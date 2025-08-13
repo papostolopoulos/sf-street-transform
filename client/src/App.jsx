@@ -18,6 +18,16 @@ export default function App() {
   // Zone attributes
   const [useType, setUseType] = useState("mixed-use");
 
+  // Sidebar visibility for compact toggle
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+
+  // Centralized colors per use type
+  const colorByUse = {
+    "mixed-use": "#7e57c2",
+    residential: "#42a5f5",
+    commercial: "#ef6c00",
+  };
+
   // Derived info for sidebar
   const [zoneSummary, setZoneSummary] = useState(null); // { areaM2, areaFt2, centroid, address, streets[] }
 
@@ -145,11 +155,11 @@ export default function App() {
             "match",
             ["get", "useType"],
             "mixed-use",
-            "#7e57c2",
+            colorByUse["mixed-use"],
             "residential",
-            "#42a5f5",
+            colorByUse["residential"],
             "commercial",
-            "#ef6c00",
+            colorByUse["commercial"],
             "#888888",
           ],
           "fill-opacity": 0.35,
@@ -458,8 +468,72 @@ export default function App() {
         </select>
       </div>
 
-      {/* Sidebar toggle */}
-      {/* You can add a collapsible sidebar if needed. For now, keep a simple summary box. */}
+      {/* Legend */}
+      <div
+        style={{
+          position: "absolute",
+          left: "1rem",
+          bottom: "1rem",
+          zIndex: 10,
+          backgroundColor: "white",
+          padding: "0.5rem 0.75rem",
+          borderRadius: "0.5rem",
+          boxShadow: "0 2px 10px rgba(0,0,0,0.15)",
+          fontSize: "0.9rem",
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>Legend</div>
+        <div
+          style={{
+            display: "flex",
+            gap: "0.5rem",
+            alignItems: "center",
+            marginBottom: "0.25rem",
+          }}
+        >
+          <span
+            style={{
+              width: 12,
+              height: 12,
+              borderRadius: 2,
+              backgroundColor: colorByUse["mixed-use"],
+              display: "inline-block",
+            }}
+          />
+          Mixed Use
+        </div>
+        <div
+          style={{
+            display: "flex",
+            gap: "0.5rem",
+            alignItems: "center",
+            marginBottom: "0.25rem",
+          }}
+        >
+          <span
+            style={{
+              width: 12,
+              height: 12,
+              borderRadius: 2,
+              backgroundColor: colorByUse["residential"],
+              display: "inline-block",
+            }}
+          />
+          Residential
+        </div>
+        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+          <span
+            style={{
+              width: 12,
+              height: 12,
+              borderRadius: 2,
+              backgroundColor: colorByUse["commercial"],
+              display: "inline-block",
+            }}
+          />
+          Commercial
+        </div>
+      </div>
 
       {drawMode && (
         <div
@@ -513,128 +587,153 @@ export default function App() {
 
       {/* Summary panel */}
       {zoneSummary && (
-        <div
-          style={{
-            position: "absolute",
-            right: 0,
-            top: 0,
-            height: "100%",
-            width: "320px",
-            backgroundColor: "#fdfdfd",
-            padding: "1.5rem",
-            boxShadow: "-2px 0 10px rgba(0,0,0,0.1)",
-            zIndex: 9,
-            overflowY: "auto",
-            fontFamily: "system-ui, sans-serif",
-          }}
-        >
-          <h2
+        <>
+          <button
+            onClick={() => setSidebarVisible(!sidebarVisible)}
             style={{
-              fontSize: "1.4rem",
-              marginBottom: "1rem",
-              borderBottom: "2px solid #eee",
-              paddingBottom: "0.5rem",
+              position: "absolute",
+              right: sidebarVisible ? "320px" : "0",
+              top: "1rem",
+              zIndex: 10,
+              backgroundColor: "#007bff",
+              color: "white",
+              border: "none",
+              padding: "0.5rem 0.75rem",
+              borderRadius: "0.25rem 0 0 0.25rem",
+              cursor: "pointer",
+              transition: "right 0.3s",
+            }}
+            aria-label="Toggle summary"
+            title="Toggle summary"
+          >
+            {sidebarVisible ? "❮" : "❯"}
+          </button>
+
+          <div
+            style={{
+              position: "absolute",
+              right: 0,
+              top: 0,
+              height: "100%",
+              width: "320px",
+              backgroundColor: "#fdfdfd",
+              padding: "1.5rem",
+              boxShadow: "-2px 0 10px rgba(0,0,0,0.1)",
+              zIndex: 9,
+              overflowY: "auto",
+              fontFamily: "system-ui, sans-serif",
+              transform: sidebarVisible ? "translateX(0)" : "translateX(100%)",
+              transition: "transform 0.3s ease",
             }}
           >
-            Zone Summary
-          </h2>
+            <h2
+              style={{
+                fontSize: "1.4rem",
+                marginBottom: "1rem",
+                borderBottom: "2px solid #eee",
+                paddingBottom: "0.5rem",
+              }}
+            >
+              Zone Summary
+            </h2>
 
-          <p style={{ marginBottom: "0.5rem" }}>
-            <strong>Name:</strong> Custom Zone
-          </p>
-          <p style={{ marginBottom: "0.5rem" }}>
-            <strong>Type:</strong> {zoneSummary.useType}
-          </p>
-          <p style={{ marginBottom: "0.5rem" }}>
-            <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
-            {zoneSummary.areaFt2.toFixed(2)} ft²
-          </p>
-          <p style={{ marginBottom: "1rem" }}>
-            <strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)},{" "}
-            {zoneSummary.centroid[1].toFixed(6)}
-          </p>
+            <p style={{ marginBottom: "0.5rem" }}>
+              <strong>Name:</strong> Custom Zone
+            </p>
+            <p style={{ marginBottom: "0.5rem" }}>
+              <strong>Type:</strong> {zoneSummary.useType}
+            </p>
+            <p style={{ marginBottom: "0.5rem" }}>
+              <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
+              {zoneSummary.areaFt2.toFixed(2)} ft²
+            </p>
+            <p style={{ marginBottom: "1rem" }}>
+              <strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)},{" "}
+              {zoneSummary.centroid[1].toFixed(6)}
+            </p>
 
-          {zoneSummary.address && (
-            <>
-              <h3
-                style={{
-                  fontSize: "1.1rem",
-                  margin: "1.5rem 0 0.5rem",
-                  borderBottom: "1px solid #ddd",
-                  paddingBottom: "0.25rem",
-                }}
-              >
-                Location Details
-              </h3>
-              <ul
-                style={{
-                  paddingLeft: "1rem",
-                  listStyle: "disc",
-                  lineHeight: "1.6",
-                }}
-              >
-                {zoneSummary.address.street && (
-                  <li>
-                    <strong>Street:</strong> {zoneSummary.address.street}
-                  </li>
-                )}
-                {zoneSummary.address.postalCode && (
-                  <li>
-                    <strong>Postal Code:</strong>{" "}
-                    {zoneSummary.address.postalCode}
-                  </li>
-                )}
-                {zoneSummary.address.neighborhood && (
-                  <li>
-                    <strong>Neighborhood:</strong>{" "}
-                    {zoneSummary.address.neighborhood}
-                  </li>
-                )}
-                {zoneSummary.address.city && (
-                  <li>
-                    <strong>City:</strong> {zoneSummary.address.city}
-                  </li>
-                )}
-                {zoneSummary.address.state && (
-                  <li>
-                    <strong>State:</strong> {zoneSummary.address.state}
-                  </li>
-                )}
-                {zoneSummary.address.country && (
-                  <li>
-                    <strong>Country:</strong> {zoneSummary.address.country}
-                  </li>
-                )}
-              </ul>
-            </>
-          )}
+            {zoneSummary.address && (
+              <>
+                <h3
+                  style={{
+                    fontSize: "1.1rem",
+                    margin: "1.5rem 0 0.5rem",
+                    borderBottom: "1px solid #ddd",
+                    paddingBottom: "0.25rem",
+                  }}
+                >
+                  Location Details
+                </h3>
+                <ul
+                  style={{
+                    paddingLeft: "1rem",
+                    listStyle: "disc",
+                    lineHeight: "1.6",
+                  }}
+                >
+                  {zoneSummary.address.street && (
+                    <li>
+                      <strong>Street:</strong> {zoneSummary.address.street}
+                    </li>
+                  )}
+                  {zoneSummary.address.postalCode && (
+                    <li>
+                      <strong>Postal Code:</strong>{" "}
+                      {zoneSummary.address.postalCode}
+                    </li>
+                  )}
+                  {zoneSummary.address.neighborhood && (
+                    <li>
+                      <strong>Neighborhood:</strong>{" "}
+                      {zoneSummary.address.neighborhood}
+                    </li>
+                  )}
+                  {zoneSummary.address.city && (
+                    <li>
+                      <strong>City:</strong> {zoneSummary.address.city}
+                    </li>
+                  )}
+                  {zoneSummary.address.state && (
+                    <li>
+                      <strong>State:</strong> {zoneSummary.address.state}
+                    </li>
+                  )}
+                  {zoneSummary.address.country && (
+                    <li>
+                      <strong>Country:</strong> {zoneSummary.address.country}
+                    </li>
+                  )}
+                </ul>
+              </>
+            )}
 
-          {zoneSummary.streets?.length > 0 && (
-            <>
-              <h3
-                style={{
-                  fontSize: "1.1rem",
-                  margin: "1.5rem 0 0.5rem",
-                  borderBottom: "1px solid #ddd",
-                  paddingBottom: "0.25rem",
-                }}
-              >
-                Streets Inside The Zone
-              </h3>
-              <ul
-                style={{
-                  paddingLeft: "1rem",
-                  listStyle: "disc",
-                  lineHeight: "1.6",
-                }}
-              >
-                {zoneSummary.streets.map((s) => (
-                  <li key={s}>{s}</li>
-                ))}
-              </ul>
-            </>
-          )}
-        </div>
+            {zoneSummary.streets?.length > 0 && (
+              <>
+                <h3
+                  style={{
+                    fontSize: "1.1rem",
+                    margin: "1.5rem 0 0.5rem",
+                    borderBottom: "1px solid #ddd",
+                    paddingBottom: "0.25rem",
+                  }}
+                >
+                  Streets Inside The Zone
+                </h3>
+                <ul
+                  style={{
+                    paddingLeft: "1rem",
+                    listStyle: "disc",
+                    lineHeight: "1.6",
+                  }}
+                >
+                  {zoneSummary.streets.map((s) => (
+                    <li key={s}>{s}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+        </>
       )}
     </div>
   );
