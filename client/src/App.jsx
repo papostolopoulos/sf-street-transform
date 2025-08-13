@@ -1,32 +1,20 @@
-// Import core React hooks and MapLibre GL
 import React, { useRef, useEffect, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
-// Main application component
 export default function App() {
-  // Refs for DOM and map instances
-  const mapContainer = useRef(null); // DOM element for the map container
-  const map = useRef(null); // MapLibre map instance
-  const markerRef = useRef(null); // Reference to the current overlay popup marker
+  const mapContainer = useRef(null);
+  const map = useRef(null);
+  const markerRef = useRef(null); // 🏭️ Track current marker
+  const [overlayVisible, setOverlayVisible] = useState(true);
+  const [basemapStyle, setBasemapStyle] = useState("streets");
+  const [zoneType, setZoneType] = useState("mixed-use");
+  const [addressInfo, setAddressInfo] = useState(null);
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+  const [drawMode, setDrawMode] = useState(false);
+  const [drawnCoords, setDrawnCoords] = useState([]);
+  const [showHelpBox, setShowHelpBox] = useState(true);
 
-  // UI and state controls
-  const [basemapStyle, setBasemapStyle] = useState("streets"); // Current basemap (streets or satellite)
-  const [customZone, setCustomZone] = useState({
-    name: "Custom Zone",
-    type: "mixed-use", // default
-    coordinates: [],
-    areaSqM: 0,
-    areaSqFt: 0,
-    centroid: null,
-  }); // Selected zone type from dropdown
-  const [addressInfo, setAddressInfo] = useState(null); // Address details from reverse geocoding
-  const [sidebarVisible, setSidebarVisible] = useState(true); // Controls sidebar visibility
-  const [drawMode, setDrawMode] = useState(false); // Whether draw mode is active
-  const [drawnCoords, setDrawnCoords] = useState([]); // Coordinates of user-drawn polygon
-  const [showHelpBox, setShowHelpBox] = useState(true); // Toggles help instructions overlay
-
-  // MapTiler basemap styles (streets and satellite)
   const maptilerStyles = {
     streets:
       "https://api.maptiler.com/maps/streets/style.json?key=DyVFUZmyKdCywxRTVU9B",
@@ -34,16 +22,75 @@ export default function App() {
       "https://api.maptiler.com/maps/hybrid/style.json?key=DyVFUZmyKdCywxRTVU9B",
   };
 
-  //mapTiler API key: DyVFUZmyKdCywxRTVU9B
+  const zoneOverlays = {
+    residential: [
+      {
+        type: "Feature",
+        properties: { name: "Family Park" },
+        geometry: {
+          type: "Polygon",
+          coordinates: [
+            [
+              [-122.4232, 37.7748],
+              [-122.4228, 37.7748],
+              [-122.4228, 37.7745],
+              [-122.4232, 37.7745],
+              [-122.4232, 37.7748],
+            ],
+          ],
+        },
+      },
+    ],
+    "mixed-use": [
+      {
+        type: "Feature",
+        properties: { name: "Parklet Zone" },
+        geometry: {
+          type: "Polygon",
+          coordinates: [
+            [
+              [-122.423, 37.775],
+              [-122.422, 37.775],
+              [-122.422, 37.7745],
+              [-122.423, 37.7745],
+              [-122.423, 37.775],
+            ],
+          ],
+        },
+      },
+    ],
+    commercial: [
+      {
+        type: "Feature",
+        properties: { name: "Vendor Zone" },
+        geometry: {
+          type: "Polygon",
+          coordinates: [
+            [
+              [-122.4225, 37.7752],
+              [-122.422, 37.7752],
+              [-122.422, 37.7749],
+              [-122.4225, 37.7749],
+              [-122.4225, 37.7752],
+            ],
+          ],
+        },
+      },
+    ],
+  };
 
-  // Helper: Calculates approximate area of a polygon in square meters using spherical projection
+  const zoneOverlay = {
+    type: "FeatureCollection",
+    features: zoneOverlays[zoneType] || [],
+  };
+
   function calculateAreaInSquareMeters(polygonCoordinates) {
     if (!polygonCoordinates || polygonCoordinates.length === 0) return 0;
 
     const coordinates = polygonCoordinates[0];
     if (coordinates.length < 4) return 0;
 
-    const R = 6378137; // Earth's radius in meters
+    const R = 6378137;
     let area = 0;
     for (let i = 0; i < coordinates.length - 1; i++) {
       const [x1, y1] = coordinates[i];
@@ -55,12 +102,10 @@ export default function App() {
     return Math.abs((area * R * R) / 2);
   }
 
-  // Helper: Convert area from square meters to square feet
   function convertToSquareFeet(squareMeters) {
     return squareMeters * 10.7639;
   }
 
-  // Helper: Calculate centroid of a polygon by averaging its vertices
   function getPolygonCentroid(coords) {
     const ring = coords[0];
     let [xSum, ySum] = [0, 0];
@@ -72,71 +117,58 @@ export default function App() {
     return [xSum / count, ySum / count];
   }
 
-  // 🗺️ Initialize the map when the component mounts
-  useEffect(() => {
-    // Exit if map container is not available or map already initialized
-    if (!mapContainer.current || map.current) return;
+  function restoreDrawnLayers(mapInstance, drawnCoords) {
+    if (!mapInstance || drawnCoords.length < 3) return;
 
-    // Create a new MapLibre instance and attach it to the container
-    map.current = new maplibregl.Map({
-      container: mapContainer.current, // DOM element to render the map
-      style: maptilerStyles[basemapStyle], // Initial map style (streets/satellite)
-      center: [-122.422, 37.7749], // Default center (San Francisco)
-      zoom: 15, // Starting zoom level
-    });
+    const closed = [...drawnCoords, drawnCoords[0]];
 
-    // Add zoom and rotation controls to the top-right
-    map.current.addControl(new maplibregl.NavigationControl(), "top-right");
-  }, []); // Runs only once on initial render
+    const polygonData = {
+      type: "Feature",
+      geometry: { type: "Polygon", coordinates: [closed] },
+    };
 
-  // 🎨 When the user changes the basemap style (e.g. from streets to satellite),
-  // update the map and reattach the overlay layer if needed.
-  useEffect(() => {
-    if (!map.current) return;
-    map.current.setStyle(maptilerStyles[basemapStyle]);
-  }, [basemapStyle]);
-
-  useEffect(() => {
-    if (!map.current) return;
-    const mapRef = map.current;
-  
-    const reAddDrawnLayers = () => {
-      if (drawnCoords.length < 1) return;
-  
-      const closed = [...drawnCoords, drawnCoords[0]];
-      const polygonData = {
+    const pointData = {
+      type: "FeatureCollection",
+      features: drawnCoords.map((coord, i) => ({
         type: "Feature",
-        geometry: {
-          type: "Polygon",
-          coordinates: [closed],
+        geometry: { type: "Point", coordinates: coord },
+        properties: { id: i },
+      })),
+    };
+
+    if (!mapInstance.getSource("drawn-polygon")) {
+      mapInstance.addSource("drawn-polygon", {
+        type: "geojson",
+        data: polygonData,
+      });
+    } else {
+      mapInstance.getSource("drawn-polygon").setData(polygonData);
+    }
+
+    if (!mapInstance.getLayer("drawn-polygon-layer")) {
+      mapInstance.addLayer({
+        id: "drawn-polygon-layer",
+        type: "fill",
+        source: "drawn-polygon",
+        paint: {
+          "fill-color": "#00bcd4",
+          "fill-opacity": 0.4,
         },
-      };
-      const pointData = {
-        type: "FeatureCollection",
-        features: drawnCoords.map((coord, i) => ({
-          type: "Feature",
-          geometry: { type: "Point", coordinates: coord },
-          properties: { id: i },
-        })),
-      };
-  
-      // Re-add sources and layers if needed
-      if (!mapRef.getSource("drawn-polygon")) {
-        mapRef.addSource("drawn-polygon", { type: "geojson", data: polygonData });
-        mapRef.addLayer({
-          id: "drawn-polygon-layer",
-          type: "fill",
-          source: "drawn-polygon",
-          paint: {
-            "fill-color": "#00bcd4",
-            "fill-opacity": 0.4,
-          },
-        });
-      }
-  
-      if (!mapRef.getSource("drawn-points")) {
-        mapRef.addSource("drawn-points", { type: "geojson", data: pointData });
-        mapRef.addLayer({
+      });
+    }
+
+    if (!mapInstance.getSource("drawn-points")) {
+      mapInstance.addSource("drawn-points", {
+        type: "geojson",
+        data: pointData,
+      });
+    } else {
+      mapInstance.getSource("drawn-points").setData(pointData);
+    }
+
+    if (!mapInstance.getLayer("drawn-points-layer")) {
+      mapInstance.addLayer(
+        {
           id: "drawn-points-layer",
           type: "circle",
           source: "drawn-points",
@@ -146,40 +178,187 @@ export default function App() {
             "circle-stroke-width": 1.5,
             "circle-stroke-color": "#fff",
           },
-        });
-      }
-    };
-  
-    mapRef.on("style.load", reAddDrawnLayers);
-  
-    return () => {
-      mapRef.off("style.load", reAddDrawnLayers);
-    };
-  }, [drawnCoords]);  
+        },
+        "drawn-polygon-layer"
+      );
+    }
+  }
 
-  // ➕ Enable adding points to a custom polygon when in draw mode
   useEffect(() => {
     if (!map.current) return;
 
-    // Handle user click on the map
+    const feature = zoneOverlays[zoneType]?.[0];
+    if (!feature) return;
+
+    const centroid = getPolygonCentroid(feature.geometry.coordinates);
+    const [lng, lat] = centroid;
+
+    const apiKey = "DyVFUZmyKdCywxRTVU9B";
+    const url = `https://api.maptiler.com/geocoding/${lng},${lat}.json?key=${apiKey}`;
+
+    console.log("🛰 Fetching address info from:", url);
+
+    fetch(url)
+      .then((res) => res.json())
+      .then((data) => {
+        console.log("📦 Raw geocode data:", data);
+
+        const features = data?.features || [];
+
+        const address = {
+          street: features[0]?.text_en || null,
+          postalCode: features[1]?.text_en || null,
+          neighborhood: features[2]?.text_en || null,
+          city: features[3]?.text_en || null,
+          state: features[4]?.text_en || null,
+          country: features[5]?.text_en || null,
+        };
+
+        console.log("📍 Parsed address info:", address);
+        setAddressInfo(address);
+      })
+      .catch((err) => {
+        console.error("❌ Failed to fetch address info:", err);
+        setAddressInfo(null);
+      });
+  }, [zoneType]);
+
+  useEffect(() => {
+    if (!map.current) return;
+
+    // Clean up old marker
+    if (markerRef.current) {
+      markerRef.current.remove();
+      markerRef.current = null;
+    }
+
+    const feature = zoneOverlays[zoneType]?.[0];
+    if (!feature) return;
+
+    const corner = feature.geometry.coordinates?.[0]?.[0];
+    const name = feature.properties.name;
+    const area = calculateAreaInSquareMeters(feature.geometry.coordinates);
+    const areaFeet = convertToSquareFeet(area);
+    const popupHTML = `
+      <strong>${name}</strong><br/>
+      ${area.toFixed(2)} m²<br/>
+      ${areaFeet.toFixed(2)} ft²
+    `;
+
+    const popup = new maplibregl.Popup().setHTML(popupHTML);
+
+    const marker = new maplibregl.Marker()
+      .setLngLat(corner)
+      .setPopup(popup)
+      .addTo(map.current);
+
+    marker.togglePopup();
+    markerRef.current = marker;
+  }, [zoneType]);
+
+  useEffect(() => {
+    if (!mapContainer.current || map.current) return;
+
+    map.current = new maplibregl.Map({
+      container: mapContainer.current,
+      style: maptilerStyles[basemapStyle],
+      center: [-122.422, 37.7749],
+      zoom: 15,
+    });
+
+    map.current.addControl(new maplibregl.NavigationControl(), "top-right");
+
+    map.current.on("load", () => {
+      map.current.addSource("overlay", {
+        type: "geojson",
+        data: zoneOverlay,
+      });
+
+      map.current.addLayer({
+        id: "overlay-layer",
+        type: "fill",
+        source: "overlay",
+        paint: {
+          "fill-color": "#ff69b4",
+          "fill-opacity": 0.5,
+        },
+        layout: {
+          visibility: overlayVisible ? "visible" : "none",
+        },
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!map.current) return;
+
+    map.current.setStyle(maptilerStyles[basemapStyle]);
+
+    map.current.once("styledata", () => {
+      // 🔁 Restore overlay layer
+      if (!map.current.getSource("overlay")) {
+        map.current.addSource("overlay", {
+          type: "geojson",
+          data: zoneOverlay,
+        });
+      }
+
+      if (!map.current.getLayer("overlay-layer")) {
+        map.current.addLayer({
+          id: "overlay-layer",
+          type: "fill",
+          source: "overlay",
+          paint: {
+            "fill-color": "#ff69b4",
+            "fill-opacity": 0.5,
+          },
+          layout: {
+            visibility: overlayVisible ? "visible" : "none",
+          },
+        });
+      }
+
+      // 🧩 Restore drawn polygon and points
+      restoreDrawnLayers(map.current, drawnCoords);
+    });
+  }, [basemapStyle]);
+
+  useEffect(() => {
+    if (!map.current || !map.current.getLayer("overlay-layer")) return;
+
+    map.current.setLayoutProperty(
+      "overlay-layer",
+      "visibility",
+      overlayVisible ? "visible" : "none"
+    );
+  }, [overlayVisible]);
+
+  useEffect(() => {
+    if (!map.current || !map.current.getSource("overlay")) return;
+    console.log("🔄 Updating overlay with zone:", zoneType);
+    map.current.getSource("overlay").setData({
+      type: "FeatureCollection",
+      features: zoneOverlays[zoneType] || [],
+    });
+  }, [zoneType]);
+
+  useEffect(() => {
+    if (!map.current) return;
+
     const handleMapClick = (e) => {
-      // Only respond if draw mode is enabled
       if (!drawMode) return;
 
-      // Get clicked coordinates [lng, lat]
       const lngLat = [e.lngLat.lng, e.lngLat.lat];
 
-      // Add the clicked point to the list of polygon coordinates
       setDrawnCoords((prev) => {
         const updated = [...prev, lngLat];
+
         return updated;
       });
     };
 
-    // Attach click listener to the map
     map.current.on("click", handleMapClick);
 
-    // Cleanup listener on unmount or when drawMode changes
     return () => {
       if (map.current) {
         map.current.off("click", handleMapClick);
@@ -187,16 +366,13 @@ export default function App() {
     };
   }, [drawMode]);
 
-  // 🧭 Respond to changes in draw mode (on/off)
   useEffect(() => {
     if (!map.current) return;
 
     const mapRef = map.current;
 
     if (!drawMode) {
-      // 🚪 Exiting draw mode:
-      // - Clear all drawn coordinates
-      // - Remove polygon and points layers/sources from the map
+      // ✅ We are exiting draw mode, so clear state and remove polygon
       setDrawnCoords([]);
 
       if (mapRef.getLayer("drawn-polygon-layer")) {
@@ -213,21 +389,15 @@ export default function App() {
         mapRef.removeSource("drawn-points");
       }
     } else {
-      // ✏️ Entering draw mode:
-      // - Show the floating help box with drawing instructions
+      // ✅ We are entering draw mode, so show the help box
       setShowHelpBox(true);
     }
   }, [drawMode]);
 
-  // 📏 When 3 or more points are drawn, compute the polygon area and centroid
   useEffect(() => {
-    // Wait until there are at least 3 points (minimum for a polygon)
     if (drawnCoords.length < 3) return;
 
-    // Close the polygon by repeating the first point at the end
     const closedCoords = [...drawnCoords, drawnCoords[0]];
-
-    // Construct a GeoJSON feature (not yet rendered here)
     const customFeature = {
       type: "Feature",
       geometry: {
@@ -237,32 +407,22 @@ export default function App() {
       properties: { name: "Custom Zone" },
     };
 
-    // Calculate area in square meters and square feet
     const area = calculateAreaInSquareMeters([closedCoords]);
     const areaFeet = convertToSquareFeet(area);
-
-    // Get the polygon's geometric center
     const [lng, lat] = getPolygonCentroid([closedCoords]);
 
-    setCustomZone((prev) => ({
-      ...prev,
-      coordinates: [...drawnCoords],
-      areaSqM: area,
-      areaSqFt: areaFeet,
-      centroid: [lng, lat],
-    }));
+    console.log("🆕 Custom zone data:");
+    console.log("→ Area:", area.toFixed(2), "m² /", areaFeet.toFixed(2), "ft²");
+    console.log("→ Centroid:", lng, lat);
 
-    // 📌 Optionally, you could reverse geocode or update the sidebar here
+    // Optional: you could even run a reverse geocode here like in your zone useEffect
+    // Or set the zone as the active one and display in sidebar
   }, [drawnCoords]);
 
-  // 🖌️ Render the user-drawn polygon and draggable point nodes
   useEffect(() => {
-    // Exit if map isn't ready or no points have been drawn
     if (!map.current || drawnCoords.length < 1) return;
 
-    const closed = [...drawnCoords, drawnCoords[0]]; // Ensure the polygon is closed
-
-    // Create a GeoJSON polygon feature
+    const closed = [...drawnCoords, drawnCoords[0]];
     const polygonData = {
       type: "Feature",
       geometry: {
@@ -271,7 +431,6 @@ export default function App() {
       },
     };
 
-    // Create a GeoJSON FeatureCollection of circle points (vertices)
     const pointData = {
       type: "FeatureCollection",
       features: drawnCoords.map((coord, i) => ({
@@ -280,36 +439,32 @@ export default function App() {
           type: "Point",
           coordinates: coord,
         },
-        properties: { id: i }, // Used to identify and drag/delete specific nodes
+        properties: { id: i },
       })),
     };
 
     const mapRef = map.current;
 
-    // 🟦 Update or add the polygon source and layer
+    // Update or add polygon source
     if (mapRef.getSource("drawn-polygon")) {
-      // Update data if source already exists
       mapRef.getSource("drawn-polygon").setData(polygonData);
     } else {
-      // First time: create source and layer
       mapRef.addSource("drawn-polygon", { type: "geojson", data: polygonData });
       mapRef.addLayer({
         id: "drawn-polygon-layer",
         type: "fill",
         source: "drawn-polygon",
         paint: {
-          "fill-color": "#00bcd4", // Cyan-ish fill
-          "fill-opacity": 0.4, // Semi-transparent
+          "fill-color": "#00bcd4",
+          "fill-opacity": 0.4,
         },
       });
     }
 
-    // 🔴 Update or add the points source and layer
+    // Update or add points source
     if (mapRef.getSource("drawn-points")) {
-      // Update point data
       mapRef.getSource("drawn-points").setData(pointData);
     } else {
-      // Create point source and layer for draggable circle markers
       mapRef.addSource("drawn-points", { type: "geojson", data: pointData });
       mapRef.addLayer(
         {
@@ -318,50 +473,45 @@ export default function App() {
           source: "drawn-points",
           paint: {
             "circle-radius": 7,
-            "circle-color": "#ff0000", // Red circles
+            "circle-color": "#ff0000",
             "circle-stroke-width": 1.5,
             "circle-stroke-color": "#fff",
           },
         },
-        "drawn-polygon-layer" // ➕ Insert point layer *above* the polygon layer
+        "drawn-polygon-layer" // ⬅ Ensure points are added *above* polygon
       );
     }
   }, [drawnCoords]);
 
-  // ✋ Enable dragging and right-click deletion of polygon points
   useEffect(() => {
-    // Exit if map is not ready or no points are drawn
     if (!map.current || drawnCoords.length < 1) return;
 
     const mapRef = map.current;
-    let isDragging = false; // Track whether a drag is in progress
-    let dragIndex = null; // Index of the point being dragged
+    let isDragging = false;
+    let dragIndex = null;
 
-    // 🧠 Clone current coordinates to avoid stale closure issues during drag
+    // 🧠 Keep live reference of coords to avoid stale state in drag loop
     const coordsRef = [...drawnCoords];
 
-    // 🖱 Handle user mouse down on a draggable point
     const handleMouseDown = (e) => {
       if (!e.features?.length) return;
       const feature = e.features[0];
       if (feature.layer.id !== "drawn-points-layer") return;
 
-      // Start dragging the selected point
       dragIndex = feature.properties.id;
       isDragging = true;
 
       mapRef.getCanvas().style.cursor = "grabbing";
-      mapRef.dragPan.disable(); // Disable map panning while dragging
+      mapRef.dragPan.disable();
     };
 
-    // 🧭 Track mouse movement to update dragged point
     const handleMouseMove = (e) => {
       if (!isDragging || dragIndex === null) return;
 
       const { lng, lat } = e.lngLat;
-      coordsRef[dragIndex] = [lng, lat]; // Update dragged point position
+      coordsRef[dragIndex] = [lng, lat];
 
-      // Update the polygon and point layers live during drag
+      // 🔄 Manually update polygon and point sources
       const closed = [...coordsRef, coordsRef[0]];
 
       const polygonData = {
@@ -386,20 +536,18 @@ export default function App() {
       }
     };
 
-    // 🖐 End drag and commit changes to React state
     const handleMouseUp = () => {
       if (!isDragging) return;
       isDragging = false;
       dragIndex = null;
 
-      // Finalize drag and update React state
+      // ✅ Commit changes to React state after drag ends
       setDrawnCoords([...coordsRef]);
 
       mapRef.getCanvas().style.cursor = "";
-      mapRef.dragPan.enable(); // Re-enable map panning
+      mapRef.dragPan.enable();
     };
 
-    // 🗑 Handle right-click to delete a point
     const handleRightClick = (e) => {
       if (!e.features?.length) return;
       const feature = e.features[0];
@@ -407,23 +555,20 @@ export default function App() {
 
       const idToRemove = feature.properties.id;
 
-      // Remove the point from drawnCoords
       setDrawnCoords((prevCoords) => {
         const updated = [...prevCoords];
         updated.splice(idToRemove, 1);
         return updated;
       });
 
-      e.preventDefault(); // Prevent default browser context menu
+      e.preventDefault();
     };
 
-    // 🎯 Register map event listeners
     mapRef.on("mousedown", "drawn-points-layer", handleMouseDown);
     mapRef.on("mousemove", handleMouseMove);
     mapRef.on("mouseup", handleMouseUp);
     mapRef.on("contextmenu", "drawn-points-layer", handleRightClick);
 
-    // 🔄 Cleanup on unmount or dependency change
     return () => {
       mapRef.off("mousedown", "drawn-points-layer", handleMouseDown);
       mapRef.off("mousemove", handleMouseMove);
@@ -432,132 +577,6 @@ export default function App() {
     };
   }, [drawnCoords]);
 
-  useEffect(() => {
-    if (!map.current || drawnCoords.length < 1) return;
-
-    const closed = [...drawnCoords, drawnCoords[0]];
-    const polygonData = {
-      type: "Feature",
-      geometry: {
-        type: "Polygon",
-        coordinates: [closed],
-      },
-    };
-
-    const pointData = {
-      type: "FeatureCollection",
-      features: drawnCoords.map((coord, i) => ({
-        type: "Feature",
-        geometry: {
-          type: "Point",
-          coordinates: coord,
-        },
-        properties: { id: i },
-      })),
-    };
-
-    const mapRef = map.current;
-
-    if (mapRef.getSource("drawn-polygon")) {
-      mapRef.getSource("drawn-polygon").setData(polygonData);
-    } else {
-      mapRef.addSource("drawn-polygon", { type: "geojson", data: polygonData });
-      mapRef.addLayer({
-        id: "drawn-polygon-layer",
-        type: "fill",
-        source: "drawn-polygon",
-        paint: {
-          "fill-color": "#00bcd4",
-          "fill-opacity": 0.4,
-        },
-      });
-    }
-
-    if (mapRef.getSource("drawn-points")) {
-      mapRef.getSource("drawn-points").setData(pointData);
-    } else {
-      mapRef.addSource("drawn-points", { type: "geojson", data: pointData });
-      mapRef.addLayer(
-        {
-          id: "drawn-points-layer",
-          type: "circle",
-          source: "drawn-points",
-          paint: {
-            "circle-radius": 7,
-            "circle-color": "#ff0000",
-            "circle-stroke-width": 1.5,
-            "circle-stroke-color": "#fff",
-          },
-        },
-        "drawn-polygon-layer"
-      );
-    }
-  }, [drawnCoords]);
-
-  useEffect(() => {
-    if (!map.current || drawnCoords.length < 1) return;
-
-    const closed = [...drawnCoords, drawnCoords[0]];
-
-    const polygonData = {
-      type: "Feature",
-      geometry: {
-        type: "Polygon",
-        coordinates: [closed],
-      },
-    };
-
-    const pointData = {
-      type: "FeatureCollection",
-      features: drawnCoords.map((coord, i) => ({
-        type: "Feature",
-        geometry: {
-          type: "Point",
-          coordinates: coord,
-        },
-        properties: { id: i },
-      })),
-    };
-
-    const mapRef = map.current;
-
-    if (mapRef.getSource("drawn-polygon")) {
-      mapRef.getSource("drawn-polygon").setData(polygonData);
-    } else {
-      mapRef.addSource("drawn-polygon", { type: "geojson", data: polygonData });
-      mapRef.addLayer({
-        id: "drawn-polygon-layer",
-        type: "fill",
-        source: "drawn-polygon",
-        paint: {
-          "fill-color": "#00bcd4",
-          "fill-opacity": 0.4,
-        },
-      });
-    }
-
-    if (mapRef.getSource("drawn-points")) {
-      mapRef.getSource("drawn-points").setData(pointData);
-    } else {
-      mapRef.addSource("drawn-points", { type: "geojson", data: pointData });
-      mapRef.addLayer(
-        {
-          id: "drawn-points-layer",
-          type: "circle",
-          source: "drawn-points",
-          paint: {
-            "circle-radius": 7,
-            "circle-color": "#ff0000",
-            "circle-stroke-width": 1.5,
-            "circle-stroke-color": "#fff",
-          },
-        },
-        "drawn-polygon-layer"
-      );
-    }
-  }, [drawnCoords]);
-
-  // 🎛️ Inline styles for the control panel (top-left toolbar)
   const controlPanelStyle = {
     position: "absolute",
     top: "1rem",
@@ -566,17 +585,16 @@ export default function App() {
     backgroundColor: "white",
     padding: "0.75rem",
     borderRadius: "0.5rem",
-    boxShadow: "0 2px 10px rgba(0,0,0,0.15)", // Soft shadow
+    boxShadow: "0 2px 10px rgba(0,0,0,0.15)",
     display: "flex",
-    flexWrap: "wrap", // Wrap buttons if screen is narrow
+    flexWrap: "wrap",
     alignItems: "center",
-    gap: "0.5rem", // Spacing between buttons/selects
-    maxWidth: "calc(100vw - 2rem)", // Prevent overflow on small screens
+    gap: "0.5rem",
+    maxWidth: "calc(100vw - 2rem)",
   };
 
-  // 🎨 Style for all control buttons
   const buttonStyle = {
-    backgroundColor: "#ffc107", // Yellow (Bootstrap warning)
+    backgroundColor: "#ffc107",
     border: "none",
     padding: "0.5rem 1rem",
     borderRadius: "0.375rem",
@@ -585,34 +603,44 @@ export default function App() {
     fontSize: "0.9rem",
   };
 
-  // 🔽 Style for dropdown selects (zone type, basemap)
   const selectStyle = {
     padding: "0.5rem",
     borderRadius: "0.375rem",
     fontSize: "0.9rem",
   };
 
+  const currentFeature = zoneOverlays[zoneType]?.[0];
+  const currentArea = currentFeature
+    ? calculateAreaInSquareMeters(currentFeature.geometry.coordinates)
+    : 0;
+
+  const currentAreaFeet = convertToSquareFeet(currentArea);
+
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
-      {/* 🗺️ Map container (full-screen) */}
       <div
         ref={mapContainer}
         style={{ position: "absolute", inset: 0, zIndex: 0 }}
       ></div>
 
-      {/* 🎛️ Floating control panel (top-left) */}
       <div style={controlPanelStyle}>
+        <button
+          onClick={() => setOverlayVisible(!overlayVisible)}
+          style={buttonStyle}
+        >
+          {overlayVisible ? "Hide" : "Show"} Overlay
+        </button>
+
         <button
           onClick={() => setDrawMode(!drawMode)}
           style={{
             ...buttonStyle,
-            backgroundColor: drawMode ? "#28a745" : "#ffc107", // Green when active
+            backgroundColor: drawMode ? "#28a745" : "#ffc107",
           }}
         >
           {drawMode ? "Exit Draw Mode" : "Enter Draw Mode"}
         </button>
 
-        {/* Switch basemap style */}
         <select
           value={basemapStyle}
           onChange={(e) => setBasemapStyle(e.target.value)}
@@ -622,12 +650,9 @@ export default function App() {
           <option value="satellite">Satellite</option>
         </select>
 
-        {/* Switch zone overlay type */}
         <select
-          value={customZone.type}
-          onChange={(e) =>
-            setCustomZone((prev) => ({ ...prev, type: e.target.value }))
-          }
+          value={zoneType}
+          onChange={(e) => setZoneType(e.target.value)}
           style={selectStyle}
         >
           <option value="residential">Residential</option>
@@ -636,7 +661,6 @@ export default function App() {
         </select>
       </div>
 
-      {/* 🪟 Sidebar toggle button (left of sidebar when open) */}
       <button
         onClick={() => setSidebarVisible(!sidebarVisible)}
         style={{
@@ -656,7 +680,6 @@ export default function App() {
         {sidebarVisible ? "❮" : "❯"}
       </button>
 
-      {/* 📋 Sidebar with zone details and geocoded address */}
       {sidebarVisible && (
         <div
           style={{
@@ -673,88 +696,101 @@ export default function App() {
             fontFamily: "system-ui, sans-serif",
           }}
         >
-          <div>
-            <h2
+          {
+            <div
               style={{
-                fontSize: "1.4rem",
-                marginBottom: "1rem",
-                borderBottom: "2px solid #eee",
-                paddingBottom: "0.5rem",
+                position: "absolute",
+                right: 0,
+                top: 0,
+                height: "100%",
+                width: "320px",
+                backgroundColor: "#fdfdfd",
+                padding: "1.5rem",
+                boxShadow: "-2px 0 10px rgba(0,0,0,0.1)",
+                zIndex: 9,
+                overflowY: "auto",
+                fontFamily: "system-ui, sans-serif",
               }}
             >
-              Zone Summary
-            </h2>
+              <h2
+                style={{
+                  fontSize: "1.4rem",
+                  marginBottom: "1rem",
+                  borderBottom: "2px solid #eee",
+                  paddingBottom: "0.5rem",
+                }}
+              >
+                Zone Summary
+              </h2>
 
-            {/* Zone metadata */}
-            <p style={{ marginBottom: "0.5rem" }}>
-              <strong>Name:</strong> {customZone.name}
-            </p>
-            <p style={{ marginBottom: "0.5rem" }}>
-              <strong>Type:</strong> {customZone.type}
-            </p>
-            <p style={{ marginBottom: "1rem" }}>
-              <strong>Area:</strong> {customZone.areaSqM.toFixed(2)} m² /{" "}
-              {customZone.areaSqFt.toFixed(2)} ft²
-            </p>
+              <p style={{ marginBottom: "0.5rem" }}>
+                <strong>Name:</strong> {currentFeature?.properties?.name}
+              </p>
+              <p style={{ marginBottom: "0.5rem" }}>
+                <strong>Type:</strong> {zoneType}
+              </p>
+              <p style={{ marginBottom: "1rem" }}>
+                <strong>Area:</strong> {currentArea.toFixed(2)} m² /{" "}
+                {currentAreaFeet.toFixed(2)} ft²
+              </p>
 
-            {/* Reverse geocoded location info */}
-            {addressInfo && (
-              <>
-                <h3
-                  style={{
-                    fontSize: "1.1rem",
-                    margin: "1.5rem 0 0.5rem",
-                    borderBottom: "1px solid #ddd",
-                    paddingBottom: "0.25rem",
-                  }}
-                >
-                  Location Details
-                </h3>
-                <ul
-                  style={{
-                    paddingLeft: "1rem",
-                    listStyle: "disc",
-                    lineHeight: "1.6",
-                  }}
-                >
-                  {addressInfo.street && (
-                    <li>
-                      <strong>Street:</strong> {addressInfo.street}
-                    </li>
-                  )}
-                  {addressInfo.postalCode && (
-                    <li>
-                      <strong>Postal Code:</strong> {addressInfo.postalCode}
-                    </li>
-                  )}
-                  {addressInfo.neighborhood && (
-                    <li>
-                      <strong>Neighborhood:</strong> {addressInfo.neighborhood}
-                    </li>
-                  )}
-                  {addressInfo.city && (
-                    <li>
-                      <strong>City:</strong> {addressInfo.city}
-                    </li>
-                  )}
-                  {addressInfo.state && (
-                    <li>
-                      <strong>State:</strong> {addressInfo.state}
-                    </li>
-                  )}
-                  {addressInfo.country && (
-                    <li>
-                      <strong>Country:</strong> {addressInfo.country}
-                    </li>
-                  )}
-                </ul>
-              </>
-            )}
-          </div>
+              {addressInfo && (
+                <>
+                  <h3
+                    style={{
+                      fontSize: "1.1rem",
+                      margin: "1.5rem 0 0.5rem",
+                      borderBottom: "1px solid #ddd",
+                      paddingBottom: "0.25rem",
+                    }}
+                  >
+                    Location Details
+                  </h3>
+                  <ul
+                    style={{
+                      paddingLeft: "1rem",
+                      listStyle: "disc",
+                      lineHeight: "1.6",
+                    }}
+                  >
+                    {addressInfo.street && (
+                      <li>
+                        <strong>Street:</strong> {addressInfo.street}
+                      </li>
+                    )}
+                    {addressInfo.postalCode && (
+                      <li>
+                        <strong>Postal Code:</strong> {addressInfo.postalCode}
+                      </li>
+                    )}
+                    {addressInfo.neighborhood && (
+                      <li>
+                        <strong>Neighborhood:</strong>{" "}
+                        {addressInfo.neighborhood}
+                      </li>
+                    )}
+                    {addressInfo.city && (
+                      <li>
+                        <strong>City:</strong> {addressInfo.city}
+                      </li>
+                    )}
+                    {addressInfo.state && (
+                      <li>
+                        <strong>State:</strong> {addressInfo.state}
+                      </li>
+                    )}
+                    {addressInfo.country && (
+                      <li>
+                        <strong>Country:</strong> {addressInfo.country}
+                      </li>
+                    )}
+                  </ul>
+                </>
+              )}
+            </div>
+          }
         </div>
       )}
-
-      {/* 📘 Floating help box for draw instructions (shown in draw mode) */}
       {drawMode && showHelpBox && (
         <div
           style={{
@@ -770,7 +806,6 @@ export default function App() {
             boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
           }}
         >
-          {/* Close (X) button */}
           <button
             onClick={() => setShowHelpBox(false)}
             style={{
@@ -801,8 +836,6 @@ export default function App() {
           </ul>
         </div>
       )}
-
-      {/* ℹ️ Help icon to reopen instructions if user closed them */}
       {drawMode && !showHelpBox && (
         <button
           onClick={() => setShowHelpBox(true)}
