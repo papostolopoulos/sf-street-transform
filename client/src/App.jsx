@@ -1,25 +1,34 @@
 import React, { useRef, useEffect, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+// ✅ Add Turf for geometry math and intersections
+import * as turf from "@turf/turf";
 
 export default function App() {
   const mapContainer = useRef(null);
   const map = useRef(null);
-  const markerRef = useRef(null); // 🏭️ Track current marker
+  const markerRef = useRef(null);
+
   const [overlayVisible, setOverlayVisible] = useState(true);
   const [basemapStyle, setBasemapStyle] = useState("streets");
   const [zoneType, setZoneType] = useState("mixed-use");
+
+  // Preset zone reverse‑geocode
   const [addressInfo, setAddressInfo] = useState(null);
+
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [drawMode, setDrawMode] = useState(false);
   const [drawnCoords, setDrawnCoords] = useState([]);
   const [showHelpBox, setShowHelpBox] = useState(true);
 
+  // ✅ Custom zone summary state
+  const [customZoneInfo, setCustomZoneInfo] = useState(null); // { areaM2, areaFt2, centroid, address, streets[] }
+
+  const MAPTILER_KEY = "DyVFUZmyKdCywxRTVU9B";
+
   const maptilerStyles = {
-    streets:
-      "https://api.maptiler.com/maps/streets/style.json?key=DyVFUZmyKdCywxRTVU9B",
-    satellite:
-      "https://api.maptiler.com/maps/hybrid/style.json?key=DyVFUZmyKdCywxRTVU9B",
+    streets: `https://api.maptiler.com/maps/streets/style.json?key=${MAPTILER_KEY}`,
+    satellite: `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`,
   };
 
   const zoneOverlays = {
@@ -84,12 +93,13 @@ export default function App() {
     features: zoneOverlays[zoneType] || [],
   };
 
-  function calculateAreaInSquareMeters(polygonCoordinates) {
-    if (!polygonCoordinates || polygonCoordinates.length === 0) return 0;
+  // --- helpers ----------------------------------------------------
 
+  function calculateAreaInSquareMeters(polygonCoordinates) {
+    // Keep your original for preset zones. Turf for custom below.
+    if (!polygonCoordinates || polygonCoordinates.length === 0) return 0;
     const coordinates = polygonCoordinates[0];
     if (coordinates.length < 4) return 0;
-
     const R = 6378137;
     let area = 0;
     for (let i = 0; i < coordinates.length - 1; i++) {
@@ -115,6 +125,93 @@ export default function App() {
     }
     const count = ring.length - 1;
     return [xSum / count, ySum / count];
+  }
+
+  // ✅ visible road layers in current style
+  function getRoadLayerIds(mapInstance) {
+    const style = mapInstance.getStyle();
+    if (!style?.layers) return [];
+    return style.layers
+      .filter(
+        (lyr) =>
+          lyr.type === "line" &&
+          // MapTiler styles often use these source-layer names
+          (lyr["source-layer"]?.toLowerCase().includes("transportation") ||
+            lyr.id.toLowerCase().includes("road") ||
+            lyr["source-layer"]?.toLowerCase().includes("road") ||
+            lyr.id.toLowerCase().includes("street"))
+      )
+      .map((lyr) => lyr.id);
+  }
+
+  // ✅ fetch address for centroid {lng,lat}
+  async function reverseGeocode(lng, lat) {
+    const url = `https://api.maptiler.com/geocoding/${lng},${lat}.json?key=${MAPTILER_KEY}`;
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      const f = data?.features || [];
+      return {
+        street: f[0]?.text_en || null,
+        postalCode: f[1]?.text_en || null,
+        neighborhood: f[2]?.text_en || null,
+        city: f[3]?.text_en || null,
+        state: f[4]?.text_en || null,
+        country: f[5]?.text_en || null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // ✅ streets that intersect the polygon
+  function getIntersectingStreetNames(mapInstance, polygon) {
+    const layerIds = getRoadLayerIds(mapInstance);
+    if (!layerIds.length) return [];
+
+    // Use polygon bbox to limit candidates
+    const bbox = turf.bbox(polygon); // [minX, minY, maxX, maxY] in lng/lat
+    const sw = mapInstance.project([bbox[0], bbox[1]]);
+    const ne = mapInstance.project([bbox[2], bbox[3]]);
+    const rect = new maplibregl.LngLatBounds(
+      [bbox[0], bbox[1]],
+      [bbox[2], bbox[3]]
+    );
+    // queryRenderedFeatures accepts pixel box: [minX, minY, maxX, maxY]
+    const pixelBox = [
+      Math.min(sw.x, ne.x),
+      Math.min(sw.y, ne.y),
+      Math.max(sw.x, ne.x),
+      Math.max(sw.y, ne.y),
+    ];
+
+    const candidates = mapInstance.queryRenderedFeatures(pixelBox, {
+      layers: layerIds,
+    });
+
+    const names = new Set();
+    for (const feat of candidates) {
+      // Only LineString or MultiLineString
+      if (
+        feat.geometry?.type !== "LineString" &&
+        feat.geometry?.type !== "MultiLineString"
+      )
+        continue;
+      const asTurf =
+        feat.geometry.type === "LineString"
+          ? turf.lineString(feat.geometry.coordinates)
+          : turf.multiLineString(feat.geometry.coordinates);
+
+      if (turf.booleanIntersects(asTurf, polygon)) {
+        const name =
+          feat.properties?.name ||
+          feat.properties?.street ||
+          feat.properties?.class ||
+          null;
+        if (name) names.add(name);
+      }
+    }
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
   }
 
   function restoreDrawnLayers(mapInstance, drawnCoords) {
@@ -184,54 +281,26 @@ export default function App() {
     }
   }
 
+  // --- effects ----------------------------------------------------
+
+  // Reverse geocode for preset zone centroid
   useEffect(() => {
     if (!map.current) return;
-
     const feature = zoneOverlays[zoneType]?.[0];
     if (!feature) return;
-
     const centroid = getPolygonCentroid(feature.geometry.coordinates);
     const [lng, lat] = centroid;
 
-    const apiKey = "DyVFUZmyKdCywxRTVU9B";
-    const url = `https://api.maptiler.com/geocoding/${lng},${lat}.json?key=${apiKey}`;
-
-    console.log("🛰 Fetching address info from:", url);
-
-    fetch(url)
-      .then((res) => res.json())
-      .then((data) => {
-        console.log("📦 Raw geocode data:", data);
-
-        const features = data?.features || [];
-
-        const address = {
-          street: features[0]?.text_en || null,
-          postalCode: features[1]?.text_en || null,
-          neighborhood: features[2]?.text_en || null,
-          city: features[3]?.text_en || null,
-          state: features[4]?.text_en || null,
-          country: features[5]?.text_en || null,
-        };
-
-        console.log("📍 Parsed address info:", address);
-        setAddressInfo(address);
-      })
-      .catch((err) => {
-        console.error("❌ Failed to fetch address info:", err);
-        setAddressInfo(null);
-      });
+    reverseGeocode(lng, lat).then(setAddressInfo);
   }, [zoneType]);
 
+  // Marker popup for preset zone
   useEffect(() => {
     if (!map.current) return;
-
-    // Clean up old marker
     if (markerRef.current) {
       markerRef.current.remove();
       markerRef.current = null;
     }
-
     const feature = zoneOverlays[zoneType]?.[0];
     if (!feature) return;
 
@@ -244,18 +313,16 @@ export default function App() {
       ${area.toFixed(2)} m²<br/>
       ${areaFeet.toFixed(2)} ft²
     `;
-
     const popup = new maplibregl.Popup().setHTML(popupHTML);
-
     const marker = new maplibregl.Marker()
       .setLngLat(corner)
       .setPopup(popup)
       .addTo(map.current);
-
     marker.togglePopup();
     markerRef.current = marker;
   }, [zoneType]);
 
+  // Init map
   useEffect(() => {
     if (!mapContainer.current || map.current) return;
 
@@ -289,43 +356,36 @@ export default function App() {
     });
   }, []);
 
+  // Style switch restore
   useEffect(() => {
     if (!map.current) return;
 
     map.current.setStyle(maptilerStyles[basemapStyle]);
 
     map.current.once("styledata", () => {
-      // 🔁 Restore overlay layer
       if (!map.current.getSource("overlay")) {
         map.current.addSource("overlay", {
           type: "geojson",
           data: zoneOverlay,
         });
       }
-
       if (!map.current.getLayer("overlay-layer")) {
         map.current.addLayer({
           id: "overlay-layer",
           type: "fill",
           source: "overlay",
-          paint: {
-            "fill-color": "#ff69b4",
-            "fill-opacity": 0.5,
-          },
-          layout: {
-            visibility: overlayVisible ? "visible" : "none",
-          },
+          paint: { "fill-color": "#ff69b4", "fill-opacity": 0.5 },
+          layout: { visibility: overlayVisible ? "visible" : "none" },
         });
       }
-
-      // 🧩 Restore drawn polygon and points
+      // ✅ Also restore drawn layers
       restoreDrawnLayers(map.current, drawnCoords);
     });
   }, [basemapStyle]);
 
+  // Overlay visibility toggle
   useEffect(() => {
     if (!map.current || !map.current.getLayer("overlay-layer")) return;
-
     map.current.setLayoutProperty(
       "overlay-layer",
       "visibility",
@@ -333,119 +393,72 @@ export default function App() {
     );
   }, [overlayVisible]);
 
+  // Overlay data on zoneType change
   useEffect(() => {
     if (!map.current || !map.current.getSource("overlay")) return;
-    console.log("🔄 Updating overlay with zone:", zoneType);
     map.current.getSource("overlay").setData({
       type: "FeatureCollection",
       features: zoneOverlays[zoneType] || [],
     });
   }, [zoneType]);
 
+  // Draw click
   useEffect(() => {
     if (!map.current) return;
 
     const handleMapClick = (e) => {
       if (!drawMode) return;
-
       const lngLat = [e.lngLat.lng, e.lngLat.lat];
-
-      setDrawnCoords((prev) => {
-        const updated = [...prev, lngLat];
-
-        return updated;
-      });
+      setDrawnCoords((prev) => [...prev, lngLat]);
     };
 
     map.current.on("click", handleMapClick);
-
-    return () => {
-      if (map.current) {
-        map.current.off("click", handleMapClick);
-      }
-    };
+    return () => map.current && map.current.off("click", handleMapClick);
   }, [drawMode]);
 
+  // Enter/exit draw mode housekeeping
   useEffect(() => {
     if (!map.current) return;
-
     const mapRef = map.current;
 
     if (!drawMode) {
-      // ✅ We are exiting draw mode, so clear state and remove polygon
+      // Clear drawn visuals and summary
       setDrawnCoords([]);
+      setCustomZoneInfo(null);
 
-      if (mapRef.getLayer("drawn-polygon-layer")) {
+      if (mapRef.getLayer("drawn-polygon-layer"))
         mapRef.removeLayer("drawn-polygon-layer");
-      }
-      if (mapRef.getSource("drawn-polygon")) {
+      if (mapRef.getSource("drawn-polygon"))
         mapRef.removeSource("drawn-polygon");
-      }
-
-      if (mapRef.getLayer("drawn-points-layer")) {
+      if (mapRef.getLayer("drawn-points-layer"))
         mapRef.removeLayer("drawn-points-layer");
-      }
-      if (mapRef.getSource("drawn-points")) {
-        mapRef.removeSource("drawn-points");
-      }
+      if (mapRef.getSource("drawn-points")) mapRef.removeSource("drawn-points");
     } else {
-      // ✅ We are entering draw mode, so show the help box
       setShowHelpBox(true);
     }
   }, [drawMode]);
 
-  useEffect(() => {
-    if (drawnCoords.length < 3) return;
-
-    const closedCoords = [...drawnCoords, drawnCoords[0]];
-    const customFeature = {
-      type: "Feature",
-      geometry: {
-        type: "Polygon",
-        coordinates: [closedCoords],
-      },
-      properties: { name: "Custom Zone" },
-    };
-
-    const area = calculateAreaInSquareMeters([closedCoords]);
-    const areaFeet = convertToSquareFeet(area);
-    const [lng, lat] = getPolygonCentroid([closedCoords]);
-
-    console.log("🆕 Custom zone data:");
-    console.log("→ Area:", area.toFixed(2), "m² /", areaFeet.toFixed(2), "ft²");
-    console.log("→ Centroid:", lng, lat);
-
-    // Optional: you could even run a reverse geocode here like in your zone useEffect
-    // Or set the zone as the active one and display in sidebar
-  }, [drawnCoords]);
-
+  // Drawn polygon -> render layers
   useEffect(() => {
     if (!map.current || drawnCoords.length < 1) return;
 
     const closed = [...drawnCoords, drawnCoords[0]];
     const polygonData = {
       type: "Feature",
-      geometry: {
-        type: "Polygon",
-        coordinates: [closed],
-      },
+      geometry: { type: "Polygon", coordinates: [closed] },
     };
 
     const pointData = {
       type: "FeatureCollection",
       features: drawnCoords.map((coord, i) => ({
         type: "Feature",
-        geometry: {
-          type: "Point",
-          coordinates: coord,
-        },
+        geometry: { type: "Point", coordinates: coord },
         properties: { id: i },
       })),
     };
 
     const mapRef = map.current;
 
-    // Update or add polygon source
     if (mapRef.getSource("drawn-polygon")) {
       mapRef.getSource("drawn-polygon").setData(polygonData);
     } else {
@@ -454,14 +467,10 @@ export default function App() {
         id: "drawn-polygon-layer",
         type: "fill",
         source: "drawn-polygon",
-        paint: {
-          "fill-color": "#00bcd4",
-          "fill-opacity": 0.4,
-        },
+        paint: { "fill-color": "#00bcd4", "fill-opacity": 0.4 },
       });
     }
 
-    // Update or add points source
     if (mapRef.getSource("drawn-points")) {
       mapRef.getSource("drawn-points").setData(pointData);
     } else {
@@ -478,47 +487,40 @@ export default function App() {
             "circle-stroke-color": "#fff",
           },
         },
-        "drawn-polygon-layer" // ⬅ Ensure points are added *above* polygon
+        "drawn-polygon-layer"
       );
     }
   }, [drawnCoords]);
 
+  // Point drag + delete
   useEffect(() => {
     if (!map.current || drawnCoords.length < 1) return;
 
     const mapRef = map.current;
     let isDragging = false;
     let dragIndex = null;
-
-    // 🧠 Keep live reference of coords to avoid stale state in drag loop
     const coordsRef = [...drawnCoords];
 
     const handleMouseDown = (e) => {
       if (!e.features?.length) return;
       const feature = e.features[0];
       if (feature.layer.id !== "drawn-points-layer") return;
-
       dragIndex = feature.properties.id;
       isDragging = true;
-
       mapRef.getCanvas().style.cursor = "grabbing";
       mapRef.dragPan.disable();
     };
 
     const handleMouseMove = (e) => {
       if (!isDragging || dragIndex === null) return;
-
       const { lng, lat } = e.lngLat;
       coordsRef[dragIndex] = [lng, lat];
 
-      // 🔄 Manually update polygon and point sources
       const closed = [...coordsRef, coordsRef[0]];
-
       const polygonData = {
         type: "Feature",
         geometry: { type: "Polygon", coordinates: [closed] },
       };
-
       const pointData = {
         type: "FeatureCollection",
         features: coordsRef.map((coord, i) => ({
@@ -528,22 +530,17 @@ export default function App() {
         })),
       };
 
-      if (mapRef.getSource("drawn-polygon")) {
+      if (mapRef.getSource("drawn-polygon"))
         mapRef.getSource("drawn-polygon").setData(polygonData);
-      }
-      if (mapRef.getSource("drawn-points")) {
+      if (mapRef.getSource("drawn-points"))
         mapRef.getSource("drawn-points").setData(pointData);
-      }
     };
 
     const handleMouseUp = () => {
       if (!isDragging) return;
       isDragging = false;
       dragIndex = null;
-
-      // ✅ Commit changes to React state after drag ends
       setDrawnCoords([...coordsRef]);
-
       mapRef.getCanvas().style.cursor = "";
       mapRef.dragPan.enable();
     };
@@ -552,15 +549,12 @@ export default function App() {
       if (!e.features?.length) return;
       const feature = e.features[0];
       if (feature.layer.id !== "drawn-points-layer") return;
-
       const idToRemove = feature.properties.id;
-
-      setDrawnCoords((prevCoords) => {
-        const updated = [...prevCoords];
-        updated.splice(idToRemove, 1);
-        return updated;
+      setDrawnCoords((prev) => {
+        const u = [...prev];
+        u.splice(idToRemove, 1);
+        return u;
       });
-
       e.preventDefault();
     };
 
@@ -576,6 +570,35 @@ export default function App() {
       mapRef.off("contextmenu", "drawn-points-layer", handleRightClick);
     };
   }, [drawnCoords]);
+
+  // ✅ Build Custom Zone Summary whenever polygon has 3+ points
+  useEffect(() => {
+    if (!map.current || drawnCoords.length < 3) return;
+
+    const closed = [...drawnCoords, drawnCoords[0]];
+    const poly = turf.polygon([closed]);
+
+    const areaM2 = turf.area(poly);
+    const areaFt2 = convertToSquareFeet(areaM2);
+
+    const centroidPt = turf.centroid(poly).geometry.coordinates; // [lng, lat]
+
+    // streets from visible layers
+    const streets = getIntersectingStreetNames(map.current, poly);
+
+    // reverse geocode centroid
+    reverseGeocode(centroidPt[0], centroidPt[1]).then((addr) => {
+      setCustomZoneInfo({
+        areaM2,
+        areaFt2,
+        centroid: centroidPt,
+        address: addr,
+        streets,
+      });
+    });
+  }, [drawnCoords]);
+
+  // --- UI ---------------------------------------------------------
 
   const controlPanelStyle = {
     position: "absolute",
@@ -613,15 +636,17 @@ export default function App() {
   const currentArea = currentFeature
     ? calculateAreaInSquareMeters(currentFeature.geometry.coordinates)
     : 0;
-
   const currentAreaFeet = convertToSquareFeet(currentArea);
+
+  // Prefer custom zone summary if it exists
+  const usingCustom = !!customZoneInfo;
 
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
       <div
         ref={mapContainer}
         style={{ position: "absolute", inset: 0, zIndex: 0 }}
-      ></div>
+      />
 
       <div style={controlPanelStyle}>
         <button
@@ -696,33 +721,19 @@ export default function App() {
             fontFamily: "system-ui, sans-serif",
           }}
         >
-          {
-            <div
-              style={{
-                position: "absolute",
-                right: 0,
-                top: 0,
-                height: "100%",
-                width: "320px",
-                backgroundColor: "#fdfdfd",
-                padding: "1.5rem",
-                boxShadow: "-2px 0 10px rgba(0,0,0,0.1)",
-                zIndex: 9,
-                overflowY: "auto",
-                fontFamily: "system-ui, sans-serif",
-              }}
-            >
-              <h2
-                style={{
-                  fontSize: "1.4rem",
-                  marginBottom: "1rem",
-                  borderBottom: "2px solid #eee",
-                  paddingBottom: "0.5rem",
-                }}
-              >
-                Zone Summary
-              </h2>
+          <h2
+            style={{
+              fontSize: "1.4rem",
+              marginBottom: "1rem",
+              borderBottom: "2px solid #eee",
+              paddingBottom: "0.5rem",
+            }}
+          >
+            {usingCustom ? "Custom Zone Summary" : "Zone Summary"}
+          </h2>
 
+          {!usingCustom && (
+            <>
               <p style={{ marginBottom: "0.5rem" }}>
                 <strong>Name:</strong> {currentFeature?.properties?.name}
               </p>
@@ -787,10 +798,113 @@ export default function App() {
                   </ul>
                 </>
               )}
-            </div>
-          }
+            </>
+          )}
+
+          {usingCustom && (
+            <>
+              <p style={{ marginBottom: "0.5rem" }}>
+                <strong>Name:</strong> Custom Zone
+              </p>
+              <p style={{ marginBottom: "0.5rem" }}>
+                <strong>Type:</strong> User‑drawn polygon
+              </p>
+              <p style={{ marginBottom: "0.5rem" }}>
+                <strong>Area:</strong> {customZoneInfo.areaM2.toFixed(2)} m² /{" "}
+                {customZoneInfo.areaFt2.toFixed(2)} ft²
+              </p>
+              <p style={{ marginBottom: "1rem" }}>
+                <strong>Centroid:</strong>{" "}
+                {customZoneInfo.centroid[0].toFixed(6)},{" "}
+                {customZoneInfo.centroid[1].toFixed(6)}
+              </p>
+
+              {customZoneInfo.address && (
+                <>
+                  <h3
+                    style={{
+                      fontSize: "1.1rem",
+                      margin: "1.5rem 0 0.5rem",
+                      borderBottom: "1px solid #ddd",
+                      paddingBottom: "0.25rem",
+                    }}
+                  >
+                    Location Details
+                  </h3>
+                  <ul
+                    style={{
+                      paddingLeft: "1rem",
+                      listStyle: "disc",
+                      lineHeight: "1.6",
+                    }}
+                  >
+                    {customZoneInfo.address.street && (
+                      <li>
+                        <strong>Street:</strong> {customZoneInfo.address.street}
+                      </li>
+                    )}
+                    {customZoneInfo.address.postalCode && (
+                      <li>
+                        <strong>Postal Code:</strong>{" "}
+                        {customZoneInfo.address.postalCode}
+                      </li>
+                    )}
+                    {customZoneInfo.address.neighborhood && (
+                      <li>
+                        <strong>Neighborhood:</strong>{" "}
+                        {customZoneInfo.address.neighborhood}
+                      </li>
+                    )}
+                    {customZoneInfo.address.city && (
+                      <li>
+                        <strong>City:</strong> {customZoneInfo.address.city}
+                      </li>
+                    )}
+                    {customZoneInfo.address.state && (
+                      <li>
+                        <strong>State:</strong> {customZoneInfo.address.state}
+                      </li>
+                    )}
+                    {customZoneInfo.address.country && (
+                      <li>
+                        <strong>Country:</strong>{" "}
+                        {customZoneInfo.address.country}
+                      </li>
+                    )}
+                  </ul>
+                </>
+              )}
+
+              {customZoneInfo.streets?.length > 0 && (
+                <>
+                  <h3
+                    style={{
+                      fontSize: "1.1rem",
+                      margin: "1.5rem 0 0.5rem",
+                      borderBottom: "1px solid #ddd",
+                      paddingBottom: "0.25rem",
+                    }}
+                  >
+                    Streets Inside The Zone
+                  </h3>
+                  <ul
+                    style={{
+                      paddingLeft: "1rem",
+                      listStyle: "disc",
+                      lineHeight: "1.6",
+                    }}
+                  >
+                    {customZoneInfo.streets.map((s) => (
+                      <li key={s}>{s}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
+
       {drawMode && showHelpBox && (
         <div
           style={{
@@ -836,6 +950,7 @@ export default function App() {
           </ul>
         </div>
       )}
+
       {drawMode && !showHelpBox && (
         <button
           onClick={() => setShowHelpBox(true)}
