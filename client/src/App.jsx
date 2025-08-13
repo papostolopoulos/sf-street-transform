@@ -13,6 +13,7 @@ export default function App() {
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [drawMode, setDrawMode] = useState(false);
   const [drawnCoords, setDrawnCoords] = useState([]);
+  const [showHelpBox, setShowHelpBox] = useState(true);
 
   const maptilerStyles = {
     streets:
@@ -94,9 +95,11 @@ export default function App() {
     for (let i = 0; i < coordinates.length - 1; i++) {
       const [x1, y1] = coordinates[i];
       const [x2, y2] = coordinates[i + 1];
-      area += ((x2 - x1) * Math.PI / 180) * (2 + Math.sin(y1 * Math.PI / 180) + Math.sin(y2 * Math.PI / 180));
+      area +=
+        (((x2 - x1) * Math.PI) / 180) *
+        (2 + Math.sin((y1 * Math.PI) / 180) + Math.sin((y2 * Math.PI) / 180));
     }
-    return Math.abs(area * R * R / 2);
+    return Math.abs((area * R * R) / 2);
   }
 
   function convertToSquareFeet(squareMeters) {
@@ -114,6 +117,73 @@ export default function App() {
     return [xSum / count, ySum / count];
   }
 
+  function restoreDrawnLayers(mapInstance, drawnCoords) {
+    if (!mapInstance || drawnCoords.length < 3) return;
+
+    const closed = [...drawnCoords, drawnCoords[0]];
+
+    const polygonData = {
+      type: "Feature",
+      geometry: { type: "Polygon", coordinates: [closed] },
+    };
+
+    const pointData = {
+      type: "FeatureCollection",
+      features: drawnCoords.map((coord, i) => ({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: coord },
+        properties: { id: i },
+      })),
+    };
+
+    if (!mapInstance.getSource("drawn-polygon")) {
+      mapInstance.addSource("drawn-polygon", {
+        type: "geojson",
+        data: polygonData,
+      });
+    } else {
+      mapInstance.getSource("drawn-polygon").setData(polygonData);
+    }
+
+    if (!mapInstance.getLayer("drawn-polygon-layer")) {
+      mapInstance.addLayer({
+        id: "drawn-polygon-layer",
+        type: "fill",
+        source: "drawn-polygon",
+        paint: {
+          "fill-color": "#00bcd4",
+          "fill-opacity": 0.4,
+        },
+      });
+    }
+
+    if (!mapInstance.getSource("drawn-points")) {
+      mapInstance.addSource("drawn-points", {
+        type: "geojson",
+        data: pointData,
+      });
+    } else {
+      mapInstance.getSource("drawn-points").setData(pointData);
+    }
+
+    if (!mapInstance.getLayer("drawn-points-layer")) {
+      mapInstance.addLayer(
+        {
+          id: "drawn-points-layer",
+          type: "circle",
+          source: "drawn-points",
+          paint: {
+            "circle-radius": 7,
+            "circle-color": "#ff0000",
+            "circle-stroke-width": 1.5,
+            "circle-stroke-color": "#fff",
+          },
+        },
+        "drawn-polygon-layer"
+      );
+    }
+  }
+
   useEffect(() => {
     if (!map.current) return;
 
@@ -129,8 +199,8 @@ export default function App() {
     console.log("🛰 Fetching address info from:", url);
 
     fetch(url)
-      .then(res => res.json())
-      .then(data => {
+      .then((res) => res.json())
+      .then((data) => {
         console.log("📦 Raw geocode data:", data);
 
         const features = data?.features || [];
@@ -147,7 +217,7 @@ export default function App() {
         console.log("📍 Parsed address info:", address);
         setAddressInfo(address);
       })
-      .catch(err => {
+      .catch((err) => {
         console.error("❌ Failed to fetch address info:", err);
         setAddressInfo(null);
       });
@@ -225,6 +295,7 @@ export default function App() {
     map.current.setStyle(maptilerStyles[basemapStyle]);
 
     map.current.once("styledata", () => {
+      // 🔁 Restore overlay layer
       if (!map.current.getSource("overlay")) {
         map.current.addSource("overlay", {
           type: "geojson",
@@ -246,6 +317,9 @@ export default function App() {
           },
         });
       }
+
+      // 🧩 Restore drawn polygon and points
+      restoreDrawnLayers(map.current, drawnCoords);
     });
   }, [basemapStyle]);
 
@@ -295,12 +369,11 @@ export default function App() {
   useEffect(() => {
     if (!map.current) return;
 
-    if (!drawMode) {
-      // Clear coordinates from state
-      setDrawnCoords([]);
+    const mapRef = map.current;
 
-      // Remove drawn layers and sources from the map
-      const mapRef = map.current;
+    if (!drawMode) {
+      // ✅ We are exiting draw mode, so clear state and remove polygon
+      setDrawnCoords([]);
 
       if (mapRef.getLayer("drawn-polygon-layer")) {
         mapRef.removeLayer("drawn-polygon-layer");
@@ -315,6 +388,9 @@ export default function App() {
       if (mapRef.getSource("drawn-points")) {
         mapRef.removeSource("drawn-points");
       }
+    } else {
+      // ✅ We are entering draw mode, so show the help box
+      setShowHelpBox(true);
     }
   }, [drawMode]);
 
@@ -341,7 +417,6 @@ export default function App() {
 
     // Optional: you could even run a reverse geocode here like in your zone useEffect
     // Or set the zone as the active one and display in sidebar
-
   }, [drawnCoords]);
 
   useEffect(() => {
@@ -391,62 +466,114 @@ export default function App() {
       mapRef.getSource("drawn-points").setData(pointData);
     } else {
       mapRef.addSource("drawn-points", { type: "geojson", data: pointData });
-      mapRef.addLayer({
-        id: "drawn-points-layer",
-        type: "circle",
-        source: "drawn-points",
-        paint: {
-          "circle-radius": 5,
-          "circle-color": "#f00",
+      mapRef.addLayer(
+        {
+          id: "drawn-points-layer",
+          type: "circle",
+          source: "drawn-points",
+          paint: {
+            "circle-radius": 7,
+            "circle-color": "#ff0000",
+            "circle-stroke-width": 1.5,
+            "circle-stroke-color": "#fff",
+          },
         },
-      });
+        "drawn-polygon-layer" // ⬅ Ensure points are added *above* polygon
+      );
     }
   }, [drawnCoords]);
 
   useEffect(() => {
     if (!map.current || drawnCoords.length < 1) return;
 
+    const mapRef = map.current;
     let isDragging = false;
     let dragIndex = null;
+
+    // 🧠 Keep live reference of coords to avoid stale state in drag loop
+    const coordsRef = [...drawnCoords];
 
     const handleMouseDown = (e) => {
       if (!e.features?.length) return;
       const feature = e.features[0];
       if (feature.layer.id !== "drawn-points-layer") return;
 
-      isDragging = true;
       dragIndex = feature.properties.id;
-      map.current.getCanvas().style.cursor = "grabbing";
+      isDragging = true;
+
+      mapRef.getCanvas().style.cursor = "grabbing";
+      mapRef.dragPan.disable();
     };
 
     const handleMouseMove = (e) => {
       if (!isDragging || dragIndex === null) return;
+
       const { lng, lat } = e.lngLat;
+      coordsRef[dragIndex] = [lng, lat];
 
-      setDrawnCoords((prevCoords) => {
-        const updated = [...prevCoords];
-        updated[dragIndex] = [lng, lat];
-        return updated;
-      });
-    };
+      // 🔄 Manually update polygon and point sources
+      const closed = [...coordsRef, coordsRef[0]];
 
-    const handleMouseUp = () => {
-      if (isDragging) {
-        isDragging = false;
-        dragIndex = null;
-        map.current.getCanvas().style.cursor = "";
+      const polygonData = {
+        type: "Feature",
+        geometry: { type: "Polygon", coordinates: [closed] },
+      };
+
+      const pointData = {
+        type: "FeatureCollection",
+        features: coordsRef.map((coord, i) => ({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: coord },
+          properties: { id: i },
+        })),
+      };
+
+      if (mapRef.getSource("drawn-polygon")) {
+        mapRef.getSource("drawn-polygon").setData(polygonData);
+      }
+      if (mapRef.getSource("drawn-points")) {
+        mapRef.getSource("drawn-points").setData(pointData);
       }
     };
 
-    const mapRef = map.current;
+    const handleMouseUp = () => {
+      if (!isDragging) return;
+      isDragging = false;
+      dragIndex = null;
+
+      // ✅ Commit changes to React state after drag ends
+      setDrawnCoords([...coordsRef]);
+
+      mapRef.getCanvas().style.cursor = "";
+      mapRef.dragPan.enable();
+    };
+
+    const handleRightClick = (e) => {
+      if (!e.features?.length) return;
+      const feature = e.features[0];
+      if (feature.layer.id !== "drawn-points-layer") return;
+
+      const idToRemove = feature.properties.id;
+
+      setDrawnCoords((prevCoords) => {
+        const updated = [...prevCoords];
+        updated.splice(idToRemove, 1);
+        return updated;
+      });
+
+      e.preventDefault();
+    };
+
     mapRef.on("mousedown", "drawn-points-layer", handleMouseDown);
     mapRef.on("mousemove", handleMouseMove);
     mapRef.on("mouseup", handleMouseUp);
+    mapRef.on("contextmenu", "drawn-points-layer", handleRightClick);
 
     return () => {
       mapRef.off("mousedown", "drawn-points-layer", handleMouseDown);
       mapRef.off("mousemove", handleMouseMove);
       mapRef.off("mouseup", handleMouseUp);
+      mapRef.off("contextmenu", "drawn-points-layer", handleRightClick);
     };
   }, [drawnCoords]);
 
@@ -585,7 +712,14 @@ export default function App() {
                 fontFamily: "system-ui, sans-serif",
               }}
             >
-              <h2 style={{ fontSize: "1.4rem", marginBottom: "1rem", borderBottom: "2px solid #eee", paddingBottom: "0.5rem" }}>
+              <h2
+                style={{
+                  fontSize: "1.4rem",
+                  marginBottom: "1rem",
+                  borderBottom: "2px solid #eee",
+                  paddingBottom: "0.5rem",
+                }}
+              >
                 Zone Summary
               </h2>
 
@@ -596,27 +730,138 @@ export default function App() {
                 <strong>Type:</strong> {zoneType}
               </p>
               <p style={{ marginBottom: "1rem" }}>
-                <strong>Area:</strong> {currentArea.toFixed(2)} m² / {currentAreaFeet.toFixed(2)} ft²
+                <strong>Area:</strong> {currentArea.toFixed(2)} m² /{" "}
+                {currentAreaFeet.toFixed(2)} ft²
               </p>
 
               {addressInfo && (
                 <>
-                  <h3 style={{ fontSize: "1.1rem", margin: "1.5rem 0 0.5rem", borderBottom: "1px solid #ddd", paddingBottom: "0.25rem" }}>
+                  <h3
+                    style={{
+                      fontSize: "1.1rem",
+                      margin: "1.5rem 0 0.5rem",
+                      borderBottom: "1px solid #ddd",
+                      paddingBottom: "0.25rem",
+                    }}
+                  >
                     Location Details
                   </h3>
-                  <ul style={{ paddingLeft: "1rem", listStyle: "disc", lineHeight: "1.6" }}>
-                    {addressInfo.street && <li><strong>Street:</strong> {addressInfo.street}</li>}
-                    {addressInfo.postalCode && <li><strong>Postal Code:</strong> {addressInfo.postalCode}</li>}
-                    {addressInfo.neighborhood && <li><strong>Neighborhood:</strong> {addressInfo.neighborhood}</li>}
-                    {addressInfo.city && <li><strong>City:</strong> {addressInfo.city}</li>}
-                    {addressInfo.state && <li><strong>State:</strong> {addressInfo.state}</li>}
-                    {addressInfo.country && <li><strong>Country:</strong> {addressInfo.country}</li>}
+                  <ul
+                    style={{
+                      paddingLeft: "1rem",
+                      listStyle: "disc",
+                      lineHeight: "1.6",
+                    }}
+                  >
+                    {addressInfo.street && (
+                      <li>
+                        <strong>Street:</strong> {addressInfo.street}
+                      </li>
+                    )}
+                    {addressInfo.postalCode && (
+                      <li>
+                        <strong>Postal Code:</strong> {addressInfo.postalCode}
+                      </li>
+                    )}
+                    {addressInfo.neighborhood && (
+                      <li>
+                        <strong>Neighborhood:</strong>{" "}
+                        {addressInfo.neighborhood}
+                      </li>
+                    )}
+                    {addressInfo.city && (
+                      <li>
+                        <strong>City:</strong> {addressInfo.city}
+                      </li>
+                    )}
+                    {addressInfo.state && (
+                      <li>
+                        <strong>State:</strong> {addressInfo.state}
+                      </li>
+                    )}
+                    {addressInfo.country && (
+                      <li>
+                        <strong>Country:</strong> {addressInfo.country}
+                      </li>
+                    )}
                   </ul>
                 </>
               )}
             </div>
           }
         </div>
+      )}
+      {drawMode && showHelpBox && (
+        <div
+          style={{
+            position: "absolute",
+            top: "6rem",
+            left: "1rem",
+            backgroundColor: "#fffff3",
+            border: "1px solid #ccc",
+            padding: "1rem",
+            borderRadius: "0.5rem",
+            zIndex: 11,
+            maxWidth: "300px",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+          }}
+        >
+          <button
+            onClick={() => setShowHelpBox(false)}
+            style={{
+              position: "absolute",
+              top: "0.25rem",
+              right: "0.5rem",
+              border: "none",
+              background: "transparent",
+              fontSize: "1.2rem",
+              cursor: "pointer",
+              color: "#888",
+            }}
+            aria-label="Close help"
+          >
+            ×
+          </button>
+          <h4 style={{ marginTop: 0 }}>Drawing Help</h4>
+          <ul
+            style={{
+              paddingLeft: "1rem",
+              fontSize: "0.9rem",
+              lineHeight: "1.5",
+            }}
+          >
+            <li>Click to add points</li>
+            <li>Right-click a point to delete it</li>
+            <li>Click and drag a point to move it</li>
+          </ul>
+        </div>
+      )}
+      {drawMode && !showHelpBox && (
+        <button
+          onClick={() => setShowHelpBox(true)}
+          style={{
+            position: "absolute",
+            top: "6rem",
+            left: "1rem",
+            zIndex: 11,
+            backgroundColor: "#ffffff",
+            color: "#333",
+            border: "1px solid #ccc",
+            borderRadius: "50%",
+            width: "2.5rem",
+            height: "2.5rem",
+            fontSize: "1.25rem",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            boxShadow: "0 2px 6px rgba(0,0,0,0.15)",
+          }}
+          aria-label="Show help"
+          title="Show help"
+        >
+          ℹ️
+        </button>
       )}
     </div>
   );
