@@ -15,7 +15,7 @@ export default function App() {
   // User-drawn polygon coords (open ring, not yet closed)
   const [drawnCoords, setDrawnCoords] = useState([]);
 
-  // Zone attributes
+  // Zone attributes (for in-progress drawing)
   const [useType, setUseType] = useState("mixed-use");
 
   // Sidebar visibility for compact toggle
@@ -28,8 +28,29 @@ export default function App() {
     commercial: "#ef6c00",
   };
 
-  // Derived info for sidebar
-  const [zoneSummary, setZoneSummary] = useState(null); // { areaM2, areaFt2, centroid, address, streets[] }
+  // Derived info for sidebar while drawing
+  const [zoneSummary, setZoneSummary] = useState(null); // { areaM2, areaFt2, centroid, address, streets[], useType }
+
+  // Saved zones and finalize flow
+  const [savedZones, setSavedZones] = useState(() => {
+    try {
+      const raw = localStorage.getItem("sfst.savedZones");
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [showSavePanel, setShowSavePanel] = useState(false);
+  const [pendingName, setPendingName] = useState("");
+  const [pendingDescription, setPendingDescription] = useState("");
+
+  // Selection and editing of saved zones
+  const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
+  const [editingSavedIndex, setEditingSavedIndex] = useState(null);
+
+  useEffect(() => {
+    localStorage.setItem("sfst.savedZones", JSON.stringify(savedZones));
+  }, [savedZones]);
 
   const MAPTILER_KEY = "DyVFUZmyKdCywxRTVU9B";
   const maptilerStyles = {
@@ -124,7 +145,7 @@ export default function App() {
 
   // Ensure sources and layers exist after load/style switch
   function ensureSourcesAndLayers(mapInstance) {
-    // GeoJSON sources
+    // GeoJSON sources for current in-progress zone
     if (!mapInstance.getSource("zones")) {
       mapInstance.addSource("zones", {
         type: "geojson",
@@ -144,7 +165,21 @@ export default function App() {
       });
     }
 
-    // Style polygons by useType
+    // Sources for saved zones
+    if (!mapInstance.getSource("saved-zones")) {
+      mapInstance.addSource("saved-zones", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+    }
+    if (!mapInstance.getSource("saved-centroids")) {
+      mapInstance.addSource("saved-centroids", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+    }
+
+    // In-progress layers
     if (!mapInstance.getLayer("zones-fill")) {
       mapInstance.addLayer({
         id: "zones-fill",
@@ -175,7 +210,6 @@ export default function App() {
       });
     }
 
-    // Centroid pointer as a circle layer
     if (!mapInstance.getLayer("centroids-circle")) {
       mapInstance.addLayer({
         id: "centroids-circle",
@@ -190,7 +224,6 @@ export default function App() {
       });
     }
 
-    // Draggable vertices for drawing
     if (!mapInstance.getLayer("drawn-points-layer")) {
       mapInstance.addLayer({
         id: "drawn-points-layer",
@@ -204,11 +237,91 @@ export default function App() {
         },
       });
     }
+
+    // Saved zones layers
+    if (!mapInstance.getLayer("saved-zones-fill")) {
+      mapInstance.addLayer({
+        id: "saved-zones-fill",
+        type: "fill",
+        source: "saved-zones",
+        paint: {
+          "fill-color": [
+            "match",
+            ["get", "useType"],
+            "mixed-use",
+            colorByUse["mixed-use"],
+            "residential",
+            colorByUse["residential"],
+            "commercial",
+            colorByUse["commercial"],
+            "#888888",
+          ],
+          "fill-opacity": 0.18,
+        },
+      });
+    }
+    if (!mapInstance.getLayer("saved-zones-outline")) {
+      mapInstance.addLayer({
+        id: "saved-zones-outline",
+        type: "line",
+        source: "saved-zones",
+        paint: { "line-color": "#222", "line-width": 1 },
+      });
+    }
+
+    // Selected highlight layers with a filter
+    if (!mapInstance.getLayer("saved-zones-fill-selected")) {
+      mapInstance.addLayer({
+        id: "saved-zones-fill-selected",
+        type: "fill",
+        source: "saved-zones",
+        paint: {
+          // use the same color expression so highlight respects useType colors
+          "fill-color": [
+            "match",
+            ["get", "useType"],
+            "mixed-use",
+            colorByUse["mixed-use"],
+            "residential",
+            colorByUse["residential"],
+            "commercial",
+            colorByUse["commercial"],
+            "#888888",
+          ],
+          "fill-opacity": 0.35,
+        },
+        filter: ["==", ["get", "__sid"], -999],
+      });
+    }
+    if (!mapInstance.getLayer("saved-zones-outline-selected")) {
+      mapInstance.addLayer({
+        id: "saved-zones-outline-selected",
+        type: "line",
+        source: "saved-zones",
+        paint: { "line-color": "#000", "line-width": 3 },
+        filter: ["==", ["get", "__sid"], -999],
+      });
+    }
+  }
+
+  // Update selected filters
+  function applySelectedFilter(mapInstance, idx) {
+    if (!mapInstance) return;
+    const filt =
+      typeof idx === "number"
+        ? ["==", ["get", "__sid"], idx]
+        : ["==", ["get", "__sid"], -999];
+    if (mapInstance.getLayer("saved-zones-fill-selected")) {
+      mapInstance.setFilter("saved-zones-fill-selected", filt);
+    }
+    if (mapInstance.getLayer("saved-zones-outline-selected")) {
+      mapInstance.setFilter("saved-zones-outline-selected", filt);
+    }
   }
 
   // Push current state into map sources
-  function refreshMapData(mapInstance, coords, currentUseType) {
-    // Polygon feature from drawn coords, if 3+
+  function refreshMapData(mapInstance, coords, currentUseType, savedList) {
+    // In-progress zone FC
     let zonesFC = { type: "FeatureCollection", features: [] };
     let centroidsFC = { type: "FeatureCollection", features: [] };
 
@@ -239,9 +352,39 @@ export default function App() {
       })),
     };
 
+    // Saved zones FCs with stable index property for filtering
+    const savedListWithSid = (savedList || []).map((f, i) => {
+      const clone = JSON.parse(JSON.stringify(f));
+      clone.properties = { ...(clone.properties || {}), __sid: i };
+      return clone;
+    });
+    const savedZonesFC = {
+      type: "FeatureCollection",
+      features: savedListWithSid,
+    };
+    const savedCentroidsFC = {
+      type: "FeatureCollection",
+      features: savedListWithSid
+        .map((f, i) => {
+          try {
+            const ctr = turf.centroid(f);
+            return {
+              type: "Feature",
+              properties: { id: i },
+              geometry: ctr.geometry,
+            };
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean),
+    };
+
     mapInstance.getSource("zones")?.setData(zonesFC);
     mapInstance.getSource("centroids")?.setData(centroidsFC);
     mapInstance.getSource("drawn-points")?.setData(pointsFC);
+    mapInstance.getSource("saved-zones")?.setData(savedZonesFC);
+    mapInstance.getSource("saved-centroids")?.setData(savedCentroidsFC);
   }
 
   // --- effects ----------------------------------------------------
@@ -261,7 +404,8 @@ export default function App() {
 
     map.current.on("load", () => {
       ensureSourcesAndLayers(map.current);
-      refreshMapData(map.current, drawnCoords, useType);
+      refreshMapData(map.current, drawnCoords, useType, savedZones);
+      applySelectedFilter(map.current, selectedSavedIndex);
     });
   }, []);
 
@@ -272,9 +416,26 @@ export default function App() {
 
     map.current.once("styledata", () => {
       ensureSourcesAndLayers(map.current);
-      refreshMapData(map.current, drawnCoords, useType);
+      refreshMapData(map.current, drawnCoords, useType, savedZones);
+      applySelectedFilter(map.current, selectedSavedIndex);
     });
   }, [basemapStyle]);
+
+  // Repaint saved zones if the list changes
+  useEffect(() => {
+    if (!map.current) return;
+    refreshMapData(map.current, drawnCoords, useType, savedZones);
+    // Clear selection if index is now out of range
+    setSelectedSavedIndex((idx) =>
+      idx != null && idx < savedZones.length ? idx : null
+    );
+  }, [savedZones]);
+
+  // Apply highlight when selection changes
+  useEffect(() => {
+    if (!map.current) return;
+    applySelectedFilter(map.current, selectedSavedIndex);
+  }, [selectedSavedIndex]);
 
   // Handle clicks in draw mode
   useEffect(() => {
@@ -290,6 +451,30 @@ export default function App() {
     return () => map.current && map.current.off("click", handleMapClick);
   }, [drawMode]);
 
+  // Click on saved zones to select
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+
+    const onClickSaved = (e) => {
+      // Prevent selecting a different zone while editing geometry of another
+      if (editingSavedIndex != null) return;
+      const f = e.features?.[0];
+      if (!f) return;
+      const idx = f.properties?.__sid;
+      if (typeof idx === "number") {
+        setSelectedSavedIndex(idx);
+        applySelectedFilter(m, idx);
+      }
+    };
+
+    m.on("click", "saved-zones-fill", onClickSaved);
+
+    return () => {
+      m.off("click", "saved-zones-fill", onClickSaved);
+    };
+  }, [savedZones, editingSavedIndex]);
+
   // Enter/exit draw mode housekeeping
   useEffect(() => {
     if (!map.current) return;
@@ -298,7 +483,9 @@ export default function App() {
     if (!drawMode) {
       setDrawnCoords([]);
       setZoneSummary(null);
-      refreshMapData(mapRef, [], useType);
+      setShowSavePanel(false);
+      setEditingSavedIndex(null);
+      refreshMapData(mapRef, [], useType, savedZones);
     } else {
       setShowHelpBox(true);
     }
@@ -307,8 +494,14 @@ export default function App() {
   // Render updates when coords change
   useEffect(() => {
     if (!map.current) return;
-    refreshMapData(map.current, drawnCoords, useType);
+    refreshMapData(map.current, drawnCoords, useType, savedZones);
   }, [drawnCoords]);
+
+  // Recolor in-progress polygon immediately when Type changes
+  useEffect(() => {
+    if (!map.current) return;
+    refreshMapData(map.current, drawnCoords, useType, savedZones);
+  }, [useType]);
 
   // Point drag + delete
   useEffect(() => {
@@ -333,7 +526,7 @@ export default function App() {
       if (!isDragging || dragIndex === null) return;
       const { lng, lat } = e.lngLat;
       coordsRef[dragIndex] = [lng, lat];
-      refreshMapData(mapRef, coordsRef, useType);
+      refreshMapData(mapRef, coordsRef, useType, savedZones);
     };
 
     const handleMouseUp = () => {
@@ -365,10 +558,10 @@ export default function App() {
     return () => {
       mapRef.off("mousedown", "drawn-points-layer", handleMouseDown);
       mapRef.off("mousemove", handleMouseMove);
-      mapRef.off("mouseup", handleMouseUp);
+      mapRef.off("mouseup", "drawn-points-layer", handleMouseUp);
       mapRef.off("contextmenu", "drawn-points-layer", handleRightClick);
     };
-  }, [drawnCoords, useType]);
+  }, [drawnCoords, useType, savedZones]);
 
   // Build Zone Summary when polygon has 3+ points
   useEffect(() => {
@@ -395,6 +588,131 @@ export default function App() {
       });
     });
   }, [drawnCoords, useType]);
+
+  // --- Save / finalize helpers -----------------------------------
+  const canFinalize = drawMode && drawnCoords.length >= 3;
+
+  function finalizeZone() {
+    if (!canFinalize) return;
+    setShowSavePanel(true);
+    if (!pendingName.trim())
+      setPendingName(`Custom Zone ${savedZones.length + 1}`);
+  }
+
+  function makeFeatureFromDrawn(nameOverride) {
+    if (!zoneSummary || drawnCoords.length < 3) return null;
+    const closed = [...drawnCoords, drawnCoords[0]];
+    return {
+      type: "Feature",
+      properties: {
+        name:
+          nameOverride ??
+          (pendingName.trim() || `Custom Zone ${savedZones.length + 1}`),
+        description: pendingDescription.trim() || null,
+        useType,
+        areaM2: zoneSummary.areaM2,
+        areaFt2: zoneSummary.areaFt2,
+        address: zoneSummary.address,
+      },
+      geometry: { type: "Polygon", coordinates: [closed] },
+    };
+  }
+
+  function saveZone() {
+    const feature = makeFeatureFromDrawn();
+    if (!feature) return;
+
+    if (editingSavedIndex != null) {
+      setSavedZones((prev) =>
+        prev.map((f, i) => (i === editingSavedIndex ? feature : f))
+      );
+    } else {
+      setSavedZones((prev) => [feature, ...prev]);
+    }
+
+    // Reset draw state
+    setShowSavePanel(false);
+    setPendingName("");
+    setPendingDescription("");
+    setDrawMode(false);
+    setDrawnCoords([]);
+    setZoneSummary(null);
+    setEditingSavedIndex(null);
+  }
+
+  function saveAsNewZone() {
+    const feature = makeFeatureFromDrawn();
+    if (!feature) return;
+    setSavedZones((prev) => [feature, ...prev]);
+    // Keep editing state off after saving as new
+    setShowSavePanel(false);
+    setPendingName("");
+    setPendingDescription("");
+    setDrawMode(false);
+    setDrawnCoords([]);
+    setZoneSummary(null);
+    setEditingSavedIndex(null);
+  }
+
+  // Cancel from the save panel
+  function handleCancelSave() {
+    if (editingSavedIndex != null) {
+      // If we were editing an existing zone, cancel should exit edit mode entirely
+      setShowSavePanel(false);
+      setPendingName("");
+      setPendingDescription("");
+      setDrawMode(false); // triggers cleanup of drawn coords & summary via effect
+      setDrawnCoords([]);
+      setZoneSummary(null);
+      setEditingSavedIndex(null);
+    } else {
+      // If drawing a brand-new zone, just close the save panel (keep drawing)
+      setShowSavePanel(false);
+    }
+  }
+
+  function deleteSaved(index) {
+    setSavedZones((prev) => prev.filter((_, i) => i !== index));
+    if (selectedSavedIndex === index) setSelectedSavedIndex(null);
+  }
+
+  function flyToSaved(feature) {
+    if (!map.current) return;
+    const bb = turf.bbox(feature);
+    map.current.fitBounds(
+      [
+        [bb[0], bb[1]],
+        [bb[2], bb[3]],
+      ],
+      { padding: 40, duration: 700 }
+    );
+  }
+
+  function loadSavedIntoDraw(index, openSavePanel = false) {
+    const f = savedZones[index];
+    if (!f?.geometry?.coordinates?.[0]) return;
+    const ring = f.geometry.coordinates[0];
+    const openRing = ring.slice(0, ring.length - 1);
+    setUseType(f.properties?.useType || useType);
+    setDrawMode(true);
+    setDrawnCoords(openRing);
+    setPendingName(f.properties?.name || "");
+    setPendingDescription(f.properties?.description || "");
+    setEditingSavedIndex(index);
+    setShowSavePanel(openSavePanel);
+  }
+
+  function updateSavedUseType(index, newType) {
+    setSavedZones((prev) =>
+      prev.map((f, i) =>
+        i === index
+          ? { ...f, properties: { ...(f.properties || {}), useType: newType } }
+          : f
+      )
+    );
+  }
+
+  const isEditingSaved = editingSavedIndex != null;
 
   // --- UI ---------------------------------------------------------
 
@@ -430,6 +748,8 @@ export default function App() {
     fontSize: "0.9rem",
   };
 
+  const showRightPanel = zoneSummary || savedZones.length > 0;
+
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
       <div
@@ -447,6 +767,12 @@ export default function App() {
         >
           {drawMode ? "Exit Draw Mode" : "Enter Draw Mode"}
         </button>
+
+        {canFinalize && (
+          <button onClick={finalizeZone} style={{ ...buttonStyle }}>
+            Finalize zone
+          </button>
+        )}
 
         <select
           value={basemapStyle}
@@ -468,7 +794,7 @@ export default function App() {
         </select>
       </div>
 
-      {/* Legend */}
+      {/* Zone type */}
       <div
         style={{
           position: "absolute",
@@ -482,7 +808,9 @@ export default function App() {
           fontSize: "0.9rem",
         }}
       >
-        <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>Legend</div>
+        <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>
+          Zone type
+        </div>
         <div
           style={{
             display: "flex",
@@ -535,6 +863,7 @@ export default function App() {
         </div>
       </div>
 
+      {/* Help box during draw */}
       {drawMode && (
         <div
           style={{
@@ -579,20 +908,25 @@ export default function App() {
                 <li>Click to add points</li>
                 <li>Right-click a point to delete it</li>
                 <li>Drag a point to move it</li>
+                <li>
+                  Use the <strong>Type</strong> dropdown (top-left) to change a
+                  zone’s category/color while drawing or editing. For saved
+                  zones, change <strong>Type</strong> in the Saved Zones list.
+                </li>
               </ul>
             </>
           )}
         </div>
       )}
 
-      {/* Summary panel */}
-      {zoneSummary && (
+      {/* Summary + Saved panel */}
+      {showRightPanel && (
         <>
           <button
             onClick={() => setSidebarVisible(!sidebarVisible)}
             style={{
               position: "absolute",
-              right: sidebarVisible ? "320px" : "0",
+              right: sidebarVisible ? "360px" : "0",
               top: "1rem",
               zIndex: 10,
               backgroundColor: "#007bff",
@@ -615,9 +949,9 @@ export default function App() {
               right: 0,
               top: 0,
               height: "100%",
-              width: "320px",
+              width: "360px",
               backgroundColor: "#fdfdfd",
-              padding: "1.5rem",
+              padding: "1.25rem 1rem",
               boxShadow: "-2px 0 10px rgba(0,0,0,0.1)",
               zIndex: 9,
               overflowY: "auto",
@@ -626,111 +960,349 @@ export default function App() {
               transition: "transform 0.3s ease",
             }}
           >
-            <h2
-              style={{
-                fontSize: "1.4rem",
-                marginBottom: "1rem",
-                borderBottom: "2px solid #eee",
-                paddingBottom: "0.5rem",
-              }}
-            >
-              Zone Summary
-            </h2>
-
-            <p style={{ marginBottom: "0.5rem" }}>
-              <strong>Name:</strong> Custom Zone
-            </p>
-            <p style={{ marginBottom: "0.5rem" }}>
-              <strong>Type:</strong> {zoneSummary.useType}
-            </p>
-            <p style={{ marginBottom: "0.5rem" }}>
-              <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
-              {zoneSummary.areaFt2.toFixed(2)} ft²
-            </p>
-            <p style={{ marginBottom: "1rem" }}>
-              <strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)},{" "}
-              {zoneSummary.centroid[1].toFixed(6)}
-            </p>
-
-            {zoneSummary.address && (
+            {zoneSummary && (
               <>
-                <h3
+                <h2
                   style={{
-                    fontSize: "1.1rem",
-                    margin: "1.5rem 0 0.5rem",
-                    borderBottom: "1px solid #ddd",
-                    paddingBottom: "0.25rem",
+                    fontSize: "1.2rem",
+                    marginBottom: "0.75rem",
+                    borderBottom: "2px solid #eee",
+                    paddingBottom: "0.5rem",
                   }}
                 >
-                  Location Details
-                </h3>
-                <ul
+                  Zone Summary
+                </h2>
+
+                <p style={{ marginBottom: "0.5rem" }}>
+                  <strong>Name:</strong> {pendingName || "Custom Zone"}
+                </p>
+                <p style={{ marginBottom: "0.5rem" }}>
+                  <strong>Type:</strong> {zoneSummary.useType}
+                </p>
+                <p style={{ marginBottom: "0.5rem" }}>
+                  <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
+                  {zoneSummary.areaFt2.toFixed(2)} ft²
+                </p>
+                <p style={{ marginBottom: "1rem" }}>
+                  <strong>Centroid:</strong>{" "}
+                  {zoneSummary.centroid[0].toFixed(6)},{" "}
+                  {zoneSummary.centroid[1].toFixed(6)}
+                </p>
+
+                {zoneSummary.address && (
+                  <>
+                    <h3
+                      style={{
+                        fontSize: "1.05rem",
+                        margin: "1rem 0 0.5rem",
+                        borderBottom: "1px solid #ddd",
+                        paddingBottom: "0.25rem",
+                      }}
+                    >
+                      Location Details
+                    </h3>
+                    <ul
+                      style={{
+                        paddingLeft: "1rem",
+                        listStyle: "disc",
+                        lineHeight: "1.6",
+                      }}
+                    >
+                      {zoneSummary.address.street && (
+                        <li>
+                          <strong>Street:</strong> {zoneSummary.address.street}
+                        </li>
+                      )}
+                      {zoneSummary.address.postalCode && (
+                        <li>
+                          <strong>Postal Code:</strong>{" "}
+                          {zoneSummary.address.postalCode}
+                        </li>
+                      )}
+                      {zoneSummary.address.neighborhood && (
+                        <li>
+                          <strong>Neighborhood:</strong>{" "}
+                          {zoneSummary.address.neighborhood}
+                        </li>
+                      )}
+                      {zoneSummary.address.city && (
+                        <li>
+                          <strong>City:</strong> {zoneSummary.address.city}
+                        </li>
+                      )}
+                      {zoneSummary.address.state && (
+                        <li>
+                          <strong>State:</strong> {zoneSummary.address.state}
+                        </li>
+                      )}
+                      {zoneSummary.address.country && (
+                        <li>
+                          <strong>Country:</strong>{" "}
+                          {zoneSummary.address.country}
+                        </li>
+                      )}
+                    </ul>
+                  </>
+                )}
+
+                {/* Finalize / Save block */}
+                <div
                   style={{
-                    paddingLeft: "1rem",
-                    listStyle: "disc",
-                    lineHeight: "1.6",
+                    marginTop: "1rem",
+                    paddingTop: "0.75rem",
+                    borderTop: "1px solid #eee",
                   }}
                 >
-                  {zoneSummary.address.street && (
-                    <li>
-                      <strong>Street:</strong> {zoneSummary.address.street}
-                    </li>
+                  {!showSavePanel ? (
+                    <button
+                      onClick={finalizeZone}
+                      style={{ ...buttonStyle, backgroundColor: "#17a2b8" }}
+                    >
+                      Finalize & Save
+                    </button>
+                  ) : (
+                    <div style={{ display: "grid", gap: "0.5rem" }}>
+                      {editingSavedIndex != null && (
+                        <div style={{ fontSize: "0.85rem", color: "#555" }}>
+                          Editing saved zone #{editingSavedIndex + 1}
+                        </div>
+                      )}
+                      <label style={{ fontSize: "0.85rem" }}>Name</label>
+                      <input
+                        value={pendingName}
+                        onChange={(e) => setPendingName(e.target.value)}
+                        placeholder="Custom Zone"
+                        style={{
+                          padding: "0.5rem",
+                          border: "1px solid #ccc",
+                          borderRadius: 6,
+                        }}
+                      />
+                      <label style={{ fontSize: "0.85rem" }}>Description</label>
+                      <textarea
+                        value={pendingDescription}
+                        onChange={(e) => setPendingDescription(e.target.value)}
+                        rows={3}
+                        placeholder="Notes, purpose, constraints"
+                        style={{
+                          padding: "0.5rem",
+                          border: "1px solid #ccc",
+                          borderRadius: 6,
+                        }}
+                      />
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: "0.5rem",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <button
+                          onClick={saveZone}
+                          style={{ ...buttonStyle, backgroundColor: "#28a745" }}
+                        >
+                          {editingSavedIndex != null ? "Save changes" : "Save"}
+                        </button>
+                        {editingSavedIndex != null && (
+                          <button
+                            onClick={saveAsNewZone}
+                            style={{ ...buttonStyle }}
+                          >
+                            Save as new
+                          </button>
+                        )}
+                        <button
+                          onClick={handleCancelSave}
+                          style={{ ...buttonStyle }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
                   )}
-                  {zoneSummary.address.postalCode && (
-                    <li>
-                      <strong>Postal Code:</strong>{" "}
-                      {zoneSummary.address.postalCode}
-                    </li>
-                  )}
-                  {zoneSummary.address.neighborhood && (
-                    <li>
-                      <strong>Neighborhood:</strong>{" "}
-                      {zoneSummary.address.neighborhood}
-                    </li>
-                  )}
-                  {zoneSummary.address.city && (
-                    <li>
-                      <strong>City:</strong> {zoneSummary.address.city}
-                    </li>
-                  )}
-                  {zoneSummary.address.state && (
-                    <li>
-                      <strong>State:</strong> {zoneSummary.address.state}
-                    </li>
-                  )}
-                  {zoneSummary.address.country && (
-                    <li>
-                      <strong>Country:</strong> {zoneSummary.address.country}
-                    </li>
-                  )}
-                </ul>
+                </div>
               </>
             )}
 
-            {zoneSummary.streets?.length > 0 && (
-              <>
-                <h3
+            {/* Saved zones list */}
+            {savedZones.length > 0 && (
+              <div style={{ marginTop: zoneSummary ? "1rem" : 0 }}>
+                <h2
                   style={{
-                    fontSize: "1.1rem",
-                    margin: "1.5rem 0 0.5rem",
-                    borderBottom: "1px solid #ddd",
-                    paddingBottom: "0.25rem",
+                    fontSize: "1.2rem",
+                    marginBottom: "0.5rem",
+                    borderBottom: "2px solid #eee",
+                    paddingBottom: "0.5rem",
                   }}
                 >
-                  Streets Inside The Zone
-                </h3>
+                  Saved Zones
+                </h2>
+                {isEditingSaved && (
+                  <div
+                    style={{
+                      background: "#fff3cd",
+                      border: "1px solid #ffeeba",
+                      color: "#856404",
+                      padding: "0.5rem",
+                      borderRadius: 6,
+                      margin: "0.5rem 0",
+                    }}
+                  >
+                    You're editing a zone. Finish or cancel to select or edit a
+                    different one.
+                  </div>
+                )}
                 <ul
                   style={{
-                    paddingLeft: "1rem",
-                    listStyle: "disc",
-                    lineHeight: "1.6",
+                    listStyle: "none",
+                    padding: 0,
+                    margin: 0,
+                    display: "grid",
+                    gap: "0.5rem",
                   }}
                 >
-                  {zoneSummary.streets.map((s) => (
-                    <li key={s}>{s}</li>
+                  {savedZones.map((f, idx) => (
+                    <li
+                      key={idx}
+                      style={{
+                        border: "1px solid #e5e5e5",
+                        borderRadius: 8,
+                        padding: "0.5rem",
+                      }}
+                    >
+                      <div style={{ fontWeight: 600 }}>
+                        {f.properties?.name || `Zone ${idx + 1}`}
+                        {selectedSavedIndex === idx ? " • selected" : ""}
+                      </div>
+                      {f.properties?.description && (
+                        <div style={{ fontSize: "0.85rem", marginTop: 4 }}>
+                          {f.properties.description}
+                        </div>
+                      )}
+                      <div style={{ fontSize: "0.8rem", marginTop: 4 }}>
+                        {f.properties?.address?.street ||
+                          f.properties?.address?.city ||
+                          ""}
+                      </div>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "0.5rem",
+                          marginTop: 6,
+                        }}
+                      >
+                        <span style={{ fontSize: "0.85rem" }}>Type</span>
+                        <select
+                          value={f.properties?.useType || "mixed-use"}
+                          onChange={(e) =>
+                            updateSavedUseType(idx, e.target.value)
+                          }
+                          style={selectStyle}
+                        >
+                          <option value="mixed-use">Mixed Use</option>
+                          <option value="residential">Residential</option>
+                          <option value="commercial">Commercial</option>
+                        </select>
+                        <span
+                          style={{
+                            width: 12,
+                            height: 12,
+                            borderRadius: 2,
+                            backgroundColor:
+                              colorByUse[f.properties?.useType || "mixed-use"],
+                            display: "inline-block",
+                            border: "1px solid #ccc",
+                          }}
+                        />
+                      </div>
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: "0.5rem",
+                          marginTop: 6,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <button
+                          disabled={isEditingSaved}
+                          onClick={() => {
+                            if (isEditingSaved) return;
+                            setSelectedSavedIndex(idx);
+                            applySelectedFilter(map.current, idx);
+                            flyToSaved(f);
+                          }}
+                          title={
+                            isEditingSaved
+                              ? "Finish or cancel current edit first"
+                              : "Select"
+                          }
+                          style={{
+                            ...buttonStyle,
+                            opacity: isEditingSaved ? 0.6 : 1,
+                            cursor: isEditingSaved ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          Select
+                        </button>
+                        <button
+                          disabled={isEditingSaved && editingSavedIndex !== idx}
+                          onClick={() => {
+                            if (isEditingSaved && editingSavedIndex !== idx)
+                              return;
+                            loadSavedIntoDraw(idx, true);
+                          }}
+                          title={
+                            isEditingSaved && editingSavedIndex !== idx
+                              ? "Finish or cancel current edit first"
+                              : "Edit geometry"
+                          }
+                          style={{
+                            ...buttonStyle,
+                            backgroundColor: "#17a2b8",
+                            opacity:
+                              isEditingSaved && editingSavedIndex !== idx
+                                ? 0.6
+                                : 1,
+                            cursor:
+                              isEditingSaved && editingSavedIndex !== idx
+                                ? "not-allowed"
+                                : "pointer",
+                          }}
+                        >
+                          {isEditingSaved && editingSavedIndex === idx
+                            ? "Editing…"
+                            : "Edit geometry"}
+                        </button>
+                        <button
+                          disabled={isEditingSaved && editingSavedIndex !== idx}
+                          onClick={() => deleteSaved(idx)}
+                          title={
+                            isEditingSaved && editingSavedIndex !== idx
+                              ? "Finish or cancel current edit first"
+                              : "Delete"
+                          }
+                          style={{
+                            ...buttonStyle,
+                            backgroundColor: "#dc3545",
+                            color: "#fff",
+                            opacity:
+                              isEditingSaved && editingSavedIndex !== idx
+                                ? 0.6
+                                : 1,
+                            cursor:
+                              isEditingSaved && editingSavedIndex !== idx
+                                ? "not-allowed"
+                                : "pointer",
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </li>
                   ))}
                 </ul>
-              </>
+              </div>
             )}
           </div>
         </>
