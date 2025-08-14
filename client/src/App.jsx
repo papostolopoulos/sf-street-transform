@@ -748,6 +748,12 @@ export default function App() {
     fontSize: "0.9rem",
   };
 
+  const labelStyle = {
+    fontSize: "0.75rem",
+    fontWeight: 600,
+    color: "#555",
+  };
+
   const showRightPanel = zoneSummary || savedZones.length > 0;
 
   return (
@@ -758,15 +764,19 @@ export default function App() {
       />
 
       <div style={controlPanelStyle}>
-        <button
-          onClick={() => setDrawMode(!drawMode)}
-          style={{
-            ...buttonStyle,
-            backgroundColor: drawMode ? "#28a745" : "#ffc107",
-          }}
-        >
-          {drawMode ? "Exit Draw Mode" : "Enter Draw Mode"}
-        </button>
+        <div style={{ display: "grid", gap: "0.25rem", minWidth: 140 }}>
+          <div style={labelStyle}>Drawing</div>
+          <button
+            onClick={() => setDrawMode(!drawMode)}
+            title="Toggle drawing mode"
+            style={{
+              ...buttonStyle,
+              backgroundColor: drawMode ? "#28a745" : "#ffc107",
+            }}
+          >
+            {drawMode ? "Exit Draw Mode" : "Enter Draw Mode"}
+          </button>
+        </div>
 
         {canFinalize && (
           <button onClick={finalizeZone} style={{ ...buttonStyle }}>
@@ -774,24 +784,32 @@ export default function App() {
           </button>
         )}
 
-        <select
-          value={basemapStyle}
-          onChange={(e) => setBasemapStyle(e.target.value)}
-          style={selectStyle}
-        >
-          <option value="streets">Streets</option>
-          <option value="satellite">Satellite</option>
-        </select>
+        <div style={{ display: "grid", gap: "0.25rem", minWidth: 140 }}>
+          <div style={labelStyle}>Basemap</div>
+          <select
+            value={basemapStyle}
+            onChange={(e) => setBasemapStyle(e.target.value)}
+            title="Switch base map style"
+            style={selectStyle}
+          >
+            <option value="streets">Streets</option>
+            <option value="satellite">Satellite</option>
+          </select>
+        </div>
 
-        <select
-          value={useType}
-          onChange={(e) => setUseType(e.target.value)}
-          style={selectStyle}
-        >
-          <option value="mixed-use">Mixed Use</option>
-          <option value="residential">Residential</option>
-          <option value="commercial">Commercial</option>
-        </select>
+        <div style={{ display: "grid", gap: "0.25rem", minWidth: 160 }}>
+          <div style={labelStyle}>Zone type</div>
+          <select
+            value={useType}
+            onChange={(e) => setUseType(e.target.value)}
+            title="Choose category/color for the polygon you're drawing"
+            style={selectStyle}
+          >
+            <option value="mixed-use">Mixed Use</option>
+            <option value="residential">Residential</option>
+            <option value="commercial">Commercial</option>
+          </select>
+        </div>
       </div>
 
       {/* Zone type */}
@@ -909,9 +927,10 @@ export default function App() {
                 <li>Right-click a point to delete it</li>
                 <li>Drag a point to move it</li>
                 <li>
-                  Use the <strong>Type</strong> dropdown (top-left) to change a
-                  zone’s category/color while drawing or editing. For saved
-                  zones, change <strong>Type</strong> in the Saved Zones list.
+                  Use the <strong>Zone type</strong> dropdown (top-left) to
+                  change a zone’s category/color while drawing or editing. For
+                  saved zones, change <strong>Type</strong> in the Saved Zones
+                  list.
                 </li>
               </ul>
             </>
