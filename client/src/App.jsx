@@ -28,8 +28,12 @@ export default function App() {
     commercial: "#ef6c00",
   };
 
-  // Derived info for sidebar while drawing
-  const [zoneSummary, setZoneSummary] = useState(null); // { areaM2, areaFt2, centroid, address, streets[], useType }
+  // Derived info for sidebar while drawing or when a saved zone is selected
+  // { areaM2, areaFt2, centroid, address, streets[], useType }
+  const [zoneSummary, setZoneSummary] = useState(null);
+
+  // Where the current summary comes from: 'draw' | 'saved' | null
+  const [summaryContext, setSummaryContext] = useState(null);
 
   // Saved zones and finalize flow
   const [savedZones, setSavedZones] = useState(() => {
@@ -48,6 +52,24 @@ export default function App() {
   const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
   const [editingSavedIndex, setEditingSavedIndex] = useState(null);
 
+  // A) Add near other state (we’ll also use this in #2/#3/#6)
+  const [sidebarWidth, setSidebarWidth] = useState(360);
+
+  // Distinct “card” backgrounds
+  const cardStyle = {
+    background: "#ffffff",
+    border: "1px solid #e5e7eb",
+    borderRadius: 8,
+    padding: "0.75rem",
+  };
+
+  const altCardStyle = {
+    background: "#f7f9ff",
+    border: "1px solid #dbeafe",
+    borderRadius: 8,
+    padding: "0.75rem",
+  };
+
   useEffect(() => {
     localStorage.setItem("sfst.savedZones", JSON.stringify(savedZones));
   }, [savedZones]);
@@ -64,19 +86,19 @@ export default function App() {
     return squareMeters * 10.7639;
   }
 
-  // Visible road layers in current style
+  // Visible road/name layers in current style (include symbol labels)
   function getRoadLayerIds(mapInstance) {
     const style = mapInstance.getStyle();
     if (!style?.layers) return [];
+    const tokens = ["transportation", "road", "street", "highway"];
     return style.layers
-      .filter(
-        (lyr) =>
-          lyr.type === "line" &&
-          (lyr["source-layer"]?.toLowerCase().includes("transportation") ||
-            lyr.id.toLowerCase().includes("road") ||
-            lyr["source-layer"]?.toLowerCase().includes("road") ||
-            lyr.id.toLowerCase().includes("street"))
-      )
+      .filter((lyr) => {
+        const id = (lyr.id || "").toLowerCase();
+        const sl = (lyr["source-layer"] || "").toLowerCase();
+        const isLineOrSymbol = lyr.type === "line" || lyr.type === "symbol";
+        const matches = tokens.some((t) => id.includes(t) || sl.includes(t));
+        return isLineOrSymbol && matches;
+      })
       .map((lyr) => lyr.id);
   }
 
@@ -100,46 +122,76 @@ export default function App() {
     }
   }
 
-  // Streets that intersect the polygon
+  // Streets that intersect the polygon (works with lines & symbol labels)
   function getIntersectingStreetNames(mapInstance, polygon) {
     const layerIds = getRoadLayerIds(mapInstance);
-    if (!layerIds.length) return [];
+    if (!mapInstance) return [];
 
-    const bbox = turf.bbox(polygon); // [minX, minY, maxX, maxY]
-    const sw = mapInstance.project([bbox[0], bbox[1]]);
-    const ne = mapInstance.project([bbox[2], bbox[3]]);
+    // Build a pixel bbox: [[minX,minY], [maxX,maxY]]
+    const [minLng, minLat, maxLng, maxLat] = turf.bbox(polygon);
+    const p1 = mapInstance.project([minLng, minLat]);
+    const p2 = mapInstance.project([maxLng, maxLat]);
+    const pad = 12;
+    const minX = Math.min(p1.x, p2.x) - pad;
+    const minY = Math.min(p1.y, p2.y) - pad;
+    const maxX = Math.max(p1.x, p2.x) + pad;
+    const maxY = Math.max(p1.y, p2.y) + pad;
     const pixelBox = [
-      Math.min(sw.x, ne.x),
-      Math.min(sw.y, ne.y),
-      Math.max(sw.x, ne.x),
-      Math.max(sw.y, ne.y),
+      [minX, minY],
+      [maxX, maxY],
     ];
 
-    const candidates = mapInstance.queryRenderedFeatures(pixelBox, {
-      layers: layerIds,
-    });
+    const options = layerIds.length ? { layers: layerIds } : undefined;
+
+    // First try just the bbox; if empty, fall back to whole viewport.
+    let candidates = mapInstance.queryRenderedFeatures(pixelBox, options);
+    if (!candidates || candidates.length === 0) {
+      candidates = mapInstance.queryRenderedFeatures(options);
+    }
 
     const names = new Set();
-    for (const feat of candidates) {
-      if (
-        feat.geometry?.type !== "LineString" &&
-        feat.geometry?.type !== "MultiLineString"
-      )
-        continue;
-      const asTurf =
-        feat.geometry.type === "LineString"
-          ? turf.lineString(feat.geometry.coordinates)
-          : turf.multiLineString(feat.geometry.coordinates);
+    const nameKeys = [
+      "name",
+      "name_en",
+      "name:en",
+      "name:latin",
+      "street",
+      "ref",
+    ];
 
-      if (turf.booleanIntersects(asTurf, polygon)) {
-        const name =
-          feat.properties?.name ||
-          feat.properties?.street ||
-          feat.properties?.class ||
-          null;
-        if (name) names.add(name);
+    for (const feat of candidates) {
+      // pick a readable name
+      let name = null;
+      for (const k of nameKeys) {
+        if (feat.properties?.[k]) {
+          name = feat.properties[k];
+          break;
+        }
+      }
+      if (!name && feat.properties?.class) name = feat.properties.class;
+      if (!name) continue;
+
+      const g = feat.geometry?.type;
+      if (g === "LineString" || g === "MultiLineString") {
+        const asTurf =
+          g === "LineString"
+            ? turf.lineString(feat.geometry.coordinates)
+            : turf.multiLineString(feat.geometry.coordinates);
+        if (turf.booleanIntersects(asTurf, polygon)) names.add(name);
+      } else if (g === "Point") {
+        const pt = turf.point(feat.geometry.coordinates);
+        if (turf.booleanPointInPolygon(pt, polygon)) names.add(name);
+      } else if (g === "MultiPoint") {
+        for (const c of feat.geometry.coordinates || []) {
+          const pt = turf.point(c);
+          if (turf.booleanPointInPolygon(pt, polygon)) {
+            names.add(name);
+            break;
+          }
+        }
       }
     }
+
     return Array.from(names).sort((a, b) => a.localeCompare(b));
   }
 
@@ -276,7 +328,6 @@ export default function App() {
         type: "fill",
         source: "saved-zones",
         paint: {
-          // use the same color expression so highlight respects useType colors
           "fill-color": [
             "match",
             ["get", "useType"],
@@ -387,6 +438,43 @@ export default function App() {
     mapInstance.getSource("saved-centroids")?.setData(savedCentroidsFC);
   }
 
+  // Build a zone summary from any Feature<Polygon>
+  async function buildSummaryFromFeature(mapInstance, feature, typeFallback) {
+    if (!feature?.geometry?.type || feature.geometry.type !== "Polygon")
+      return null;
+
+    const poly = feature; // GeoJSON Feature<Polygon>
+    const areaM2 = turf.area(poly);
+    const areaFt2 = convertToSquareFeet(areaM2);
+
+    // Safe centroid
+    const centroidPt = turf.centroid(poly).geometry.coordinates; // [lng,lat]
+
+    // Streets from visible road layers
+    const streets = getIntersectingStreetNames(mapInstance, poly);
+
+    // Reverse geocode
+    const addr = await reverseGeocode(centroidPt[0], centroidPt[1]);
+
+    return {
+      areaM2,
+      areaFt2,
+      centroid: centroidPt,
+      address: addr,
+      streets,
+      useType: feature.properties?.useType || typeFallback || "mixed-use",
+    };
+  }
+
+  //Gives asymmetric padding when the sidebar is visible
+  // Add this helper
+  function getMapPadding() {
+    const base = 40;
+    // Keep the polygon away from the sidebar by padding its side
+    const rightPad = sidebarVisible ? sidebarWidth + 24 : base;
+    return { top: base, bottom: base, left: base, right: rightPad };
+  }
+
   // --- effects ----------------------------------------------------
 
   // Init map
@@ -414,6 +502,7 @@ export default function App() {
     if (!map.current) return;
     map.current.setStyle(maptilerStyles[basemapStyle]);
 
+    // Wait for the new style to finish loading sources/layers
     map.current.once("styledata", () => {
       ensureSourcesAndLayers(map.current);
       refreshMapData(map.current, drawnCoords, useType, savedZones);
@@ -435,6 +524,11 @@ export default function App() {
   useEffect(() => {
     if (!map.current) return;
     applySelectedFilter(map.current, selectedSavedIndex);
+  }, [selectedSavedIndex]);
+
+  // Auto-open sidebar when selecting a saved zone
+  useEffect(() => {
+    if (selectedSavedIndex != null) setSidebarVisible(true);
   }, [selectedSavedIndex]);
 
   // Handle clicks in draw mode
@@ -465,6 +559,9 @@ export default function App() {
       if (typeof idx === "number") {
         setSelectedSavedIndex(idx);
         applySelectedFilter(m, idx);
+        // Also fly to the zone on map-click
+        const feature = savedZones[idx];
+        if (feature) flyToSaved(feature);
       }
     };
 
@@ -473,7 +570,7 @@ export default function App() {
     return () => {
       m.off("click", "saved-zones-fill", onClickSaved);
     };
-  }, [savedZones, editingSavedIndex]);
+  }, [savedZones, editingSavedIndex, basemapStyle]);
 
   // Enter/exit draw mode housekeeping
   useEffect(() => {
@@ -485,8 +582,11 @@ export default function App() {
       setZoneSummary(null);
       setShowSavePanel(false);
       setEditingSavedIndex(null);
+      setSummaryContext(null);
       refreshMapData(mapRef, [], useType, savedZones);
     } else {
+      // Entering draw mode: keep summaryContext as set by loadSavedIntoDraw()
+      setSelectedSavedIndex(null);
       setShowHelpBox(true);
     }
   }, [drawMode]);
@@ -563,7 +663,7 @@ export default function App() {
     };
   }, [drawnCoords, useType, savedZones]);
 
-  // Build Zone Summary when polygon has 3+ points
+  // Build Zone Summary when polygon has 3+ points (drawing)
   useEffect(() => {
     if (!map.current || drawnCoords.length < 3) return;
 
@@ -586,8 +686,52 @@ export default function App() {
         streets,
         useType,
       });
+      setSummaryContext("draw");
     });
   }, [drawnCoords, useType]);
+
+  // Compute summary when a saved zone is selected
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+
+    // Don’t rebuild from "saved" while we’re editing
+    if (drawMode && editingSavedIndex != null) return;
+
+    if (selectedSavedIndex == null) {
+      if (!drawMode) {
+        setZoneSummary(null);
+        setSummaryContext(null);
+      }
+      return;
+    }
+
+    const f = savedZones[selectedSavedIndex];
+    if (!f) return;
+
+    const build = async () => {
+      const summary = await buildSummaryFromFeature(
+        m,
+        f,
+        f?.properties?.useType
+      );
+      if (summary) {
+        setZoneSummary(summary);
+        setSummaryContext("saved");
+      }
+    };
+
+    // If the map is still moving (from flyTo), wait until it settles
+    if (m.isMoving()) {
+      const onIdle = () => {
+        m.off("idle", onIdle);
+        build();
+      };
+      m.on("idle", onIdle);
+    } else {
+      build();
+    }
+  }, [selectedSavedIndex, savedZones, drawMode, editingSavedIndex]);
 
   // --- Save / finalize helpers -----------------------------------
   const canFinalize = drawMode && drawnCoords.length >= 3;
@@ -638,6 +782,7 @@ export default function App() {
     setDrawnCoords([]);
     setZoneSummary(null);
     setEditingSavedIndex(null);
+    setSummaryContext(null);
   }
 
   function saveAsNewZone() {
@@ -652,6 +797,7 @@ export default function App() {
     setDrawnCoords([]);
     setZoneSummary(null);
     setEditingSavedIndex(null);
+    setSummaryContext(null);
   }
 
   // Cancel from the save panel
@@ -661,10 +807,11 @@ export default function App() {
       setShowSavePanel(false);
       setPendingName("");
       setPendingDescription("");
-      setDrawMode(false); // triggers cleanup of drawn coords & summary via effect
+      setDrawMode(false); // triggers cleanup via effect
       setDrawnCoords([]);
       setZoneSummary(null);
       setEditingSavedIndex(null);
+      setSummaryContext(null);
     } else {
       // If drawing a brand-new zone, just close the save panel (keep drawing)
       setShowSavePanel(false);
@@ -684,22 +831,71 @@ export default function App() {
         [bb[0], bb[1]],
         [bb[2], bb[3]],
       ],
-      { padding: 40, duration: 700 }
+      { padding: getMapPadding(), duration: 700 }
     );
   }
 
   function loadSavedIntoDraw(index, openSavePanel = false) {
     const f = savedZones[index];
     if (!f?.geometry?.coordinates?.[0]) return;
-    const ring = f.geometry.coordinates[0];
-    const openRing = ring.slice(0, ring.length - 1);
-    setUseType(f.properties?.useType || useType);
-    setDrawMode(true);
-    setDrawnCoords(openRing);
+
+    // Important: clear selection first so the "saved summary" effect won't run
+    setSelectedSavedIndex(null);
+    setEditingSavedIndex(index);
+
+    const ring = f.geometry.coordinates[0]; // closed ring
+    const openRing = ring.slice(0, ring.length - 1); // open ring
+    const type = f.properties?.useType || useType;
+
+    // Put app into draw/edit state
+    setUseType(type);
     setPendingName(f.properties?.name || "");
     setPendingDescription(f.properties?.description || "");
-    setEditingSavedIndex(index);
     setShowSavePanel(openSavePanel);
+    setSidebarVisible(true);
+
+    // Make the finalize/edit UI appear immediately
+    setSummaryContext("draw");
+
+    // Fit the feature with the same sidebar-aware padding
+    flyToSaved(f);
+
+    // After “Edit geometry” fly, refresh the streets once the camera is idle
+    if (map.current) {
+      const m = map.current;
+      const onIdle = () => {
+        m.off("idle", onIdle);
+        try {
+          const ring = f.geometry.coordinates[0];
+          const poly = turf.polygon([ring], {
+            useType: f.properties?.useType || useType,
+          });
+          const streets = getIntersectingStreetNames(m, poly);
+          setZoneSummary((s) => (s ? { ...s, streets } : s));
+        } catch {}
+      };
+      m.on("idle", onIdle);
+    }
+
+    // Seed a minimal summary synchronously
+    try {
+      const poly = turf.polygon([ring], { useType: type });
+      const areaM2 = turf.area(poly);
+      const areaFt2 = convertToSquareFeet(areaM2);
+      const centroidPt = turf.centroid(poly).geometry.coordinates;
+      setZoneSummary({
+        areaM2,
+        areaFt2,
+        centroid: centroidPt,
+        address: f.properties?.address || null,
+        streets: [],
+        useType: type,
+      });
+    } catch {}
+
+    // Finally flip to draw mode and paint the open ring
+    setDrawMode(true);
+    setDrawnCoords(openRing);
   }
 
   function updateSavedUseType(index, newType) {
@@ -710,6 +906,25 @@ export default function App() {
           : f
       )
     );
+  }
+
+  function startSidebarResize(e) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+
+    const onMove = (ev) => {
+      const dx = startX - ev.clientX; // drag left = grow
+      const next = Math.max(300, Math.min(560, startW + dx));
+      setSidebarWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   }
 
   const isEditingSaved = editingSavedIndex != null;
@@ -755,6 +970,13 @@ export default function App() {
   };
 
   const showRightPanel = zoneSummary || savedZones.length > 0;
+
+  // Display name for the summary header
+  const displayName =
+    summaryContext === "saved"
+      ? savedZones[selectedSavedIndex]?.properties?.name ??
+        (selectedSavedIndex != null ? `Zone ${selectedSavedIndex + 1}` : "Zone")
+      : pendingName || "Custom Zone";
 
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
@@ -812,7 +1034,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Zone type */}
+      {/* Zone type legend */}
       <div
         style={{
           position: "absolute",
@@ -945,7 +1167,7 @@ export default function App() {
             onClick={() => setSidebarVisible(!sidebarVisible)}
             style={{
               position: "absolute",
-              right: sidebarVisible ? "360px" : "0",
+              right: sidebarVisible ? `${sidebarWidth}px` : "0",
               top: "1rem",
               zIndex: 10,
               backgroundColor: "#007bff",
@@ -956,10 +1178,11 @@ export default function App() {
               cursor: "pointer",
               transition: "right 0.3s",
             }}
-            aria-label="Toggle summary"
-            title="Toggle summary"
+            aria-label={sidebarVisible ? "Hide summary" : "Show summary"}
+            title={sidebarVisible ? "Hide summary" : "Show summary"}
           >
-            {sidebarVisible ? "❮" : "❯"}
+            {/* Show the action, not the state */}
+            {sidebarVisible ? "❯" : "❮"}
           </button>
 
           <div
@@ -968,7 +1191,7 @@ export default function App() {
               right: 0,
               top: 0,
               height: "100%",
-              width: "360px",
+              width: `${sidebarWidth}px`,
               backgroundColor: "#fdfdfd",
               padding: "1.25rem 1rem",
               boxShadow: "-2px 0 10px rgba(0,0,0,0.1)",
@@ -979,164 +1202,218 @@ export default function App() {
               transition: "transform 0.3s ease",
             }}
           >
+            {/* ← resizer HANDLE (child), not the container */}
+            <div
+              onMouseDown={startSidebarResize}
+              title="Resize"
+              style={{
+                position: "absolute",
+                left: 0, // sits over the left padding area
+                top: 0,
+                width: 6,
+                height: "100%",
+                cursor: "ew-resize",
+                background: "transparent",
+              }}
+            />
             {zoneSummary && (
               <>
-                <h2
-                  style={{
-                    fontSize: "1.2rem",
-                    marginBottom: "0.75rem",
-                    borderBottom: "2px solid #eee",
-                    paddingBottom: "0.5rem",
-                  }}
-                >
-                  Zone Summary
-                </h2>
+                <div style={cardStyle}>
+                  <h2
+                    style={{
+                      fontSize: "1.2rem",
+                      marginBottom: "0.75rem",
+                      borderBottom: "2px solid #eee",
+                      paddingBottom: "0.5rem",
+                    }}
+                  >
+                    Zone Summary
+                  </h2>
 
-                <p style={{ marginBottom: "0.5rem" }}>
-                  <strong>Name:</strong> {pendingName || "Custom Zone"}
-                </p>
-                <p style={{ marginBottom: "0.5rem" }}>
-                  <strong>Type:</strong> {zoneSummary.useType}
-                </p>
-                <p style={{ marginBottom: "0.5rem" }}>
-                  <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
-                  {zoneSummary.areaFt2.toFixed(2)} ft²
-                </p>
-                <p style={{ marginBottom: "1rem" }}>
-                  <strong>Centroid:</strong>{" "}
-                  {zoneSummary.centroid[0].toFixed(6)},{" "}
-                  {zoneSummary.centroid[1].toFixed(6)}
-                </p>
+                  <p style={{ marginBottom: "0.5rem" }}>
+                    <strong>Name:</strong> {displayName}
+                  </p>
+                  <p style={{ marginBottom: "0.5rem" }}>
+                    <strong>Type:</strong> {zoneSummary.useType}
+                  </p>
+                  <p style={{ marginBottom: "0.5rem" }}>
+                    <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
+                    {zoneSummary.areaFt2.toFixed(2)} ft²
+                  </p>
+                  <p style={{ marginBottom: "1rem" }}>
+                    <strong>Centroid:</strong>{" "}
+                    {zoneSummary.centroid[0].toFixed(6)},{" "}
+                    {zoneSummary.centroid[1].toFixed(6)}
+                  </p>
 
-                {zoneSummary.address && (
-                  <>
-                    <h3
-                      style={{
-                        fontSize: "1.05rem",
-                        margin: "1rem 0 0.5rem",
-                        borderBottom: "1px solid #ddd",
-                        paddingBottom: "0.25rem",
-                      }}
-                    >
-                      Location Details
-                    </h3>
-                    <ul
-                      style={{
-                        paddingLeft: "1rem",
-                        listStyle: "disc",
-                        lineHeight: "1.6",
-                      }}
-                    >
-                      {zoneSummary.address.street && (
-                        <li>
-                          <strong>Street:</strong> {zoneSummary.address.street}
-                        </li>
-                      )}
-                      {zoneSummary.address.postalCode && (
-                        <li>
-                          <strong>Postal Code:</strong>{" "}
-                          {zoneSummary.address.postalCode}
-                        </li>
-                      )}
-                      {zoneSummary.address.neighborhood && (
-                        <li>
-                          <strong>Neighborhood:</strong>{" "}
-                          {zoneSummary.address.neighborhood}
-                        </li>
-                      )}
-                      {zoneSummary.address.city && (
-                        <li>
-                          <strong>City:</strong> {zoneSummary.address.city}
-                        </li>
-                      )}
-                      {zoneSummary.address.state && (
-                        <li>
-                          <strong>State:</strong> {zoneSummary.address.state}
-                        </li>
-                      )}
-                      {zoneSummary.address.country && (
-                        <li>
-                          <strong>Country:</strong>{" "}
-                          {zoneSummary.address.country}
-                        </li>
-                      )}
-                    </ul>
-                  </>
-                )}
-
-                {/* Finalize / Save block */}
-                <div
-                  style={{
-                    marginTop: "1rem",
-                    paddingTop: "0.75rem",
-                    borderTop: "1px solid #eee",
-                  }}
-                >
-                  {!showSavePanel ? (
-                    <button
-                      onClick={finalizeZone}
-                      style={{ ...buttonStyle, backgroundColor: "#17a2b8" }}
-                    >
-                      Finalize & Save
-                    </button>
-                  ) : (
-                    <div style={{ display: "grid", gap: "0.5rem" }}>
-                      {editingSavedIndex != null && (
-                        <div style={{ fontSize: "0.85rem", color: "#555" }}>
-                          Editing saved zone #{editingSavedIndex + 1}
-                        </div>
-                      )}
-                      <label style={{ fontSize: "0.85rem" }}>Name</label>
-                      <input
-                        value={pendingName}
-                        onChange={(e) => setPendingName(e.target.value)}
-                        placeholder="Custom Zone"
+                  {zoneSummary.address && (
+                    <>
+                      <h3
                         style={{
-                          padding: "0.5rem",
-                          border: "1px solid #ccc",
-                          borderRadius: 6,
-                        }}
-                      />
-                      <label style={{ fontSize: "0.85rem" }}>Description</label>
-                      <textarea
-                        value={pendingDescription}
-                        onChange={(e) => setPendingDescription(e.target.value)}
-                        rows={3}
-                        placeholder="Notes, purpose, constraints"
-                        style={{
-                          padding: "0.5rem",
-                          border: "1px solid #ccc",
-                          borderRadius: 6,
-                        }}
-                      />
-                      <div
-                        style={{
-                          display: "flex",
-                          gap: "0.5rem",
-                          flexWrap: "wrap",
+                          fontSize: "1.05rem",
+                          margin: "1rem 0 0.5rem",
+                          borderBottom: "1px solid #ddd",
+                          paddingBottom: "0.25rem",
                         }}
                       >
-                        <button
-                          onClick={saveZone}
-                          style={{ ...buttonStyle, backgroundColor: "#28a745" }}
-                        >
-                          {editingSavedIndex != null ? "Save changes" : "Save"}
-                        </button>
-                        {editingSavedIndex != null && (
-                          <button
-                            onClick={saveAsNewZone}
-                            style={{ ...buttonStyle }}
-                          >
-                            Save as new
-                          </button>
+                        Location Details
+                      </h3>
+                      <ul
+                        style={{
+                          paddingLeft: "1rem",
+                          listStyle: "disc",
+                          lineHeight: "1.6",
+                        }}
+                      >
+                        {zoneSummary.address.street && (
+                          <li>
+                            <strong>Street:</strong>{" "}
+                            {zoneSummary.address.street}
+                          </li>
                         )}
+                        {zoneSummary.address.postalCode && (
+                          <li>
+                            <strong>Postal Code:</strong>{" "}
+                            {zoneSummary.address.postalCode}
+                          </li>
+                        )}
+                        {zoneSummary.address.neighborhood && (
+                          <li>
+                            <strong>Neighborhood:</strong>{" "}
+                            {zoneSummary.address.neighborhood}
+                          </li>
+                        )}
+                        {zoneSummary.address.city && (
+                          <li>
+                            <strong>City:</strong> {zoneSummary.address.city}
+                          </li>
+                        )}
+                        {zoneSummary.address.state && (
+                          <li>
+                            <strong>State:</strong> {zoneSummary.address.state}
+                          </li>
+                        )}
+                        {zoneSummary.address.country && (
+                          <li>
+                            <strong>Country:</strong>{" "}
+                            {zoneSummary.address.country}
+                          </li>
+                        )}
+                      </ul>
+                    </>
+                  )}
+
+                  {zoneSummary.streets && zoneSummary.streets.length > 0 && (
+                    <>
+                      <h3
+                        style={{
+                          fontSize: "1.05rem",
+                          margin: "1rem 0 0.5rem",
+                          borderBottom: "1px solid #ddd",
+                          paddingBottom: "0.25rem",
+                        }}
+                      >
+                        Streets intersecting zone
+                      </h3>
+                      <ul
+                        style={{
+                          paddingLeft: "1rem",
+                          listStyle: "disc",
+                          lineHeight: "1.6",
+                        }}
+                      >
+                        {zoneSummary.streets.map((s, i) => (
+                          <li key={i}>{s}</li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+
+                  {/* Finalize / Save block only for drawings */}
+                  {(summaryContext === "draw" || editingSavedIndex != null) && (
+                    <div
+                      style={{
+                        marginTop: "1rem",
+                        paddingTop: "0.75rem",
+                        borderTop: "1px solid #eee",
+                      }}
+                    >
+                      {!showSavePanel ? (
                         <button
-                          onClick={handleCancelSave}
-                          style={{ ...buttonStyle }}
+                          onClick={finalizeZone}
+                          style={{ ...buttonStyle, backgroundColor: "#17a2b8" }}
                         >
-                          Cancel
+                          Finalize & Save
                         </button>
-                      </div>
+                      ) : (
+                        <div style={{ display: "grid", gap: "0.5rem" }}>
+                          {editingSavedIndex != null && (
+                            <div style={{ fontSize: "0.85rem", color: "#555" }}>
+                              Editing saved zone #{editingSavedIndex + 1}
+                            </div>
+                          )}
+                          <label style={{ fontSize: "0.85rem" }}>Name</label>
+                          <input
+                            value={pendingName}
+                            onChange={(e) => setPendingName(e.target.value)}
+                            placeholder="Custom Zone"
+                            style={{
+                              padding: "0.5rem",
+                              border: "1px solid #ccc",
+                              borderRadius: 6,
+                            }}
+                          />
+                          <label style={{ fontSize: "0.85rem" }}>
+                            Description
+                          </label>
+                          <textarea
+                            value={pendingDescription}
+                            onChange={(e) =>
+                              setPendingDescription(e.target.value)
+                            }
+                            rows={3}
+                            placeholder="Notes, purpose, constraints"
+                            style={{
+                              padding: "0.5rem",
+                              border: "1px solid #ccc",
+                              borderRadius: 6,
+                            }}
+                          />
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: "0.5rem",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <button
+                              onClick={saveZone}
+                              style={{
+                                ...buttonStyle,
+                                backgroundColor: "#28a745",
+                              }}
+                            >
+                              {editingSavedIndex != null
+                                ? "Save changes"
+                                : "Save"}
+                            </button>
+                            {editingSavedIndex != null && (
+                              <button
+                                onClick={saveAsNewZone}
+                                style={{ ...buttonStyle }}
+                              >
+                                Save as new
+                              </button>
+                            )}
+                            <button
+                              onClick={handleCancelSave}
+                              style={{ ...buttonStyle }}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1146,181 +1423,208 @@ export default function App() {
             {/* Saved zones list */}
             {savedZones.length > 0 && (
               <div style={{ marginTop: zoneSummary ? "1rem" : 0 }}>
-                <h2
+                {/* Saved Zones "card" with a distinct background */}
+                <div
                   style={{
-                    fontSize: "1.2rem",
-                    marginBottom: "0.5rem",
-                    borderBottom: "2px solid #eee",
-                    paddingBottom: "0.5rem",
+                    background: "#f7f9ff", // <-- tinted card so it contrasts with the white Zone Summary
+                    border: "1px solid #dbeafe",
+                    borderRadius: 8,
+                    padding: "0.75rem",
                   }}
                 >
-                  Saved Zones
-                </h2>
-                {isEditingSaved && (
-                  <div
+                  <h2
                     style={{
-                      background: "#fff3cd",
-                      border: "1px solid #ffeeba",
-                      color: "#856404",
-                      padding: "0.5rem",
-                      borderRadius: 6,
-                      margin: "0.5rem 0",
+                      fontSize: "1.2rem",
+                      marginBottom: "0.5rem",
+                      borderBottom: "2px solid #cfe1ff",
+                      paddingBottom: "0.5rem",
                     }}
                   >
-                    You're editing a zone. Finish or cancel to select or edit a
-                    different one.
-                  </div>
-                )}
-                <ul
-                  style={{
-                    listStyle: "none",
-                    padding: 0,
-                    margin: 0,
-                    display: "grid",
-                    gap: "0.5rem",
-                  }}
-                >
-                  {savedZones.map((f, idx) => (
-                    <li
-                      key={idx}
+                    Saved Zones
+                  </h2>
+
+                  {isEditingSaved && (
+                    <div
                       style={{
-                        border: "1px solid #e5e5e5",
-                        borderRadius: 8,
+                        background: "#fff3cd",
+                        border: "1px solid #ffeeba",
+                        color: "#856404",
                         padding: "0.5rem",
+                        borderRadius: 6,
+                        margin: "0.5rem 0",
                       }}
                     >
-                      <div style={{ fontWeight: 600 }}>
-                        {f.properties?.name || `Zone ${idx + 1}`}
-                        {selectedSavedIndex === idx ? " • selected" : ""}
-                      </div>
-                      {f.properties?.description && (
-                        <div style={{ fontSize: "0.85rem", marginTop: 4 }}>
-                          {f.properties.description}
+                      You're editing a zone. Finish or cancel to select or edit
+                      a different one.
+                    </div>
+                  )}
+
+                  <ul
+                    style={{
+                      listStyle: "none",
+                      padding: 0,
+                      margin: 0,
+                      display: "grid",
+                      gap: "0.5rem",
+                    }}
+                  >
+                    {savedZones.map((f, idx) => (
+                      <li
+                        key={idx}
+                        style={{
+                          background: "#fff", // item cards pop against the blue-ish container
+                          border: "1px solid #e5e5e5",
+                          borderRadius: 8,
+                          padding: "0.5rem",
+                        }}
+                      >
+                        <div style={{ fontWeight: 600 }}>
+                          {f.properties?.name || `Zone ${idx + 1}`}
+                          {selectedSavedIndex === idx ? " • selected" : ""}
                         </div>
-                      )}
-                      <div style={{ fontSize: "0.8rem", marginTop: 4 }}>
-                        {f.properties?.address?.street ||
-                          f.properties?.address?.city ||
-                          ""}
-                      </div>
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: "0.5rem",
-                          marginTop: 6,
-                        }}
-                      >
-                        <span style={{ fontSize: "0.85rem" }}>Type</span>
-                        <select
-                          value={f.properties?.useType || "mixed-use"}
-                          onChange={(e) =>
-                            updateSavedUseType(idx, e.target.value)
-                          }
-                          style={selectStyle}
-                        >
-                          <option value="mixed-use">Mixed Use</option>
-                          <option value="residential">Residential</option>
-                          <option value="commercial">Commercial</option>
-                        </select>
-                        <span
+
+                        {f.properties?.description && (
+                          <div style={{ fontSize: "0.85rem", marginTop: 4 }}>
+                            {f.properties.description}
+                          </div>
+                        )}
+
+                        <div style={{ fontSize: "0.8rem", marginTop: 4 }}>
+                          {f.properties?.address?.street ||
+                            f.properties?.address?.city ||
+                            ""}
+                        </div>
+
+                        <div
                           style={{
-                            width: 12,
-                            height: 12,
-                            borderRadius: 2,
-                            backgroundColor:
-                              colorByUse[f.properties?.useType || "mixed-use"],
-                            display: "inline-block",
-                            border: "1px solid #ccc",
-                          }}
-                        />
-                      </div>
-                      <div
-                        style={{
-                          display: "flex",
-                          gap: "0.5rem",
-                          marginTop: 6,
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <button
-                          disabled={isEditingSaved}
-                          onClick={() => {
-                            if (isEditingSaved) return;
-                            setSelectedSavedIndex(idx);
-                            applySelectedFilter(map.current, idx);
-                            flyToSaved(f);
-                          }}
-                          title={
-                            isEditingSaved
-                              ? "Finish or cancel current edit first"
-                              : "Select"
-                          }
-                          style={{
-                            ...buttonStyle,
-                            opacity: isEditingSaved ? 0.6 : 1,
-                            cursor: isEditingSaved ? "not-allowed" : "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "0.5rem",
+                            marginTop: 6,
                           }}
                         >
-                          Select
-                        </button>
-                        <button
-                          disabled={isEditingSaved && editingSavedIndex !== idx}
-                          onClick={() => {
-                            if (isEditingSaved && editingSavedIndex !== idx)
-                              return;
-                            loadSavedIntoDraw(idx, true);
-                          }}
-                          title={
-                            isEditingSaved && editingSavedIndex !== idx
-                              ? "Finish or cancel current edit first"
-                              : "Edit geometry"
-                          }
+                          <span style={{ fontSize: "0.85rem" }}>Type</span>
+                          <select
+                            value={f.properties?.useType || "mixed-use"}
+                            onChange={(e) =>
+                              updateSavedUseType(idx, e.target.value)
+                            }
+                            style={selectStyle}
+                          >
+                            <option value="mixed-use">Mixed Use</option>
+                            <option value="residential">Residential</option>
+                            <option value="commercial">Commercial</option>
+                          </select>
+                          <span
+                            style={{
+                              width: 12,
+                              height: 12,
+                              borderRadius: 2,
+                              backgroundColor:
+                                colorByUse[
+                                  f.properties?.useType || "mixed-use"
+                                ],
+                              display: "inline-block",
+                              border: "1px solid #ccc",
+                            }}
+                          />
+                        </div>
+
+                        <div
                           style={{
-                            ...buttonStyle,
-                            backgroundColor: "#17a2b8",
-                            opacity:
-                              isEditingSaved && editingSavedIndex !== idx
-                                ? 0.6
-                                : 1,
-                            cursor:
-                              isEditingSaved && editingSavedIndex !== idx
+                            display: "flex",
+                            gap: "0.5rem",
+                            marginTop: 6,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <button
+                            disabled={isEditingSaved}
+                            onClick={() => {
+                              if (isEditingSaved) return;
+                              setSelectedSavedIndex(idx);
+                              applySelectedFilter(map.current, idx);
+                              flyToSaved(f);
+                            }}
+                            title={
+                              isEditingSaved
+                                ? "Finish or cancel current edit first"
+                                : "Select"
+                            }
+                            style={{
+                              ...buttonStyle,
+                              opacity: isEditingSaved ? 0.6 : 1,
+                              cursor: isEditingSaved
                                 ? "not-allowed"
                                 : "pointer",
-                          }}
-                        >
-                          {isEditingSaved && editingSavedIndex === idx
-                            ? "Editing…"
-                            : "Edit geometry"}
-                        </button>
-                        <button
-                          disabled={isEditingSaved && editingSavedIndex !== idx}
-                          onClick={() => deleteSaved(idx)}
-                          title={
-                            isEditingSaved && editingSavedIndex !== idx
-                              ? "Finish or cancel current edit first"
-                              : "Delete"
-                          }
-                          style={{
-                            ...buttonStyle,
-                            backgroundColor: "#dc3545",
-                            color: "#fff",
-                            opacity:
+                            }}
+                          >
+                            Select
+                          </button>
+
+                          <button
+                            disabled={
                               isEditingSaved && editingSavedIndex !== idx
-                                ? 0.6
-                                : 1,
-                            cursor:
+                            }
+                            onClick={() => {
+                              if (isEditingSaved && editingSavedIndex !== idx)
+                                return;
+                              loadSavedIntoDraw(idx, true);
+                            }}
+                            title={
                               isEditingSaved && editingSavedIndex !== idx
-                                ? "not-allowed"
-                                : "pointer",
-                          }}
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+                                ? "Finish or cancel current edit first"
+                                : "Edit geometry"
+                            }
+                            style={{
+                              ...buttonStyle,
+                              backgroundColor: "#17a2b8",
+                              opacity:
+                                isEditingSaved && editingSavedIndex !== idx
+                                  ? 0.6
+                                  : 1,
+                              cursor:
+                                isEditingSaved && editingSavedIndex !== idx
+                                  ? "not-allowed"
+                                  : "pointer",
+                            }}
+                          >
+                            {isEditingSaved && editingSavedIndex === idx
+                              ? "Editing…"
+                              : "Edit geometry"}
+                          </button>
+
+                          <button
+                            disabled={
+                              isEditingSaved && editingSavedIndex !== idx
+                            }
+                            onClick={() => deleteSaved(idx)}
+                            title={
+                              isEditingSaved && editingSavedIndex !== idx
+                                ? "Finish or cancel current edit first"
+                                : "Delete"
+                            }
+                            style={{
+                              ...buttonStyle,
+                              backgroundColor: "#dc3545",
+                              color: "#fff",
+                              opacity:
+                                isEditingSaved && editingSavedIndex !== idx
+                                  ? 0.6
+                                  : 1,
+                              cursor:
+                                isEditingSaved && editingSavedIndex !== idx
+                                  ? "not-allowed"
+                                  : "pointer",
+                            }}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               </div>
             )}
           </div>
