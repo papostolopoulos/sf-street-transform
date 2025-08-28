@@ -21,6 +21,11 @@ export default function App() {
   // Sidebar visibility for compact toggle
   const [sidebarVisible, setSidebarVisible] = useState(true);
 
+  // [SEGMENT] state
+  const [segmentMode, setSegmentMode] = useState(false);
+  const [selectedSegments, setSelectedSegments] = useState([]); // Array<Feature<LineString|MultiLineString>>
+  const [segmentWidthMeters, setSegmentWidthMeters] = useState(16); // corridor total width
+
   // Centralized colors per use type
   const colorByUse = {
     "mixed-use": "#7e57c2",
@@ -353,6 +358,82 @@ export default function App() {
         filter: ["==", ["get", "__sid"], -999],
       });
     }
+
+    // [SEGMENT] sources for selected street lines and their buffered polygon
+    if (!mapInstance.getSource("street-selections")) {
+      mapInstance.addSource("street-selections", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+    }
+    if (!mapInstance.getSource("street-buffer")) {
+      mapInstance.addSource("street-buffer", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+    }
+
+    // [SEGMENT] selected lines styling
+    if (!mapInstance.getLayer("street-selections-line")) {
+      mapInstance.addLayer({
+        id: "street-selections-line",
+        type: "line",
+        source: "street-selections",
+        paint: {
+          "line-color": "#ff2d55",
+          "line-width": 6,
+          "line-opacity": 0.9,
+        },
+      });
+    }
+    if (!mapInstance.getLayer("street-selections-casing")) {
+      mapInstance.addLayer({
+        id: "street-selections-casing",
+        type: "line",
+        source: "street-selections",
+        paint: {
+          "line-color": "#ffffff",
+          "line-width": 2,
+          "line-opacity": 0.9,
+        },
+      });
+    }
+
+    // [SEGMENT] buffered polygon styling
+    if (!mapInstance.getLayer("street-buffer-fill")) {
+      mapInstance.addLayer({
+        id: "street-buffer-fill",
+        type: "fill",
+        source: "street-buffer",
+        paint: {
+          "fill-color": "#ff9fbf",
+          "fill-opacity": 0.25,
+        },
+      });
+    }
+    if (!mapInstance.getLayer("street-buffer-outline")) {
+      mapInstance.addLayer({
+        id: "street-buffer-outline",
+        type: "line",
+        source: "street-buffer",
+        paint: {
+          "line-color": "#d61b5b",
+          "line-width": 2,
+        },
+      });
+    }
+  }
+
+  // [SEGMENT] refresh selection and buffer sources
+  function refreshStreetSelectionData(mapInstance, lines, totalWidthMeters) {
+    const linesFC = { type: "FeatureCollection", features: lines || [] };
+    mapInstance.getSource("street-selections")?.setData(linesFC);
+
+    const buffered = buildBufferedPolygonFromSegments(lines || [], totalWidthMeters);
+    const bufFC = buffered
+      ? { type: "FeatureCollection", features: [buffered] }
+      : { type: "FeatureCollection", features: [] };
+    mapInstance.getSource("street-buffer")?.setData(bufFC);
   }
 
   // Update selected filters
@@ -475,6 +556,109 @@ export default function App() {
     return { top: base, bottom: base, left: base, right: rightPad };
   }
 
+  // [SEGMENT] unique key builder for toggle logic
+  function keyForRenderedFeature(f) {
+    const sl = f?.sourceLayer || f?.source_layer || f?.["source-layer"] || f?.layer?.["source-layer"] || "";
+    const pid = f?.id ?? f?.properties?.id ?? f?.properties?.osm_id ?? f?.properties?.osm_way_id ?? Math.random();
+    return `${sl}::${pid}`;
+  }
+
+  // [SEGMENT] normalize a rendered road feature into GeoJSON Feature(s)
+  function toLineFeatures(renderedFeature) {
+    const g = renderedFeature?.geometry?.type || renderedFeature?.geometry?.type;
+    if (!g) return [];
+    const geom = renderedFeature.geometry;
+    const props = { ...(renderedFeature.properties || {}) };
+    if (g === "LineString") {
+      return [{ type: "Feature", properties: props, geometry: { type: "LineString", coordinates: geom.coordinates } }];
+    }
+    if (g === "MultiLineString") {
+      return [{ type: "Feature", properties: props, geometry: { type: "MultiLineString", coordinates: geom.coordinates } }];
+    }
+    return [];
+  }
+
+  // [SEGMENT] build a buffered polygon from the current selection
+  function buildBufferedPolygonFromSegments(lines, totalWidthMeters) {
+    if (!lines.length) return null;
+    const half = Math.max(0.5, totalWidthMeters / 2); // turf.buffer uses radius from the line
+    let unionPoly = null;
+
+    for (const lf of lines) {
+      // guard for empty coordinates
+      if (!lf?.geometry || !lf.geometry.coordinates || lf.geometry.coordinates.length === 0) continue;
+      try {
+        const buf = turf.buffer(lf, half, { units: "meters", steps: 8 });
+        unionPoly = unionPoly ? turf.union(unionPoly, buf) : buf;
+      } catch {}
+    }
+
+    // Ensure a Feature<Polygon>
+    if (!unionPoly) return null;
+    if (unionPoly.geometry.type === "Polygon") return unionPoly;
+    if (unionPoly.geometry.type === "MultiPolygon") {
+      // pick the largest part as a practical polygon
+      const parts = unionPoly.geometry.coordinates.map(coords => turf.polygon(coords));
+      parts.sort((a, b) => turf.area(b) - turf.area(a));
+      return parts[0] || null;
+    }
+    return null;
+  }
+
+  // [SEGMENT] fly to current buffer
+function flyToCurrentBuffer() {
+  if (!map.current) return;
+  const buffered = buildBufferedPolygonFromSegments(selectedSegments, segmentWidthMeters);
+  if (!buffered) return;
+  const bb = turf.bbox(buffered);
+  map.current.fitBounds([[bb[0], bb[1]], [bb[2], bb[3]]], { padding: getMapPadding(), duration: 700 });
+}
+
+// [SEGMENT] finalize from street selection (saves as a new zone)
+async function finalizeStreetSelection() {
+  const buffered = buildBufferedPolygonFromSegments(selectedSegments, segmentWidthMeters);
+  if (!buffered) return;
+
+  // compute summary just like buildSummaryFromFeature
+  const summary = await buildSummaryFromFeature(map.current, buffered, useType);
+  if (!summary) return;
+
+  const name = `Street Segment Zone ${savedZones.length + 1}`;
+  const feature = {
+    type: "Feature",
+    properties: {
+      name,
+      description: `Auto-buffered from ${selectedSegments.length} street segment(s) at ~${segmentWidthMeters} m width`,
+      useType,
+      areaM2: summary.areaM2,
+      areaFt2: summary.areaFt2,
+      address: summary.address,
+    },
+    geometry: buffered.geometry,
+  };
+
+  setSavedZones((prev) => [feature, ...prev]);
+
+  // reset selection
+  setSelectedSegments([]);
+  refreshStreetSelectionData(map.current, [], segmentWidthMeters);
+
+  // show the summary for what we just saved
+  setZoneSummary(summary);
+  setSummaryContext("saved");
+  setSelectedSavedIndex(0); // newest at top
+  flyToSaved(feature);
+}
+
+  // Fly to a saved zone by feature
+  function flyToSaved(feature) {
+    if (!map.current || !feature?.geometry) return;
+    try {
+      const bb = turf.bbox(feature);
+      map.current.fitBounds([[bb[0], bb[1]], [bb[2], bb[3]]], { padding: getMapPadding(), duration: 700 });
+    } catch {}
+  }
+
   // --- effects ----------------------------------------------------
 
   // Init map
@@ -493,6 +677,7 @@ export default function App() {
     map.current.on("load", () => {
       ensureSourcesAndLayers(map.current);
       refreshMapData(map.current, drawnCoords, useType, savedZones);
+      refreshStreetSelectionData(map.current, selectedSegments, segmentWidthMeters);
       applySelectedFilter(map.current, selectedSavedIndex);
     });
   }, []);
@@ -506,6 +691,7 @@ export default function App() {
     map.current.once("styledata", () => {
       ensureSourcesAndLayers(map.current);
       refreshMapData(map.current, drawnCoords, useType, savedZones);
+      refreshStreetSelectionData(map.current, selectedSegments, segmentWidthMeters);
       applySelectedFilter(map.current, selectedSavedIndex);
     });
   }, [basemapStyle]);
@@ -514,6 +700,7 @@ export default function App() {
   useEffect(() => {
     if (!map.current) return;
     refreshMapData(map.current, drawnCoords, useType, savedZones);
+    refreshStreetSelectionData(map.current, selectedSegments, segmentWidthMeters);
     // Clear selection if index is now out of range
     setSelectedSavedIndex((idx) =>
       idx != null && idx < savedZones.length ? idx : null
@@ -595,12 +782,14 @@ export default function App() {
   useEffect(() => {
     if (!map.current) return;
     refreshMapData(map.current, drawnCoords, useType, savedZones);
+    refreshStreetSelectionData(map.current, selectedSegments, segmentWidthMeters);
   }, [drawnCoords]);
 
   // Recolor in-progress polygon immediately when Type changes
   useEffect(() => {
     if (!map.current) return;
     refreshMapData(map.current, drawnCoords, useType, savedZones);
+    refreshStreetSelectionData(map.current, selectedSegments, segmentWidthMeters);
   }, [useType]);
 
   // Point drag + delete
@@ -732,6 +921,89 @@ export default function App() {
       build();
     }
   }, [selectedSavedIndex, savedZones, drawMode, editingSavedIndex]);
+
+  // [SEGMENT] handle map clicks to toggle street segments
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+
+    const onClick = (e) => {
+      if (!segmentMode) return;
+
+      // search for road features among visible road layers
+      const layerIds = getRoadLayerIds(m);
+      const opts = layerIds.length ? { layers: layerIds } : undefined;
+      const feats = m.queryRenderedFeatures(e.point, opts) || [];
+
+      // pick the first line-like feature
+      let picked = null;
+      for (const f of feats) {
+        const t = f?.geometry?.type;
+        if (t === "LineString" || t === "MultiLineString") {
+          picked = f;
+          break;
+        }
+      }
+      if (!picked) return;
+
+      // toggle by unique key
+      const k = keyForRenderedFeature(picked);
+      setSelectedSegments((prev) => {
+        // build a map for quick toggle
+        const mapByKey = new Map();
+        prev.forEach((pf, i) => mapByKey.set(pf.__key, { pf, i }));
+
+        if (mapByKey.has(k)) {
+          // remove from selection
+          const { i } = mapByKey.get(k);
+          const next = prev.slice();
+          next.splice(i, 1);
+          // update sources immediately
+          refreshStreetSelectionData(m, next, segmentWidthMeters);
+          return next;
+        } else {
+          // add normalized lines
+          const lines = toLineFeatures(picked).map((lf) => ({ ...lf, __key: k }));
+          const next = prev.concat(lines);
+          refreshStreetSelectionData(m, next, segmentWidthMeters);
+          return next;
+        }
+      });
+    };
+
+    m.on("click", onClick);
+    return () => m.off("click", onClick);
+  }, [segmentMode, segmentWidthMeters]);
+
+  // [SEGMENT] refresh buffer if width changes
+  useEffect(() => {
+    if (!map.current) return;
+    refreshStreetSelectionData(map.current, selectedSegments, segmentWidthMeters);
+  }, [segmentWidthMeters]);
+
+  // [SEGMENT] keep sources updated on selectedSegments changes
+  useEffect(() => {
+    if (!map.current) return;
+    refreshStreetSelectionData(map.current, selectedSegments, segmentWidthMeters);
+  }, [selectedSegments]);
+
+  // [SEGMENT] leaving segment mode clears selection
+  useEffect(() => {
+    if (!map.current) return;
+    if (!segmentMode) {
+      setSelectedSegments([]);
+      refreshStreetSelectionData(map.current, [], segmentWidthMeters);
+    }
+  }, [segmentMode]);
+
+  // When segment mode turns on, ensure we are not in draw mode
+  useEffect(() => {
+    if (segmentMode && drawMode) setDrawMode(false);
+  }, [segmentMode]);
+
+  // Leaving draw mode already resets its state in your code.
+  // We also already clear segment selection when segmentMode goes off.
+
 
   // --- Save / finalize helpers -----------------------------------
   const canFinalize = drawMode && drawnCoords.length >= 3;
@@ -1032,6 +1304,72 @@ export default function App() {
             <option value="commercial">Commercial</option>
           </select>
         </div>
+
+        {/* [SEGMENT] Street selection controls */}
+        <div style={{ display: "grid", gap: "0.25rem", minWidth: 180 }}>
+          <div style={labelStyle}>Street selection</div>
+          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+            <button
+              onClick={() => setSegmentMode((v) => !v)}
+              title="Select existing road segments to form a zone"
+              style={{
+                ...buttonStyle,
+                backgroundColor: segmentMode ? "#28a745" : "#ffc107",
+              }}
+            >
+              {segmentMode ? "Exit Selection" : "Select Streets"}
+            </button>
+            <button
+              onClick={flyToCurrentBuffer}
+              disabled={!selectedSegments.length}
+              style={{ ...buttonStyle, opacity: selectedSegments.length ? 1 : 0.6 }}
+              title="Zoom to current buffer"
+            >
+              Zoom to buffer
+            </button>
+          </div>
+
+          <div style={{ display: "grid", gap: 6, marginTop: 6 }}>
+            <label style={labelStyle}>
+              Corridor width (m)
+            </label>
+            <input
+              type="number"
+              min={2}
+              max={60}
+              step={1}
+              value={segmentWidthMeters}
+              onChange={(e) => setSegmentWidthMeters(Number(e.target.value || 0))}
+              style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6, width: 120 }}
+              title="Approx total corridor width to buffer streets"
+            />
+            <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+              <button
+                onClick={finalizeStreetSelection}
+                disabled={!selectedSegments.length}
+                style={{
+                  ...buttonStyle,
+                  backgroundColor: "#17a2b8",
+                  opacity: selectedSegments.length ? 1 : 0.6,
+                }}
+                title="Create a zone from the selected streets"
+              >
+                Finalize from Streets
+              </button>
+              <button
+                onClick={() => {
+                  setSelectedSegments([]);
+                  refreshStreetSelectionData(map.current, [], segmentWidthMeters);
+                }}
+                disabled={!selectedSegments.length}
+                style={{ ...buttonStyle, opacity: selectedSegments.length ? 1 : 0.6 }}
+                title="Clear current selection"
+              >
+                Clear selection
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Zone type legend */}
@@ -1154,6 +1492,59 @@ export default function App() {
                   saved zones, change <strong>Type</strong> in the Saved Zones
                   list.
                 </li>
+              </ul>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Help box during street segment selection */}
+      {segmentMode && (
+        <div
+          style={{
+            position: "absolute",
+            top: "6rem",
+            left: "1rem",
+            backgroundColor: "#f3f9ff",
+            border: "1px solid #bcd",
+            padding: "1rem",
+            borderRadius: "0.5rem",
+            zIndex: 11,
+            maxWidth: "300px",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+          }}
+        >
+          <button
+            onClick={() => setShowHelpBox(!showHelpBox)}
+            style={{
+              position: "absolute",
+              top: "0.25rem",
+              right: "0.5rem",
+              border: "none",
+              background: "transparent",
+              fontSize: "1.2rem",
+              cursor: "pointer",
+              color: "#888",
+            }}
+            aria-label="Toggle help"
+          >
+            {showHelpBox ? "×" : "ℹ️"}
+          </button>
+          {showHelpBox && (
+            <>
+              <h4 style={{ marginTop: 0 }}>Street Selection Help</h4>
+              <ul
+                style={{
+                  paddingLeft: "1rem",
+                  fontSize: "0.9rem",
+                  lineHeight: "1.5",
+                }}
+              >
+                <li>Click a street to add it to your selection.</li>
+                <li>Click again to remove it.</li>
+                <li>Use the <strong>Corridor width</strong> field to adjust buffer size.</li>
+                <li>Click <strong>Finalize from Streets</strong> to save as a new zone.</li>
+                <li>Use <strong>Clear selection</strong> to reset.</li>
               </ul>
             </>
           )}
