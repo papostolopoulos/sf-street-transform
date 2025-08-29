@@ -107,6 +107,20 @@ export default function App() {
       .map((lyr) => lyr.id);
   }
 
+  // Only line layers for picking/intersection logic
+  function getRoadLineLayerIds(mapInstance) {
+    const style = mapInstance.getStyle();
+    if (!style?.layers) return [];
+    const tokens = ["transportation", "road", "street", "highway"];
+    return style.layers
+      .filter((lyr) => {
+        const id = (lyr.id || "").toLowerCase();
+        const sl = (lyr["source-layer"] || "").toLowerCase();
+        return lyr.type === "line" && tokens.some(t => id.includes(t) || sl.includes(t));
+      })
+      .map((lyr) => lyr.id);
+  }
+
   // Reverse geocode for centroid {lng,lat}
   async function reverseGeocode(lng, lat) {
     const url = `https://api.maptiler.com/geocoding/${lng},${lat}.json?key=${MAPTILER_KEY}`;
@@ -132,56 +146,35 @@ export default function App() {
     const layerIds = getRoadLayerIds(mapInstance);
     if (!mapInstance) return [];
 
-    // Build a pixel bbox: [[minX,minY], [maxX,maxY]]
     const [minLng, minLat, maxLng, maxLat] = turf.bbox(polygon);
     const p1 = mapInstance.project([minLng, minLat]);
     const p2 = mapInstance.project([maxLng, maxLat]);
     const pad = 12;
-    const minX = Math.min(p1.x, p2.x) - pad;
-    const minY = Math.min(p1.y, p2.y) - pad;
-    const maxX = Math.max(p1.x, p2.x) + pad;
-    const maxY = Math.max(p1.y, p2.y) + pad;
-    const pixelBox = [
-      [minX, minY],
-      [maxX, maxY],
-    ];
-
+    const pixelBox = [[Math.min(p1.x, p2.x)-pad, Math.min(p1.y, p2.y)-pad],[Math.max(p1.x, p2.x)+pad, Math.max(p1.y, p2.y)+pad]];
     const options = layerIds.length ? { layers: layerIds } : undefined;
 
-    // First try just the bbox; if empty, fall back to whole viewport.
     let candidates = mapInstance.queryRenderedFeatures(pixelBox, options);
     if (!candidates || candidates.length === 0) {
       candidates = mapInstance.queryRenderedFeatures(options);
     }
 
+    // keep only drivable line-like or their labels that belong to drivable lines
+    candidates = (candidates || []).filter(f => isGeneralTrafficRoad(f.properties));
+
     const names = new Set();
-    const nameKeys = [
-      "name",
-      "name_en",
-      "name:en",
-      "name:latin",
-      "street",
-      "ref",
-    ];
+    const nameKeys = ["name","name_en","name:en","name:latin","street","ref"];
 
     for (const feat of candidates) {
-      // pick a readable name
       let name = null;
-      for (const k of nameKeys) {
-        if (feat.properties?.[k]) {
-          name = feat.properties[k];
-          break;
-        }
-      }
+      for (const k of nameKeys) { if (feat.properties?.[k]) { name = feat.properties[k]; break; } }
       if (!name && feat.properties?.class) name = feat.properties.class;
       if (!name) continue;
 
       const g = feat.geometry?.type;
       if (g === "LineString" || g === "MultiLineString") {
-        const asTurf =
-          g === "LineString"
-            ? turf.lineString(feat.geometry.coordinates)
-            : turf.multiLineString(feat.geometry.coordinates);
+        const asTurf = g === "LineString"
+          ? turf.lineString(feat.geometry.coordinates)
+          : turf.multiLineString(feat.geometry.coordinates);
         if (turf.booleanIntersects(asTurf, polygon)) names.add(name);
       } else if (g === "Point") {
         const pt = turf.point(feat.geometry.coordinates);
@@ -189,16 +182,14 @@ export default function App() {
       } else if (g === "MultiPoint") {
         for (const c of feat.geometry.coordinates || []) {
           const pt = turf.point(c);
-          if (turf.booleanPointInPolygon(pt, polygon)) {
-            names.add(name);
-            break;
-          }
+          if (turf.booleanPointInPolygon(pt, polygon)) { names.add(name); break; }
         }
       }
     }
 
     return Array.from(names).sort((a, b) => a.localeCompare(b));
   }
+
 
   // Ensure sources and layers exist after load/style switch
   function ensureSourcesAndLayers(mapInstance) {
@@ -578,6 +569,134 @@ export default function App() {
     return [];
   }
 
+  // --- [SEGMENT] precise selection helpers ------------------------------------
+
+  // Flatten any LineString/MultiLineString to an array of LineString features.
+  function explodeToLineStrings(feat) {
+    if (!feat?.geometry) return [];
+    const g = feat.geometry.type;
+    const props = { ...(feat.properties || {}) };
+    if (g === "LineString") return [{ type: "Feature", properties: props, geometry: { type: "LineString", coordinates: feat.geometry.coordinates } }];
+    if (g === "MultiLineString") {
+      return feat.geometry.coordinates.map(coords => ({
+        type: "Feature",
+        properties: props,
+        geometry: { type: "LineString", coordinates: coords }
+      }));
+    }
+    return [];
+  }
+
+  // Pixel box around a screen point for context querying
+  function pixelBoxAround(point, r = 40) {
+    return [[point.x - r, point.y - r], [point.x + r, point.y + r]];
+  }
+
+  // Pick the closest line-string road feature at the click location
+  function pickClosestRoadLineAtClick(mapInstance, e) {
+    const lineLayerIds = getRoadLineLayerIds(mapInstance);
+    const opts = lineLayerIds.length ? { layers: lineLayerIds } : undefined;
+
+    const pt = turf.point([e.lngLat.lng, e.lngLat.lat]);
+    const candidates = (mapInstance.queryRenderedFeatures(pixelBoxAround(e.point, 60), opts) || [])
+      .flatMap(explodeToLineStrings)
+      .filter(f => isGeneralTrafficRoad(f.properties)); // <-- drivable only
+
+    if (!candidates.length) return null;
+
+    let best = null, bestD = Infinity;
+    for (const lf of candidates) {
+      try {
+        const d = turf.pointToLineDistance(pt, lf, { units: "meters" });
+        if (d < bestD) { bestD = d; best = lf; }
+      } catch {}
+    }
+    return best;
+  }
+
+  // Remove near-duplicate points (same clicked line) by rounding coords
+  function dedupePointsOnLine(points, precision = 6) {
+    const seen = new Set();
+    const out = [];
+    for (const p of points) {
+      const c = p?.geometry?.coordinates;
+      if (!c) continue;
+      const key = `${c[0].toFixed(precision)},${c[1].toFixed(precision)}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(p);
+      }
+    }
+    return out;
+  }
+
+  // Slice a clicked base line between the two nearest intersections on that line
+  function sliceBetweenIntersections(mapInstance, baseLine, e) {
+    const layerIds = getRoadLayerIds(mapInstance);
+    const opts = layerIds.length ? { layers: layerIds } : undefined;
+
+    // Query a slightly larger box to gather neighboring road lines to intersect with
+    const neighbors = (mapInstance.queryRenderedFeatures(pixelBoxAround(e.point, 90), opts) || [])
+      .flatMap(f => explodeToLineStrings(f));
+
+    // Compute intersections of baseLine with neighbor lines
+    let interPts = [];
+    for (const nb of neighbors) {
+      if (nb === baseLine) continue;
+      try {
+        const ints = turf.lineIntersect(baseLine, nb);
+        if (ints && ints.features?.length) {
+          for (const p of ints.features) {
+            // project each intersection exactly onto baseLine
+            const proj = turf.nearestPointOnLine(baseLine, p);
+            interPts.push(proj);
+          }
+        }
+      } catch {}
+    }
+
+    // Always include endpoints as fallback
+    const coords = baseLine.geometry.coordinates;
+    interPts.push(turf.point(coords[0]));
+    interPts.push(turf.point(coords[coords.length - 1]));
+
+    interPts = dedupePointsOnLine(interPts);
+
+    // Distance along baseLine helper
+    const lineStart = turf.point(coords[0]);
+    const distAlong = (ptOnLine) =>
+      turf.length(turf.lineSlice(lineStart, ptOnLine, baseLine), { units: "meters" });
+
+    // Locate the clicked measure and all intersection measures
+    const clickOn = turf.nearestPointOnLine(baseLine, turf.point([e.lngLat.lng, e.lngLat.lat]));
+    const mClick = distAlong(clickOn);
+
+    const measures = interPts.map(p => ({ pt: p, m: distAlong(p) }))
+                            .sort((a, b) => a.m - b.m);
+
+    // find nearest intersection before and after click
+    let before = measures[0], after = measures[measures.length - 1];
+    for (let i = 0; i < measures.length; i++) {
+      const cur = measures[i];
+      if (cur.m <= mClick) before = cur;
+      if (cur.m >= mClick) { after = cur; break; }
+    }
+    // guard: if equal (clicked exactly at an intersection), expand to neighbors if possible
+    if (before.m === after.m) {
+      const idx = measures.findIndex(x => x.m === before.m);
+      if (idx > 0) before = measures[idx - 1];
+      if (idx < measures.length - 1) after = measures[idx + 1];
+    }
+
+    try {
+      const seg = turf.lineSlice(before.pt, after.pt, baseLine);
+      return seg;
+    } catch {
+      return null;
+    }
+  }
+
+  // --- [SEGMENT] buffered polygon building and finalization ------------------------------------
   // [SEGMENT] build a buffered polygon from the current selection
   function buildBufferedPolygonFromSegments(lines, totalWidthMeters) {
     if (!lines.length) return null;
@@ -606,49 +725,92 @@ export default function App() {
   }
 
   // [SEGMENT] fly to current buffer
-function flyToCurrentBuffer() {
-  if (!map.current) return;
-  const buffered = buildBufferedPolygonFromSegments(selectedSegments, segmentWidthMeters);
-  if (!buffered) return;
-  const bb = turf.bbox(buffered);
-  map.current.fitBounds([[bb[0], bb[1]], [bb[2], bb[3]]], { padding: getMapPadding(), duration: 700 });
-}
+  function flyToCurrentBuffer() {
+    if (!map.current) return;
+    const buffered = buildBufferedPolygonFromSegments(selectedSegments, segmentWidthMeters);
+    if (!buffered) return;
+    const bb = turf.bbox(buffered);
+    map.current.fitBounds([[bb[0], bb[1]], [bb[2], bb[3]]], { padding: getMapPadding(), duration: 700 });
+  }
 
-// [SEGMENT] finalize from street selection (saves as a new zone)
-async function finalizeStreetSelection() {
-  const buffered = buildBufferedPolygonFromSegments(selectedSegments, segmentWidthMeters);
-  if (!buffered) return;
+  // [SEGMENT] finalize from street selection (saves as a new zone)
+  async function finalizeStreetSelection() {
+    const buffered = buildBufferedPolygonFromSegments(selectedSegments, segmentWidthMeters);
+    if (!buffered) return;
 
-  // compute summary just like buildSummaryFromFeature
-  const summary = await buildSummaryFromFeature(map.current, buffered, useType);
-  if (!summary) return;
+    // compute summary just like buildSummaryFromFeature
+    const summary = await buildSummaryFromFeature(map.current, buffered, useType);
+    if (!summary) return;
 
-  const name = `Street Segment Zone ${savedZones.length + 1}`;
-  const feature = {
-    type: "Feature",
-    properties: {
-      name,
-      description: `Auto-buffered from ${selectedSegments.length} street segment(s) at ~${segmentWidthMeters} m width`,
-      useType,
-      areaM2: summary.areaM2,
-      areaFt2: summary.areaFt2,
-      address: summary.address,
-    },
-    geometry: buffered.geometry,
-  };
+    const name = `Street Segment Zone ${savedZones.length + 1}`;
+    const feature = {
+      type: "Feature",
+      properties: {
+        name,
+        description: `Auto-buffered from ${selectedSegments.length} street segment(s) at ~${segmentWidthMeters} m width`,
+        useType,
+        areaM2: summary.areaM2,
+        areaFt2: summary.areaFt2,
+        address: summary.address,
+      },
+      geometry: buffered.geometry,
+    };
 
-  setSavedZones((prev) => [feature, ...prev]);
+    setSavedZones((prev) => [feature, ...prev]);
 
-  // reset selection
-  setSelectedSegments([]);
-  refreshStreetSelectionData(map.current, [], segmentWidthMeters);
+    // reset selection
+    setSelectedSegments([]);
+    refreshStreetSelectionData(map.current, [], segmentWidthMeters);
 
-  // show the summary for what we just saved
-  setZoneSummary(summary);
-  setSummaryContext("saved");
-  setSelectedSavedIndex(0); // newest at top
-  flyToSaved(feature);
-}
+    // show the summary for what we just saved
+    setZoneSummary(summary);
+    setSummaryContext("saved");
+    setSelectedSavedIndex(0); // newest at top
+    flyToSaved(feature);
+  }
+
+  // Consider only general-traffic drivable roads (OSM highway=* or OpenMapTiles class)
+  // Exclude: service/driveway/parking_aisle/alley, track, path, footway, cycleway, pedestrian, steps, etc.
+  // Also exclude if access/motor_vehicle/vehicle explicitly forbids or restricts to destination/private.
+  function isGeneralTrafficRoad(p = {}) {
+    const hw  = (p.highway || "").toLowerCase();             // raw OSM (sometimes present)
+    const cls = (p.class   || p.kind || "").toLowerCase();    // OpenMapTiles schema
+    const service = (p.service || "").toLowerCase();
+    const acc = [
+      (p.access || "").toLowerCase(),
+      (p.motor_vehicle || "").toLowerCase(),
+      (p.motorcar || "").toLowerCase(),
+      (p.vehicle || "").toLowerCase(),
+    ];
+
+    const ALLOWED_HW = new Set([
+      "motorway","trunk","primary","secondary","tertiary",
+      "unclassified","residential","living_street",
+      "motorway_link","trunk_link","primary_link","secondary_link","tertiary_link",
+    ]);
+
+    // OpenMapTiles 'class' values
+    const ALLOWED_CLASS = new Set([
+      "motorway","trunk","primary","secondary","tertiary","minor",
+      "residential","living_street","street"
+    ]);
+
+    const EXCLUDED_HW = new Set([
+      "service","track","path","footway","cycleway","pedestrian","steps","corridor","bridleway","construction"
+    ]);
+
+    // hard exclusions
+    if (EXCLUDED_HW.has(hw)) return false;
+    if (cls === "service" || cls === "track" || cls === "path") return false;
+    if (service) return false; // driveway/parking_aisle/alley/emergency_access etc → not general traffic
+    if (acc.some(v => v === "no" || v === "private" || v === "destination")) return false;
+
+    // allow if explicitly in the allowed sets
+    if (hw && ALLOWED_HW.has(hw)) return true;
+    if (cls && ALLOWED_CLASS.has(cls)) return true;
+
+    return false;
+  }
 
   // Fly to a saved zone by feature
   function flyToSaved(feature) {
@@ -657,6 +819,127 @@ async function finalizeStreetSelection() {
       const bb = turf.bbox(feature);
       map.current.fitBounds([[bb[0], bb[1]], [bb[2], bb[3]]], { padding: getMapPadding(), duration: 700 });
     } catch {}
+  }
+
+  // Pull a readable street name from properties
+  function streetNameFromProps(p = {}) {
+    return p.name || p["name:en"] || p.name_en || p.ref || p.street || null;
+  }
+
+  // Build a stitched "clicked road" by ID (ideal) or by name via endpoint adjacency
+  function stitchClickedRoad(mapInstance, baseLine) {
+    const layerIds = getRoadLayerIds(mapInstance);
+    const opts = layerIds.length ? { layers: layerIds } : undefined;
+
+    // Grab lots of road pieces in the viewport so we can stitch across tile boundaries
+    const all = (mapInstance.queryRenderedFeatures(opts) || []).flatMap(explodeToLineStrings);
+    if (!all.length) return baseLine;
+
+    const idKeys = ["osm_id", "osm_way_id", "id"];
+    const getId = (p={}) => idKeys.map(k => p[k]).find(v => v != null);
+    const baseId = getId(baseLine.properties);
+    const baseName = streetNameFromProps(baseLine.properties);
+
+    // Prefer exact same way id, else fall back to "same name" chaining
+    let pool = [];
+    if (baseId != null) {
+      pool = all.filter(l => getId(l.properties) === baseId);
+    } else if (baseName) {
+      pool = all.filter(l => streetNameFromProps(l.properties) === baseName);
+    } else {
+      pool = [baseLine];
+    }
+    if (!pool.length) pool = [baseLine];
+
+    // Merge contiguous pieces
+    try {
+      const fc = { type: "FeatureCollection", features: pool };
+      const combined = turf.combine(fc);
+      const merged = turf.lineMerge(combined);
+      // lineMerge may return a MultiLineString -> pick the one nearest to baseLine start
+      const candidates = explodeToLineStrings(merged.features?.[0] || merged || pool[0]);
+      if (!candidates.length) return pool[0];
+      // pick longest as the main chain
+      candidates.sort((a,b) => turf.length(b) - turf.length(a));
+      return candidates[0];
+    } catch {
+      return pool[0];
+    }
+  }
+
+  // Cut the stitched road at the two closest intersections (with any DIFFERENT road)
+  function sliceBetweenIntersections(mapInstance, stitchedLine, e) {
+    const lineLayerIds = getRoadLineLayerIds(mapInstance);
+    const opts = lineLayerIds.length ? { layers: lineLayerIds } : undefined;
+
+    const world = (mapInstance.queryRenderedFeatures(pixelBoxAround(e.point, 220), opts) || [])
+      .flatMap(explodeToLineStrings)
+      .filter(f => isGeneralTrafficRoad(f.properties));
+
+    const idKeys = ["osm_id","osm_way_id","id"];
+    const sameWay = (a, b) => idKeys.some(k => a?.properties?.[k] != null && a.properties[k] === b?.properties?.[k]);
+    const baseName = streetNameFromProps(stitchedLine.properties);
+
+    const interPts = [];
+    for (const nb of world) {
+      const sameName = baseName && streetNameFromProps(nb.properties) === baseName;
+      if (sameWay(nb, stitchedLine) || sameName) continue; // only true cross streets
+
+      try {
+        const ints = turf.lineIntersect(stitchedLine, nb);
+        for (const p of ints.features || []) {
+          interPts.push(turf.nearestPointOnLine(stitchedLine, p));
+        }
+      } catch {}
+    }
+
+    // include endpoints as guards
+    const coords = stitchedLine.geometry.coordinates;
+    interPts.push(turf.point(coords[0]));
+    interPts.push(turf.point(coords[coords.length - 1]));
+
+    // de-dupe
+    const seen = new Set(), uniq = [];
+    for (const p of interPts) {
+      const [x,y] = p.geometry.coordinates;
+      const k = `${x.toFixed(7)},${y.toFixed(7)}`;
+      if (!seen.has(k)) { seen.add(k); uniq.push(p); }
+    }
+
+    const start = turf.point(coords[0]);
+    const distAlong = (pt) => turf.length(turf.lineSlice(start, pt, stitchedLine), { units: "meters" });
+    const clickM = distAlong(turf.nearestPointOnLine(stitchedLine, turf.point([e.lngLat.lng, e.lngLat.lat])));
+
+    const measures = uniq.map(pt => ({ pt, m: distAlong(pt) })).sort((a,b) => a.m - b.m);
+
+    let before = measures[0], after = measures[measures.length - 1];
+    for (let i=0;i<measures.length;i++) {
+      const cur = measures[i];
+      if (cur.m <= clickM) before = cur;
+      if (cur.m >= clickM) { after = cur; break; }
+    }
+    if (before.m === after.m) {
+      const idx = measures.findIndex(x => x.m === before.m);
+      if (idx > 0) before = measures[idx-1];
+      if (idx < measures.length-1) after = measures[idx+1];
+    }
+
+    try {
+      return turf.lineSlice(before.pt, after.pt, stitchedLine);
+    } catch {
+      return null;
+    }
+  }
+
+  // union the names directly from the selected segments into the summary.
+  function namesFromSegments(segments) {
+    const out = new Set();
+    for (const f of segments) {
+      if (!isGeneralTrafficRoad(f.properties)) continue;
+      const name = streetNameFromProps(f.properties);
+      if (name) out.add(name);
+    }
+    return Array.from(out);
   }
 
   // --- effects ----------------------------------------------------
@@ -922,7 +1205,7 @@ async function finalizeStreetSelection() {
     }
   }, [selectedSavedIndex, savedZones, drawMode, editingSavedIndex]);
 
-  // [SEGMENT] handle map clicks to toggle street segments
+  // [SEGMENT] handle map clicks to toggle *intersection-bounded* segments
   useEffect(() => {
     if (!map.current) return;
     const m = map.current;
@@ -930,41 +1213,34 @@ async function finalizeStreetSelection() {
     const onClick = (e) => {
       if (!segmentMode) return;
 
-      // search for road features among visible road layers
-      const layerIds = getRoadLayerIds(m);
-      const opts = layerIds.length ? { layers: layerIds } : undefined;
-      const feats = m.queryRenderedFeatures(e.point, opts) || [];
+      const base = pickClosestRoadLineAtClick(m, e);
+      if (!base || !isGeneralTrafficRoad(base.properties)) return;
 
-      // pick the first line-like feature
-      let picked = null;
-      for (const f of feats) {
-        const t = f?.geometry?.type;
-        if (t === "LineString" || t === "MultiLineString") {
-          picked = f;
-          break;
-        }
-      }
-      if (!picked) return;
+      const stitched = stitchClickedRoad(m, base, e);   // <-- pass e
+      const seg = sliceBetweenIntersections(m, stitched, e);
+      if (!seg || !seg.geometry?.coordinates?.length) return;
 
-      // toggle by unique key
-      const k = keyForRenderedFeature(picked);
+      // Stable key from id (or street name) + endpoints
+      const props = { ...(stitched.properties || {}) };
+      const name = streetNameFromProps(props) || "—";
+      const id = props.osm_id ?? props.osm_way_id ?? props.id ?? name; // <-- fallback
+      const start = seg.geometry.coordinates[0];
+      const end   = seg.geometry.coordinates[seg.geometry.coordinates.length - 1];
+      const k = `${id}|${start[0].toFixed(6)},${start[1].toFixed(6)}->${end[0].toFixed(6)},${end[1].toFixed(6)}`;
+
       setSelectedSegments((prev) => {
-        // build a map for quick toggle
-        const mapByKey = new Map();
-        prev.forEach((pf, i) => mapByKey.set(pf.__key, { pf, i }));
+        const byKey = new Map();
+        prev.forEach((pf, i) => byKey.set(pf.__key, { i }));
 
-        if (mapByKey.has(k)) {
-          // remove from selection
-          const { i } = mapByKey.get(k);
-          const next = prev.slice();
-          next.splice(i, 1);
-          // update sources immediately
+        if (byKey.has(k)) {
+          const { i } = byKey.get(k);
+          const next = prev.slice(); next.splice(i,1);
           refreshStreetSelectionData(m, next, segmentWidthMeters);
           return next;
         } else {
-          // add normalized lines
-          const lines = toLineFeatures(picked).map((lf) => ({ ...lf, __key: k }));
-          const next = prev.concat(lines);
+          const name = streetNameFromProps(props);
+          const nextSeg = { type: "Feature", properties: { ...props, __name: name }, geometry: seg.geometry, __key: k };
+          const next = prev.concat([nextSeg]);
           refreshStreetSelectionData(m, next, segmentWidthMeters);
           return next;
         }
@@ -1004,6 +1280,40 @@ async function finalizeStreetSelection() {
   // Leaving draw mode already resets its state in your code.
   // We also already clear segment selection when segmentMode goes off.
 
+  // [SEGMENT] Build a "zone-like" summary for current buffered selection
+  useEffect(() => {
+    if (!map.current) return;
+
+    if (!selectedSegments.length) {
+      // clear summary if not drawing or viewing a saved zone
+      if (!drawMode && selectedSavedIndex == null) {
+        setZoneSummary(null);
+        setSummaryContext(null);
+      }
+      return;
+    }
+
+    const buffered = buildBufferedPolygonFromSegments(selectedSegments, segmentWidthMeters);
+    if (!buffered) return;
+
+    (async () => {
+      const summary = await buildSummaryFromFeature(map.current, buffered, useType);
+      if (!summary) return;
+
+      // merge names: (a) from buffer query, (b) from the selected segments themselves
+      const picked = namesFromSegments(selectedSegments);           // <-- requires the helper from step 4a
+      const queried = (summary.streets || []).filter(Boolean);
+      const merged = Array.from(new Set([...queried, ...picked])).sort((a, b) => a.localeCompare(b));
+
+      setZoneSummary({ ...summary, streets: merged });
+      setSummaryContext("segments");
+    })();
+  }, [selectedSegments, segmentWidthMeters, useType, drawMode, selectedSavedIndex]);
+
+  // If entering draw mode, ensure segment mode is off
+  useEffect(() => {
+    if (drawMode && segmentMode) setSegmentMode(false);
+  }, [drawMode, segmentMode]);
 
   // --- Save / finalize helpers -----------------------------------
   const canFinalize = drawMode && drawnCoords.length >= 3;
@@ -1262,10 +1572,17 @@ async function finalizeStreetSelection() {
           <div style={labelStyle}>Drawing</div>
           <button
             onClick={() => setDrawMode(!drawMode)}
-            title="Toggle drawing mode"
+            disabled={segmentMode || selectedSegments.length > 0}
+            title={
+              segmentMode || selectedSegments.length > 0
+                ? "Disable street selection first"
+                : "Toggle drawing mode"
+            }
             style={{
               ...buttonStyle,
               backgroundColor: drawMode ? "#28a745" : "#ffc107",
+              opacity: segmentMode || selectedSegments.length > 0 ? 0.6 : 1,
+              cursor: segmentMode || selectedSegments.length > 0 ? "not-allowed" : "pointer",
             }}
           >
             {drawMode ? "Exit Draw Mode" : "Enter Draw Mode"}
@@ -1308,62 +1625,130 @@ async function finalizeStreetSelection() {
         {/* [SEGMENT] Street selection controls */}
         <div style={{ display: "grid", gap: "0.25rem", minWidth: 180 }}>
           <div style={labelStyle}>Street selection</div>
+
+          {/* Toggle + Zoom */}
           <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
             <button
               onClick={() => setSegmentMode((v) => !v)}
-              title="Select existing road segments to form a zone"
+              disabled={drawMode || drawnCoords.length > 0}
+              title={
+                drawMode || drawnCoords.length > 0
+                  ? "Disable drawing first"
+                  : "Select existing road segments to form a zone"
+              }
               style={{
                 ...buttonStyle,
                 backgroundColor: segmentMode ? "#28a745" : "#ffc107",
+                opacity: drawMode || drawnCoords.length > 0 ? 0.6 : 1,
+                cursor: drawMode || drawnCoords.length > 0 ? "not-allowed" : "pointer",
               }}
             >
               {segmentMode ? "Exit Selection" : "Select Streets"}
             </button>
+
             <button
               onClick={flyToCurrentBuffer}
-              disabled={!selectedSegments.length}
-              style={{ ...buttonStyle, opacity: selectedSegments.length ? 1 : 0.6 }}
-              title="Zoom to current buffer"
+              disabled={drawMode || drawnCoords.length > 0 || !selectedSegments.length}
+              style={{
+                ...buttonStyle,
+                opacity:
+                  drawMode || drawnCoords.length > 0 || !selectedSegments.length
+                    ? 0.6
+                    : 1,
+                cursor:
+                  drawMode || drawnCoords.length > 0 || !selectedSegments.length
+                    ? "not-allowed"
+                    : "pointer",
+              }}
+              title={
+                drawMode || drawnCoords.length > 0
+                  ? "Disable drawing first"
+                  : "Zoom to current buffer"
+              }
             >
               Zoom to buffer
             </button>
           </div>
 
+          {/* Width + Finalize/Clear */}
           <div style={{ display: "grid", gap: 6, marginTop: 6 }}>
-            <label style={labelStyle}>
-              Corridor width (m)
-            </label>
+            <label style={labelStyle}>Corridor width (m)</label>
             <input
               type="number"
               min={2}
               max={60}
               step={1}
               value={segmentWidthMeters}
-              onChange={(e) => setSegmentWidthMeters(Number(e.target.value || 0))}
-              style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6, width: 120 }}
-              title="Approx total corridor width to buffer streets"
+              onChange={(e) =>
+                setSegmentWidthMeters(Number(e.target.value || 0))
+              }
+              disabled={drawMode || drawnCoords.length > 0 || !segmentMode}
+              style={{
+                padding: "0.5rem",
+                border: "1px solid #ccc",
+                borderRadius: 6,
+                width: 120,
+                opacity:
+                  drawMode || drawnCoords.length > 0 || !segmentMode ? 0.6 : 1,
+                cursor:
+                  drawMode || drawnCoords.length > 0 || !segmentMode
+                    ? "not-allowed"
+                    : "text",
+              }}
+              title={
+                drawMode || drawnCoords.length > 0
+                  ? "Disable drawing first"
+                  : "Approx total corridor width to buffer streets"
+              }
             />
+
             <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
               <button
                 onClick={finalizeStreetSelection}
-                disabled={!selectedSegments.length}
+                disabled={drawMode || drawnCoords.length > 0 || !selectedSegments.length}
                 style={{
                   ...buttonStyle,
                   backgroundColor: "#17a2b8",
-                  opacity: selectedSegments.length ? 1 : 0.6,
+                  opacity:
+                    drawMode || drawnCoords.length > 0 || !selectedSegments.length
+                      ? 0.6
+                      : 1,
+                  cursor:
+                    drawMode || drawnCoords.length > 0 || !selectedSegments.length
+                      ? "not-allowed"
+                      : "pointer",
                 }}
-                title="Create a zone from the selected streets"
+                title={
+                  drawMode || drawnCoords.length > 0
+                    ? "Disable drawing first"
+                    : "Create a zone from the selected streets"
+                }
               >
                 Finalize from Streets
               </button>
+
               <button
                 onClick={() => {
                   setSelectedSegments([]);
                   refreshStreetSelectionData(map.current, [], segmentWidthMeters);
                 }}
-                disabled={!selectedSegments.length}
-                style={{ ...buttonStyle, opacity: selectedSegments.length ? 1 : 0.6 }}
-                title="Clear current selection"
+                disabled={drawMode || drawnCoords.length > 0 || !selectedSegments.length}
+                style={{
+                  ...buttonStyle,
+                  opacity:
+                    drawMode || drawnCoords.length > 0 || !selectedSegments.length
+                      ? 0.6
+                      : 1,
+                  cursor:
+                    drawMode || drawnCoords.length > 0 || !selectedSegments.length
+                      ? "not-allowed"
+                      : "pointer",
+                }}
+                title={
+                  drawMode || drawnCoords.length > 0
+                    ? "Disable drawing first"
+                    : "Clear current selection"
+                }
               >
                 Clear selection
               </button>
