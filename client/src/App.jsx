@@ -1,93 +1,80 @@
-import React, { useRef, useEffect, useState } from "react";
-import maplibregl from "maplibre-gl";
-import "maplibre-gl/dist/maplibre-gl.css";
+const MAPTILER_KEY = "DyVFUZmyKdCywxRTVU9B";
+import React, { useState, useRef, useEffect } from "react";
 import * as turf from "@turf/turf";
+import maplibregl from "maplibre-gl";
+// Utility: Explode GeoJSON features to array of LineStrings
+function explodeToLineStrings(feature) {
+
+  if (!feature) return [];
+  if (feature.type === "FeatureCollection") {
+    return feature.features.flatMap(explodeToLineStrings);
+  }
+  if (feature.type === "Feature") {
+    if (feature.geometry?.type === "LineString") return [feature];
+    if (feature.geometry?.type === "MultiLineString") {
+      return feature.geometry.coordinates.map(coords => ({
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: coords },
+        properties: feature.properties || {},
+      }));
+    }
+    return [];
+  }
+  return [];
+}
+
 
 export default function App() {
-  const mapContainer = useRef(null);
-  const map = useRef(null);
-
-  // Map + UI state
-  const [basemapStyle, setBasemapStyle] = useState("streets");
-  const [drawMode, setDrawMode] = useState(false);
-  const [showHelpBox, setShowHelpBox] = useState(true);
-
-  // User-drawn polygon coords (open ring, not yet closed)
-  const [drawnCoords, setDrawnCoords] = useState([]);
-
-  // Zone attributes (for in-progress drawing)
-  const [useType, setUseType] = useState("mixed-use");
-
-  // Sidebar visibility for compact toggle
-  const [sidebarVisible, setSidebarVisible] = useState(true);
-
-  // Centralized colors per use type
-  const colorByUse = {
-    "mixed-use": "#7e57c2",
-    residential: "#42a5f5",
-    commercial: "#ef6c00",
-  };
-
-  // Derived info for sidebar while drawing or when a saved zone is selected
-  // { areaM2, areaFt2, centroid, address, streets[], useType }
-  const [zoneSummary, setZoneSummary] = useState(null);
-
-  // Where the current summary comes from: 'draw' | 'saved' | null
-  const [summaryContext, setSummaryContext] = useState(null);
-
-  // Saved zones and finalize flow
-  const [savedZones, setSavedZones] = useState(() => {
-    try {
-      const raw = localStorage.getItem("sfst.savedZones");
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
-  });
+  // Show save panel state
   const [showSavePanel, setShowSavePanel] = useState(false);
+  // Map instance ref
+  const map = useRef(null);
+  // Use type to color mapping
+  const colorByUse = {
+    "mixed-use": "#FFD700",      // gold
+    "residential": "#87CEEB",    // sky blue
+    "commercial": "#FF6347",     // tomato
+    // Add more use types and colors as needed
+  };
+  // Map container ref
+  const mapContainer = useRef(null);
+  // Pending name state
   const [pendingName, setPendingName] = useState("");
-  const [pendingDescription, setPendingDescription] = useState("");
+  // Summary context state
+  const [summaryContext, setSummaryContext] = useState(null);
+  // Zone summary state
+  const [zoneSummary, setZoneSummary] = useState(null);
+  // Drawing tool state
+  const [drawTool, setDrawTool] = useState("none");
+  // --- React state hooks ---
 
-  // Selection and editing of saved zones
-  const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
-  const [editingSavedIndex, setEditingSavedIndex] = useState(null);
-
-  // A) Add near other state (we’ll also use this in #2/#3/#6)
-  const [sidebarWidth, setSidebarWidth] = useState(360);
-
-  // Distinct “card” backgrounds
-  const cardStyle = {
-    background: "#ffffff",
-    border: "1px solid #e5e7eb",
-    borderRadius: 8,
-    padding: "0.75rem",
-  };
-
-  const altCardStyle = {
-    background: "#f7f9ff",
-    border: "1px solid #dbeafe",
-    borderRadius: 8,
-    padding: "0.75rem",
-  };
-
-  // [START/END SEGMENT SELECTION] state
-  const [startEndMode, setStartEndMode] = useState(false);
-  const [startPoint, setStartPoint] = useState(null);
-  const [endPoint, setEndPoint] = useState(null);
-
-  // unified drawing selector
-  const [drawTool, setDrawTool] = useState("none"); // "none" | "polygon" | "streets"
+  // --- Derived constants ---
   const polygonActive = drawTool === "polygon";
   const streetsActive = drawTool === "streets";
-
-  useEffect(() => {
-    localStorage.setItem("sfst.savedZones", JSON.stringify(savedZones));
-  }, [savedZones]);
-
-  const MAPTILER_KEY = "DyVFUZmyKdCywxRTVU9B";
+  // End point for segment selection
+  const [endPoint, setEndPoint] = useState(null);
+  // Start point for segment selection
+  const [startPoint, setStartPoint] = useState(null);
+  // Start/end segment selection mode state
+  const [startEndMode, setStartEndMode] = useState(false);
+  // Zone type state
+  const [useType, setUseType] = useState("mixed-use");
+  // Drawn coordinates state
+  const [drawnCoords, setDrawnCoords] = useState([]);
+  // Editing saved zone index state
+  const [editingSavedIndex, setEditingSavedIndex] = useState(null);
+  // Drawing mode state
+  const [drawMode, setDrawMode] = useState(false);
+  // Selected saved zone index state
+  const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
+  // Saved zones state
+  const [savedZones, setSavedZones] = useState([]);
+  // Basemap style state
+  const [basemapStyle, setBasemapStyle] = useState("streets");
+  // --- Maptiler styles ---
   const maptilerStyles = {
     streets: `https://api.maptiler.com/maps/streets/style.json?key=${MAPTILER_KEY}`,
-    satellite: `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`,
+    satellite: `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`
   };
 
   // --- helpers ----------------------------------------------------
@@ -207,6 +194,25 @@ export default function App() {
 
   // Ensure sources and layers exist after load/style switch
   function ensureSourcesAndLayers(mapInstance) {
+    // Add source for drawn line if not present
+    if (!mapInstance.getSource("drawn-line")) {
+      mapInstance.addSource("drawn-line", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+    }
+    // Add layer for drawn line if not present
+    if (!mapInstance.getLayer("drawn-line-layer")) {
+      mapInstance.addLayer({
+        id: "drawn-line-layer",
+        type: "line",
+        source: "drawn-line",
+        paint: {
+          "line-color": "#0074D9",
+          "line-width": 4,
+        },
+      });
+    }
     // GeoJSON sources for current in-progress zone
     if (!mapInstance.getSource("zones")) {
       mapInstance.addSource("zones", {
@@ -451,91 +457,7 @@ export default function App() {
   // Build a zone summary from any Feature<Polygon>
   // typeFallback is used if the feature has no useType prop
   async function buildSummaryFromFeature(mapInstance, feature, typeFallback) {
-  const g = feature?.geometry?.type;
-  if (!g || (g !== "Polygon" && g !== "MultiPolygon")) return null;
-
-  const areaM2 = turf.area(feature);
-  const areaFt2 = convertToSquareFeet(areaM2);
-
-  // centroid that works for both Polygon & MultiPolygon
-  const centroidPt =
-    (turf.centerOfMass?.(feature) || turf.centroid(feature)).geometry.coordinates;
-
-  // This works fine with MultiPolygon too
-  const streets = getIntersectingStreetNames(mapInstance, feature);
-
-  const addr = await reverseGeocode(centroidPt[0], centroidPt[1]);
-
-  return {
-    areaM2,
-    areaFt2,
-    centroid: centroidPt,
-    address: addr,
-    streets,
-    useType: feature.properties?.useType || typeFallback || "mixed-use",
-  };
-}
-
-  // Gives asymmetric padding when the sidebar is visible
-  // to keep the polygon fully in view
-  function getMapPadding() {
-    const base = 40;
-    // Keep the polygon away from the sidebar by padding its side
-    const rightPad = sidebarVisible ? sidebarWidth + 24 : base;
-    return { top: base, bottom: base, left: base, right: rightPad };
-  }
-
-  // Only LINE road layers (no labels)
-function getRoadLineLayerIds(mapInstance) {
-  const style = mapInstance.getStyle();
-  if (!style?.layers) return [];
-  const tokens = ["transportation", "road", "street", "highway"];
-  return style.layers
-    .filter(lyr => {
-      const id = (lyr.id || "").toLowerCase();
-      const sl = (lyr["source-layer"] || "").toLowerCase();
-      return lyr.type === "line" && tokens.some(t => id.includes(t) || sl.includes(t));
-    })
-    .map(lyr => lyr.id);
-}
-
-// Normalize to LineString features (explode MultiLineString)
-function explodeToLineStrings(feat) {
-  if (!feat?.geometry) return [];
-  const g = feat.geometry.type;
-  const props = { ...(feat.properties || {}) };
-  if (g === "LineString") {
-    return [{ type: "Feature", properties: props, geometry: { type: "LineString", coordinates: feat.geometry.coordinates } }];
-  }
-  if (g === "MultiLineString") {
-    return feat.geometry.coordinates.map(coords => ({
-      type: "Feature",
-      properties: props,
-      geometry: { type: "LineString", coordinates: coords },
-    }));
-  }
-  return [];
-}
-
-// Pick a street name from various possible props
-function streetNameFromProps(p = {}) {
-  return p.name || p["name:en"] || p.name_en || p.ref || p.street || null;
-}
-
-// Stricter: roads that actually bound city blocks (used ONLY to find intersections)
-function isBlockBoundingRoad(p = {}) {
-  const hw  = (p.highway || "").toLowerCase();
-  const cls = (p.class || p.kind || "").toLowerCase();
-  const sub = (p.subclass || "").toLowerCase();
-  const svc = (p.service || "").toLowerCase();
-
-  const accs = [
-    (p.access || "").toLowerCase(),
-    (p.motor_vehicle || "").toLowerCase(),
-    (p.motorcar || "").toLowerCase(),
-    (p.vehicle || "").toLowerCase(),
-  ];
-  if (svc) return false;
+  // ...existing code...
   if (accs.some(v => v === "no" || v === "private" || v === "destination")) return false;
 
   const EXCLUDED_SUB = new Set(["crossing","footway","path","cycleway","pedestrian","steps","sidewalk","platform","corridor"]);
@@ -579,6 +501,175 @@ function pickClosestRoadLineAtClick(mapInstance, e) {
 }
 
 // Merge pieces of the same way/name into one long line
+// Minimal pathfinding: build graph from visible drivable segments and find shortest path
+function findShortestRoadPath(mapInstance, startPt, endPt) {
+  // Get all visible drivable road segments
+  const roadLayerIds = getRoadLayerIds(mapInstance);
+  const opts = roadLayerIds.length ? { layers: roadLayerIds } : undefined;
+  let featuresRaw = [];
+  try {
+    featuresRaw = mapInstance.queryRenderedFeatures(opts);
+  } catch (err) {
+    return null;
+  }
+  // Get all drivable road segments as LineStrings
+  const segments = featuresRaw.flatMap(explodeToLineStrings).filter(f => isDrivableRoad(f.properties));
+    // ...existing code...
+
+    // Snap start/end to nearest segment
+    function snapToSegment(pt) {
+      let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
+      segments.forEach(f => {
+        let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
+        const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
+        if (snapped.properties.dist < bestDist) {
+          bestDist = snapped.properties.dist;
+          best = snapped.geometry.coordinates;
+          bestSeg = coords;
+          bestIdx = snapped.properties.index;
+        }
+      });
+      return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
+    }
+
+    const startSnap = snapToSegment(startPt);
+    const endSnap = snapToSegment(endPt);
+  // ...existing code...
+  const nodes = new Map(); // key: stringified [lng,lat], value: array of connected nodes
+  const edges = new Map(); // key: nodeA|nodeB, value: segment
+  segments.forEach(seg => {
+    const coords = seg.geometry.coordinates;
+    for (let i = 0; i < coords.length - 1; i++) {
+      const a = coords[i], b = coords[i + 1];
+      const aKey = a.join(","), bKey = b.join(",");
+      if (!nodes.has(aKey)) nodes.set(aKey, []);
+      if (!nodes.has(bKey)) nodes.set(bKey, []);
+      nodes.get(aKey).push(bKey);
+      nodes.get(bKey).push(aKey);
+      edges.set(`${aKey}|${bKey}`, [a, b]);
+      edges.set(`${bKey}|${aKey}`, [b, a]);
+    }
+  });
+  // Snap start/end to nearest point on any segment
+  function nearestPointOnSegments(pt) {
+    let minDist = Infinity, best = null, bestSeg = null;
+    for (const seg of segments) {
+      const line = turf.lineString(seg.geometry.coordinates);
+      const snapped = turf.nearestPointOnLine(line, turf.point(pt), { units: "meters" });
+      if (snapped.properties.dist < minDist) {
+        minDist = snapped.properties.dist;
+        best = snapped.geometry.coordinates;
+        bestSeg = seg;
+      }
+    }
+    return { coord: best, seg: bestSeg };
+  }
+  // Helper: Snap to nearest point on any segment
+  function nearestPointOnSegments(pt) {
+    let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
+    segments.forEach(f => {
+      let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
+      const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
+      if (snapped.properties.dist < bestDist) {
+        bestDist = snapped.properties.dist;
+        best = snapped.geometry.coordinates;
+        bestSeg = coords;
+        bestIdx = snapped.properties.index;
+      }
+    });
+    return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
+  }
+  // Only one correct declaration of startSnap and endSnap should exist in this function
+  if (!startSnap.coord || !endSnap.coord) return null;
+  // Insert snapped points as temporary nodes
+  const startKey = startSnap.coord.join(",");
+  const endKey = endSnap.coord.join(",");
+  // Connect snapped start to its segment endpoints
+  if (startSnap.seg) {
+    const coords = startSnap.seg.geometry.coordinates;
+    const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
+    if (!nodes.has(startKey)) nodes.set(startKey, []);
+    nodes.get(startKey).push(aKey);
+    nodes.get(aKey).push(startKey);
+    nodes.get(startKey).push(bKey);
+    nodes.get(bKey).push(startKey);
+    edges.set(`${startKey}|${aKey}`, [startSnap.coord, coords[0]]);
+    edges.set(`${aKey}|${startKey}`, [coords[0], startSnap.coord]);
+    edges.set(`${startKey}|${bKey}`, [startSnap.coord, coords[coords.length - 1]]);
+    edges.set(`${bKey}|${startKey}`, [coords[coords.length - 1], startSnap.coord]);
+  }
+  // Connect snapped end to its segment endpoints
+  if (endSnap.seg) {
+    const coords = endSnap.seg.geometry.coordinates;
+    const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
+    if (!nodes.has(endKey)) nodes.set(endKey, []);
+    nodes.get(endKey).push(aKey);
+    nodes.get(aKey).push(endKey);
+    nodes.get(endKey).push(bKey);
+    nodes.get(bKey).push(endKey);
+    edges.set(`${endKey}|${aKey}`, [endSnap.coord, coords[0]]);
+    edges.set(`${aKey}|${endKey}`, [coords[0], endSnap.coord]);
+    edges.set(`${endKey}|${bKey}`, [endSnap.coord, coords[coords.length - 1]]);
+    edges.set(`${bKey}|${endKey}`, [coords[coords.length - 1], endSnap.coord]);
+  }
+  // Dijkstra's algorithm
+  const visited = new Set();
+  const prev = new Map();
+  const dist = new Map();
+  for (const key of nodes.keys()) dist.set(key, Infinity);
+  dist.set(startKey, 0);
+  const queue = [startKey];
+  while (queue.length) {
+    queue.sort((a, b) => dist.get(a) - dist.get(b));
+    const cur = queue.shift();
+    if (cur === endKey) break;
+    visited.add(cur);
+    for (const neighbor of nodes.get(cur)) {
+      if (visited.has(neighbor)) continue;
+      const seg = edges.get(`${cur}|${neighbor}`);
+      const segLen = turf.length(turf.lineString(seg), { units: "meters" });
+      const alt = dist.get(cur) + segLen;
+      if (alt < dist.get(neighbor)) {
+        dist.set(neighbor, alt);
+        prev.set(neighbor, cur);
+        queue.push(neighbor);
+      }
+    }
+  }
+  // Reconstruct path
+  let path = [];
+  let cur = endKey;
+  while (cur && prev.has(cur)) {
+    const prevKey = prev.get(cur);
+    const seg = edges.get(`${prevKey}|${cur}`);
+    if (seg) path.unshift({ from: prevKey, to: cur, seg });
+    cur = prevKey;
+  }
+  // If path is empty, fallback to direct line
+  if (!path.length) return turf.lineString([startPt, endPt]);
+  // Flatten path segments, slicing first/last for exact start/end
+  let coords = [];
+  for (let i = 0; i < path.length; i++) {
+    const { from, to, seg } = path[i];
+  if (i === 0 && from === startKey) {
+      // Slice first segment from startPt to next node
+      coords.push(startPt);
+      coords.push(seg[1]);
+    } else if (i === path.length - 1 && to === endKey) {
+      // Slice last segment from previous node to endPt
+      if (coords.length === 0 || coords[coords.length - 1][0] !== seg[0][0] || coords[coords.length - 1][1] !== seg[0][1]) {
+        coords.push(seg[0]);
+      }
+      coords.push(endPt);
+    } else {
+      if (coords.length === 0 || coords[coords.length - 1][0] !== seg[0][0] || coords[coords.length - 1][1] !== seg[0][1]) {
+        coords.push(seg[0]);
+      }
+      coords.push(seg[1]);
+    }
+  }
+  return turf.lineString(coords);
+}
 function stitchClickedRoad(mapInstance, baseLine) {
   const layerIds = getRoadLineLayerIds(mapInstance);
   const opts = layerIds.length ? { layers: layerIds } : undefined;
@@ -597,7 +688,7 @@ function stitchClickedRoad(mapInstance, baseLine) {
       featuresRaw = m.queryRenderedFeatures(box, { layers: roadLayerIds });
     } catch (err) {
       console.warn('queryRenderedFeatures failed:', err);
-      return [lngLat.lng, lngLat.lat];
+      return null;
     }
     console.log('Candidate features from queryRenderedFeatures:', featuresRaw);
     featuresRaw.forEach((f, i) => {
@@ -606,15 +697,19 @@ function stitchClickedRoad(mapInstance, baseLine) {
     featuresRaw.forEach((f, i) => {
       console.log(`Feature #${i} properties:`, f.properties);
       if (f.geometry?.type === "LineString") {
-        const pt = turf.point([lngLat.lng, lngLat.lat]);
-        const line = turf.lineString(f.geometry.coordinates);
-        const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-        console.log(`Feature #${i} snapped distance:`, snapped.properties.dist);
+        const coords0 = baseLine.geometry?.coordinates?.[0];
+        if (coords0) {
+          const pt = turf.point(coords0);
+          const line = turf.lineString(f.geometry.coordinates);
+          const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+          console.log(`Feature #${i} snapped distance:`, snapped.properties.dist);
+        }
       }
     });
     // Filter only drivable roads
     const features = featuresRaw.filter(f => f.geometry?.type === "LineString" && isDrivableRoad(f.properties));
-    const pt = turf.point([lngLat.lng, lngLat.lat]);
+    const coords0 = baseLine.geometry?.coordinates?.[0];
+    const pt = coords0 ? turf.point(coords0) : null;
     let best = null, bestDist = Infinity;
 }
 
@@ -1328,13 +1423,20 @@ useEffect(() => {
   function onMouseMove(e) {
     if (!isDragging || !dragType) return;
     const lngLat = e.lngLat;
-    // Snap to nearest road
-    const snapped = getNearestRoadPoint(lngLat);
-    if (!snapped) return;
+    // Snap to the nearest point along the currently highlighted road segment
+    // Find the currently highlighted segment geometry
+    const m = map.current;
+    const source = m.getSource('selected-road-segment');
+    if (!source) return;
+    const data = source._data || source._options?.data;
+    if (!data || !data.geometry || !Array.isArray(data.geometry.coordinates)) return;
+    const line = turf.lineString(data.geometry.coordinates);
+    const snapped = turf.nearestPointOnLine(line, turf.point([lngLat.lng, lngLat.lat]), { units: 'meters' });
+    if (!snapped || !snapped.geometry || !Array.isArray(snapped.geometry.coordinates)) return;
     if (dragType === 'start') {
-      setStartPoint(snapped);
+      setStartPoint(snapped.geometry.coordinates);
     } else if (dragType === 'end') {
-      setEndPoint(snapped);
+      setEndPoint(snapped.geometry.coordinates);
     }
   }
 
@@ -1372,32 +1474,71 @@ useEffect(() => {
 
   // Only highlight if both points are set and startEndMode is active
   if (startEndMode && startPoint && endPoint) {
-    // Highlight the segment between startPoint and endPoint
-    m.addSource('selected-road-segment', {
-      type: 'geojson',
-      data: {
-        type: 'Feature',
-        geometry: {
-          type: 'LineString',
-          coordinates: [startPoint, endPoint]
+    // Find the underlying road segment geometry
+    const roadLayerIds = getRoadLayerIds(m);
+    const radiusPx = 60;
+    const projected = m.project(startPoint);
+    const box = [
+      [projected.x - radiusPx, projected.y - radiusPx],
+      [projected.x + radiusPx, projected.y + radiusPx]
+    ];
+    let featuresRaw = [];
+    try {
+      featuresRaw = m.queryRenderedFeatures(box, { layers: roadLayerIds });
+    } catch (err) {
+      return;
+    }
+    // Only drivable road segments
+    const features = featuresRaw.filter(f => (f.geometry?.type === "LineString" || f.geometry?.type === "MultiLineString") && isDrivableRoad(f.properties));
+    let baseLine = null;
+    let minDist = Infinity;
+    for (const feat of features) {
+      let coordsArr = [];
+      if (feat.geometry?.type === "LineString") {
+        coordsArr = [feat.geometry.coordinates];
+      } else if (feat.geometry?.type === "MultiLineString") {
+        coordsArr = feat.geometry.coordinates;
+      }
+      for (const coords of coordsArr) {
+        // Find the closest line to the start point
+        const dist = turf.pointToLineDistance(turf.point(startPoint), turf.lineString(coords), { units: 'meters' });
+        if (dist < minDist) {
+          minDist = dist;
+          baseLine = { type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: feat.properties };
+        }
+      }
+    }
+    if (!baseLine) return;
+    // Minimal pathfinding: highlight shortest path along visible drivable segments
+    let pathLine = findShortestRoadPath(m, startPoint, endPoint);
+    // Fallback: if pathLine is null, draw direct line
+    if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
+      pathLine = turf.lineString([startPoint, endPoint]);
+      console.warn('Pathfinding failed or invalid, drawing direct line.');
+    }
+    console.log('Shortest path line:', pathLine);
+    if (pathLine && pathLine.geometry && Array.isArray(pathLine.geometry.coordinates) && pathLine.geometry.coordinates.length >= 2) {
+      m.addSource('selected-road-segment', {
+        type: 'geojson',
+        data: pathLine
+      });
+      m.addLayer({
+        id: 'selected-road-segment',
+        type: 'line',
+        source: 'selected-road-segment',
+        paint: {
+          'line-color': '#0074D9', // bright blue
+          'line-width': 8,
+          'line-opacity': 0.85
         },
-        properties: {}
-      }
-    });
-    m.addLayer({
-      id: 'selected-road-segment',
-      type: 'line',
-      source: 'selected-road-segment',
-      paint: {
-        'line-color': '#0074D9', // bright blue
-        'line-width': 8,
-        'line-opacity': 0.85
-      },
-      layout: {
-        'line-cap': 'round',
-        'line-join': 'round'
-      }
-    });
+        layout: {
+          'line-cap': 'round',
+          'line-join': 'round'
+        }
+      });
+    } else {
+      console.warn('Highlight line not added: path line invalid');
+    }
   }
 }, [startEndMode, startPoint, endPoint]);
 
