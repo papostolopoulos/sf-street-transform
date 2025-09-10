@@ -457,67 +457,115 @@ export default function App() {
   // Build a zone summary from any Feature<Polygon>
   // typeFallback is used if the feature has no useType prop
   async function buildSummaryFromFeature(mapInstance, feature, typeFallback) {
-  // ...existing code...
-  if (accs.some(v => v === "no" || v === "private" || v === "destination")) return false;
-
-  const EXCLUDED_SUB = new Set(["crossing","footway","path","cycleway","pedestrian","steps","sidewalk","platform","corridor"]);
-  if (EXCLUDED_SUB.has(sub)) return false;
-
-  const ALLOW_HW = new Set([
-    "motorway","trunk","primary","secondary","tertiary",
-    "unclassified","residential","living_street",
-    "motorway_link","trunk_link","primary_link","secondary_link","tertiary_link"
-  ]);
-  const ALLOW_CLASS_STRICT = new Set([
-    "motorway","trunk","primary","secondary","tertiary",
-    "residential","street","unclassified","living_street"
-  ]);
-
-  if (ALLOW_HW.has(hw)) return true;
-  if (ALLOW_CLASS_STRICT.has(cls)) return true;
-  return false;
-}
-
-// Pick the closest drivable road line at the click
-function pickClosestRoadLineAtClick(mapInstance, e) {
-  const layerIds = getRoadLineLayerIds(mapInstance);
-  const opts = layerIds.length ? { layers: layerIds } : undefined;
-  const radiusPx = 60;
-  const box = [[e.point.x - radiusPx, e.point.y - radiusPx],[e.point.x + radiusPx, e.point.y + radiusPx]];
-  const pt = turf.point([e.lngLat.lng, e.lngLat.lat]);
-
-  const candidates = (mapInstance.queryRenderedFeatures(box, opts) || [])
-    .flatMap(explodeToLineStrings)
-    .filter(f => isDrivableRoad(f.properties));
-
-  let best = null, bestD = Infinity;
-  for (const lf of candidates) {
-    try {
-      const d = turf.pointToLineDistance(pt, lf, { units: "meters" });
-      if (d < bestD) { bestD = d; best = lf; }
-    } catch {}
-  }
-  return best;
-}
-
-// Merge pieces of the same way/name into one long line
-// Minimal pathfinding: build graph from visible drivable segments and find shortest path
-function findShortestRoadPath(mapInstance, startPt, endPt) {
-  // Get all visible drivable road segments
-  const roadLayerIds = getRoadLayerIds(mapInstance);
-  const opts = roadLayerIds.length ? { layers: roadLayerIds } : undefined;
-  let featuresRaw = [];
-  try {
-    featuresRaw = mapInstance.queryRenderedFeatures(opts);
-  } catch (err) {
-    return null;
-  }
-  // Get all drivable road segments as LineStrings
-  const segments = featuresRaw.flatMap(explodeToLineStrings).filter(f => isDrivableRoad(f.properties));
     // ...existing code...
+    if (accs.some(v => v === "no" || v === "private" || v === "destination")) return false;
 
-    // Snap start/end to nearest segment
-    function snapToSegment(pt) {
+    const EXCLUDED_SUB = new Set(["crossing","footway","path","cycleway","pedestrian","steps","sidewalk","platform","corridor"]);
+    if (EXCLUDED_SUB.has(sub)) return false;
+
+    const ALLOW_HW = new Set([
+      "motorway","trunk","primary","secondary","tertiary",
+      "unclassified","residential","living_street",
+      "motorway_link","trunk_link","primary_link","secondary_link","tertiary_link"
+    ]);
+    const ALLOW_CLASS_STRICT = new Set([
+      "motorway","trunk","primary","secondary","tertiary",
+      "residential","street","unclassified","living_street"
+    ]);
+
+    if (ALLOW_HW.has(hw)) return true;
+    if (ALLOW_CLASS_STRICT.has(cls)) return true;
+    return false;
+  }
+
+  // Pick the closest drivable road line at the click
+  function pickClosestRoadLineAtClick(mapInstance, e) {
+    const layerIds = getRoadLineLayerIds(mapInstance);
+    const opts = layerIds.length ? { layers: layerIds } : undefined;
+    const radiusPx = 60;
+    const box = [[e.point.x - radiusPx, e.point.y - radiusPx],[e.point.x + radiusPx, e.point.y + radiusPx]];
+    const pt = turf.point([e.lngLat.lng, e.lngLat.lat]);
+
+    const candidates = (mapInstance.queryRenderedFeatures(box, opts) || [])
+      .flatMap(explodeToLineStrings)
+      .filter(f => isDrivableRoad(f.properties));
+
+    let best = null, bestD = Infinity;
+    for (const lf of candidates) {
+      try {
+        const d = turf.pointToLineDistance(pt, lf, { units: "meters" });
+        if (d < bestD) { bestD = d; best = lf; }
+      } catch {}
+    }
+    return best;
+  }
+
+  // Merge pieces of the same way/name into one long line
+  // Minimal pathfinding: build graph from visible drivable segments and find shortest path
+  function findShortestRoadPath(mapInstance, startPt, endPt) {
+    // Get all visible drivable road segments
+    const roadLayerIds = getRoadLayerIds(mapInstance);
+    const opts = roadLayerIds.length ? { layers: roadLayerIds } : undefined;
+    let featuresRaw = [];
+    try {
+      featuresRaw = mapInstance.queryRenderedFeatures(opts);
+    } catch (err) {
+      return null;
+    }
+    // Get all drivable road segments as LineStrings
+    const segments = featuresRaw.flatMap(explodeToLineStrings).filter(f => isDrivableRoad(f.properties));
+      // ...existing code...
+
+      // Snap start/end to nearest segment
+      function snapToSegment(pt) {
+        let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
+        segments.forEach(f => {
+          let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
+          const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
+          if (snapped.properties.dist < bestDist) {
+            bestDist = snapped.properties.dist;
+            best = snapped.geometry.coordinates;
+            bestSeg = coords;
+            bestIdx = snapped.properties.index;
+          }
+        });
+        return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
+      }
+
+      const startSnap = snapToSegment(startPt);
+      const endSnap = snapToSegment(endPt);
+    // ...existing code...
+    const nodes = new Map(); // key: stringified [lng,lat], value: array of connected nodes
+    const edges = new Map(); // key: nodeA|nodeB, value: segment
+    segments.forEach(seg => {
+      const coords = seg.geometry.coordinates;
+      for (let i = 0; i < coords.length - 1; i++) {
+        const a = coords[i], b = coords[i + 1];
+        const aKey = a.join(","), bKey = b.join(",");
+        if (!nodes.has(aKey)) nodes.set(aKey, []);
+        if (!nodes.has(bKey)) nodes.set(bKey, []);
+        nodes.get(aKey).push(bKey);
+        nodes.get(bKey).push(aKey);
+        edges.set(`${aKey}|${bKey}`, [a, b]);
+        edges.set(`${bKey}|${aKey}`, [b, a]);
+      }
+    });
+    // Snap start/end to nearest point on any segment
+    function nearestPointOnSegments(pt) {
+      let minDist = Infinity, best = null, bestSeg = null;
+      for (const seg of segments) {
+        const line = turf.lineString(seg.geometry.coordinates);
+        const snapped = turf.nearestPointOnLine(line, turf.point(pt), { units: "meters" });
+        if (snapped.properties.dist < minDist) {
+          minDist = snapped.properties.dist;
+          best = snapped.geometry.coordinates;
+          bestSeg = seg;
+        }
+      }
+      return { coord: best, seg: bestSeg };
+    }
+    // Helper: Snap to nearest point on any segment
+    function nearestPointOnSegments(pt) {
       let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
       segments.forEach(f => {
         let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
@@ -531,442 +579,392 @@ function findShortestRoadPath(mapInstance, startPt, endPt) {
       });
       return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
     }
-
-    const startSnap = snapToSegment(startPt);
-    const endSnap = snapToSegment(endPt);
-  // ...existing code...
-  const nodes = new Map(); // key: stringified [lng,lat], value: array of connected nodes
-  const edges = new Map(); // key: nodeA|nodeB, value: segment
-  segments.forEach(seg => {
-    const coords = seg.geometry.coordinates;
-    for (let i = 0; i < coords.length - 1; i++) {
-      const a = coords[i], b = coords[i + 1];
-      const aKey = a.join(","), bKey = b.join(",");
-      if (!nodes.has(aKey)) nodes.set(aKey, []);
-      if (!nodes.has(bKey)) nodes.set(bKey, []);
-      nodes.get(aKey).push(bKey);
-      nodes.get(bKey).push(aKey);
-      edges.set(`${aKey}|${bKey}`, [a, b]);
-      edges.set(`${bKey}|${aKey}`, [b, a]);
+    // Only one correct declaration of startSnap and endSnap should exist in this function
+    if (!startSnap.coord || !endSnap.coord) return null;
+    // Insert snapped points as temporary nodes
+    const startKey = startSnap.coord.join(",");
+    const endKey = endSnap.coord.join(",");
+    // Connect snapped start to its segment endpoints
+    if (startSnap.seg) {
+      const coords = startSnap.seg.geometry.coordinates;
+      const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
+      if (!nodes.has(startKey)) nodes.set(startKey, []);
+      nodes.get(startKey).push(aKey);
+      nodes.get(aKey).push(startKey);
+      nodes.get(startKey).push(bKey);
+      nodes.get(bKey).push(startKey);
+      edges.set(`${startKey}|${aKey}`, [startSnap.coord, coords[0]]);
+      edges.set(`${aKey}|${startKey}`, [coords[0], startSnap.coord]);
+      edges.set(`${startKey}|${bKey}`, [startSnap.coord, coords[coords.length - 1]]);
+      edges.set(`${bKey}|${startKey}`, [coords[coords.length - 1], startSnap.coord]);
     }
-  });
-  // Snap start/end to nearest point on any segment
-  function nearestPointOnSegments(pt) {
-    let minDist = Infinity, best = null, bestSeg = null;
-    for (const seg of segments) {
-      const line = turf.lineString(seg.geometry.coordinates);
-      const snapped = turf.nearestPointOnLine(line, turf.point(pt), { units: "meters" });
-      if (snapped.properties.dist < minDist) {
-        minDist = snapped.properties.dist;
-        best = snapped.geometry.coordinates;
-        bestSeg = seg;
-      }
+    // Connect snapped end to its segment endpoints
+    if (endSnap.seg) {
+      const coords = endSnap.seg.geometry.coordinates;
+      const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
+      if (!nodes.has(endKey)) nodes.set(endKey, []);
+      nodes.get(endKey).push(aKey);
+      nodes.get(aKey).push(endKey);
+      nodes.get(endKey).push(bKey);
+      nodes.get(bKey).push(endKey);
+      edges.set(`${endKey}|${aKey}`, [endSnap.coord, coords[0]]);
+      edges.set(`${aKey}|${endKey}`, [coords[0], endSnap.coord]);
+      edges.set(`${endKey}|${bKey}`, [endSnap.coord, coords[coords.length - 1]]);
+      edges.set(`${bKey}|${endKey}`, [coords[coords.length - 1], endSnap.coord]);
     }
-    return { coord: best, seg: bestSeg };
-  }
-  // Helper: Snap to nearest point on any segment
-  function nearestPointOnSegments(pt) {
-    let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
-    segments.forEach(f => {
-      let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
-      const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
-      if (snapped.properties.dist < bestDist) {
-        bestDist = snapped.properties.dist;
-        best = snapped.geometry.coordinates;
-        bestSeg = coords;
-        bestIdx = snapped.properties.index;
-      }
-    });
-    return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
-  }
-  // Only one correct declaration of startSnap and endSnap should exist in this function
-  if (!startSnap.coord || !endSnap.coord) return null;
-  // Insert snapped points as temporary nodes
-  const startKey = startSnap.coord.join(",");
-  const endKey = endSnap.coord.join(",");
-  // Connect snapped start to its segment endpoints
-  if (startSnap.seg) {
-    const coords = startSnap.seg.geometry.coordinates;
-    const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
-    if (!nodes.has(startKey)) nodes.set(startKey, []);
-    nodes.get(startKey).push(aKey);
-    nodes.get(aKey).push(startKey);
-    nodes.get(startKey).push(bKey);
-    nodes.get(bKey).push(startKey);
-    edges.set(`${startKey}|${aKey}`, [startSnap.coord, coords[0]]);
-    edges.set(`${aKey}|${startKey}`, [coords[0], startSnap.coord]);
-    edges.set(`${startKey}|${bKey}`, [startSnap.coord, coords[coords.length - 1]]);
-    edges.set(`${bKey}|${startKey}`, [coords[coords.length - 1], startSnap.coord]);
-  }
-  // Connect snapped end to its segment endpoints
-  if (endSnap.seg) {
-    const coords = endSnap.seg.geometry.coordinates;
-    const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
-    if (!nodes.has(endKey)) nodes.set(endKey, []);
-    nodes.get(endKey).push(aKey);
-    nodes.get(aKey).push(endKey);
-    nodes.get(endKey).push(bKey);
-    nodes.get(bKey).push(endKey);
-    edges.set(`${endKey}|${aKey}`, [endSnap.coord, coords[0]]);
-    edges.set(`${aKey}|${endKey}`, [coords[0], endSnap.coord]);
-    edges.set(`${endKey}|${bKey}`, [endSnap.coord, coords[coords.length - 1]]);
-    edges.set(`${bKey}|${endKey}`, [coords[coords.length - 1], endSnap.coord]);
-  }
-  // Dijkstra's algorithm
-  const visited = new Set();
-  const prev = new Map();
-  const dist = new Map();
-  for (const key of nodes.keys()) dist.set(key, Infinity);
-  dist.set(startKey, 0);
-  const queue = [startKey];
-  while (queue.length) {
-    queue.sort((a, b) => dist.get(a) - dist.get(b));
-    const cur = queue.shift();
-    if (cur === endKey) break;
-    visited.add(cur);
-    for (const neighbor of nodes.get(cur)) {
-      if (visited.has(neighbor)) continue;
-      const seg = edges.get(`${cur}|${neighbor}`);
-      const segLen = turf.length(turf.lineString(seg), { units: "meters" });
-      const alt = dist.get(cur) + segLen;
-      if (alt < dist.get(neighbor)) {
-        dist.set(neighbor, alt);
-        prev.set(neighbor, cur);
-        queue.push(neighbor);
-      }
-    }
-  }
-  // Reconstruct path
-  let path = [];
-  let cur = endKey;
-  while (cur && prev.has(cur)) {
-    const prevKey = prev.get(cur);
-    const seg = edges.get(`${prevKey}|${cur}`);
-    if (seg) path.unshift({ from: prevKey, to: cur, seg });
-    cur = prevKey;
-  }
-  // If path is empty, fallback to direct line
-  if (!path.length) return turf.lineString([startPt, endPt]);
-  // Flatten path segments, slicing first/last for exact start/end
-  let coords = [];
-  for (let i = 0; i < path.length; i++) {
-    const { from, to, seg } = path[i];
-  if (i === 0 && from === startKey) {
-      // Slice first segment from startPt to next node
-      coords.push(startPt);
-      coords.push(seg[1]);
-    } else if (i === path.length - 1 && to === endKey) {
-      // Slice last segment from previous node to endPt
-      if (coords.length === 0 || coords[coords.length - 1][0] !== seg[0][0] || coords[coords.length - 1][1] !== seg[0][1]) {
-        coords.push(seg[0]);
-      }
-      coords.push(endPt);
-    } else {
-      if (coords.length === 0 || coords[coords.length - 1][0] !== seg[0][0] || coords[coords.length - 1][1] !== seg[0][1]) {
-        coords.push(seg[0]);
-      }
-      coords.push(seg[1]);
-    }
-  }
-  return turf.lineString(coords);
-}
-function stitchClickedRoad(mapInstance, baseLine) {
-  const layerIds = getRoadLineLayerIds(mapInstance);
-  const opts = layerIds.length ? { layers: layerIds } : undefined;
-
-  const all = (mapInstance.queryRenderedFeatures(opts) || [])
-    .flatMap(explodeToLineStrings)
-    .filter(f => isDrivableRoad(f.properties));
-
-  const idKeys = ["osm_id","osm_way_id","id"];
-  const getId = (p={}) => idKeys.map(k => p[k]).find(v => v != null);
-  const baseId = getId(baseLine.properties);
-  const baseName = streetNameFromProps(baseLine.properties);
-
-    let featuresRaw = [];
-    try {
-      featuresRaw = m.queryRenderedFeatures(box, { layers: roadLayerIds });
-    } catch (err) {
-      console.warn('queryRenderedFeatures failed:', err);
-      return null;
-    }
-    console.log('Candidate features from queryRenderedFeatures:', featuresRaw);
-    featuresRaw.forEach((f, i) => {
-      console.log(`Feature #${i} layer.id:`, f.layer?.id, 'properties:', f.properties);
-    });
-    featuresRaw.forEach((f, i) => {
-      console.log(`Feature #${i} properties:`, f.properties);
-      if (f.geometry?.type === "LineString") {
-        const coords0 = baseLine.geometry?.coordinates?.[0];
-        if (coords0) {
-          const pt = turf.point(coords0);
-          const line = turf.lineString(f.geometry.coordinates);
-          const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-          console.log(`Feature #${i} snapped distance:`, snapped.properties.dist);
+    // Dijkstra's algorithm
+    const visited = new Set();
+    const prev = new Map();
+    const dist = new Map();
+    for (const key of nodes.keys()) dist.set(key, Infinity);
+    dist.set(startKey, 0);
+    const queue = [startKey];
+    while (queue.length) {
+      queue.sort((a, b) => dist.get(a) - dist.get(b));
+      const cur = queue.shift();
+      if (cur === endKey) break;
+      visited.add(cur);
+      for (const neighbor of nodes.get(cur) || []) {
+        if (visited.has(neighbor)) continue;
+        const seg = edges.get(`${cur}|${neighbor}`);
+        if (!seg) continue;
+        const segLen = turf.length(seg, { units: 'meters' });
+        const alt = dist.get(cur) + segLen;
+        if (alt < dist.get(neighbor)) {
+          dist.set(neighbor, alt);
+          prev.set(neighbor, cur);
+          queue.push(neighbor);
         }
       }
-    });
-    // Filter only drivable roads
-    const features = featuresRaw.filter(f => f.geometry?.type === "LineString" && isDrivableRoad(f.properties));
-    const coords0 = baseLine.geometry?.coordinates?.[0];
-    const pt = coords0 ? turf.point(coords0) : null;
-    let best = null, bestDist = Infinity;
-}
-
-// Split the stitched line by all intersecting block-bounding roads
-function sliceOneBlockBySplitting(mapInstance, stitchedLine, e) {
-  const layerIds = getRoadLineLayerIds(mapInstance);
-  const opts = layerIds.length ? { layers: layerIds } : undefined;
-
-  // Query a generous neighborhood
-  const [minLng, minLat, maxLng, maxLat] = turf.bbox(stitchedLine);
-  const p1 = mapInstance.project([minLng, minLat]);
-  const p2 = mapInstance.project([maxLng, maxLat]);
-  const zoom = mapInstance.getZoom();
-  const padPx = Math.max(160, Math.min(320, 28 * (zoom - 7)));
-  const box = [
-    [Math.min(p1.x, p2.x) - padPx, Math.min(p1.y, p2.y) - padPx],
-    [Math.max(p1.x, p2.x) + padPx, Math.max(p1.y, p2.y) + padPx],
-  ];
-
-  let world = (mapInstance.queryRenderedFeatures(box, opts) || [])
-    .flatMap(explodeToLineStrings)
-    .filter((f) => isBlockBoundingRoad(f.properties));
-
-  if (!world.length) {
-    world = (mapInstance.queryRenderedFeatures(opts) || [])
-      .flatMap(explodeToLineStrings)
-      .filter((f) => isBlockBoundingRoad(f.properties));
+    }
+    // Reconstruct path
+    let path = [];
+    let cur = endKey;
+    while (cur && prev.has(cur)) {
+      const prevKey = prev.get(cur);
+      const seg = edges.get(`${prevKey}|${cur}`);
+      if (seg) path.unshift(seg);
+      cur = prevKey;
+    }
+    // If path is empty, fallback to direct line
+    if (!path.length) {
+      return null;
+    }
+    // Flatten path segments, slicing first/last for exact start/end
+    let coords = [];
+    for (let i = 0; i < path.length; i++) {
+      let segCoords = path[i].geometry.coordinates;
+      // For first segment, snap start
+      if (i === 0) segCoords[0] = startPt;
+      // For last segment, snap end
+      if (i === path.length - 1) segCoords[segCoords.length - 1] = endPt;
+      // Avoid duplicate points between segments
+      if (i > 0 && coords.length && coords[coords.length - 1][0] === segCoords[0][0] && coords[coords.length - 1][1] === segCoords[0][1]) {
+        segCoords = segCoords.slice(1);
+      }
+      coords.push(...segCoords);
+    }
+    return turf.lineString(coords);
   }
 
-  // Sequentially split the stitched line by each neighbor
-  let frags = [stitchedLine];
-  for (const nb of world) {
-    const next = [];
-    for (const frag of frags) {
+  // Stitch together all connected drivable roads of the same way/name as baseLine
+  function stitchClickedRoad(mapInstance, baseLine) {
+    const layerIds = getRoadLineLayerIds(mapInstance);
+    const opts = layerIds.length ? { layers: layerIds } : undefined;
+
+    const all = (mapInstance.queryRenderedFeatures(opts) || [])
+      .flatMap(explodeToLineStrings)
+      .filter(f => isDrivableRoad(f.properties));
+
+    const idKeys = ["osm_id","osm_way_id","id"];
+    const getId = (p={}) => idKeys.map(k => p[k]).find(v => v != null);
+    const baseId = getId(baseLine.properties);
+    const baseName = streetNameFromProps(baseLine.properties);
+
+      let featuresRaw = [];
       try {
-        const out = turf.lineSplit(frag, nb);
-        if (out?.features?.length) next.push(...out.features);
-        else next.push(frag);
-      } catch {
-        next.push(frag);
+        featuresRaw = m.queryRenderedFeatures(box, { layers: roadLayerIds });
+      } catch (err) {
+        console.warn('queryRenderedFeatures failed:', err);
+        return null;
       }
-    }
-    frags = next;
+      console.log('Candidate features from queryRenderedFeatures:', featuresRaw);
+      featuresRaw.forEach((f, i) => {
+        console.log(`Feature #${i} layer.id:`, f.layer?.id, 'properties:', f.properties);
+      });
+      featuresRaw.forEach((f, i) => {
+        console.log(`Feature #${i} properties:`, f.properties);
+        if (f.geometry?.type === "LineString") {
+          const coords0 = baseLine.geometry?.coordinates?.[0];
+          if (coords0) {
+            const pt = turf.point(coords0);
+            const line = turf.lineString(f.geometry.coordinates);
+            const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+            console.log(`Feature #${i} snapped distance:`, snapped.properties.dist);
+          }
+        }
+      });
+      // Filter only drivable roads
+      const features = featuresRaw.filter(f => f.geometry?.type === "LineString" && isDrivableRoad(f.properties));
+      const coords0 = baseLine.geometry?.coordinates?.[0];
+      const pt = coords0 ? turf.point(coords0) : null;
+      let best = null, bestDist = Infinity;
   }
 
-  // Pick the fragment closest to the click
-  const clickPt = turf.point([e.lngLat.lng, e.lngLat.lat]);
-  frags.sort(
-    (a, b) =>
-      turf.pointToLineDistance(clickPt, a, { units: "meters" }) -
-      turf.pointToLineDistance(clickPt, b, { units: "meters" })
-  );
-  return frags[0] || null;
-}
+  // Split the stitched line by all intersecting block-bounding roads
+  function sliceOneBlockBySplitting(mapInstance, stitchedLine, e) {
+    const layerIds = getRoadLineLayerIds(mapInstance);
+    const opts = layerIds.length ? { layers: layerIds } : undefined;
 
-// More robust: find intersections (exact or approximate) and slice between them  
-function sliceBetweenIntersections(mapInstance, stitchedLine, e) {
-  const layerIds = getRoadLineLayerIds(mapInstance);
-  const opts = layerIds.length ? { layers: layerIds } : undefined;
+    // Query a generous neighborhood
+    const [minLng, minLat, maxLng, maxLat] = turf.bbox(stitchedLine);
+    const p1 = mapInstance.project([minLng, minLat]);
+    const p2 = mapInstance.project([maxLng, maxLat]);
+    const zoom = mapInstance.getZoom();
+    const padPx = Math.max(160, Math.min(320, 28 * (zoom - 7)));
+    const box = [
+      [Math.min(p1.x, p2.x) - padPx, Math.min(p1.y, p2.y) - padPx],
+      [Math.max(p1.x, p2.x) + padPx, Math.max(p1.y, p2.y) + padPx],
+    ];
 
-  const [minLng, minLat, maxLng, maxLat] = turf.bbox(stitchedLine);
-  const p1 = mapInstance.project([minLng, minLat]);
-  const p2 = mapInstance.project([maxLng, maxLat]);
-  const zoom = mapInstance.getZoom();
-  const padPx = Math.max(160, Math.min(320, 28 * (zoom - 7)));
-  const box = [
-    [Math.min(p1.x, p2.x) - padPx, Math.min(p1.y, p2.y) - padPx],
-    [Math.max(p1.x, p2.x) + padPx, Math.max(p1.y, p2.y) + padPx],
-  ];
-
-  const pull = (predicate) =>
-    (mapInstance.queryRenderedFeatures(box, opts) || [])
-      .flatMap(explodeToLineStrings)
-      .filter((f) => predicate(f.properties));
-
-  // 1) exact intersections with block-bounding roads
-  let world = pull(isBlockBoundingRoad);
-
-  // Fallback #1: whole viewport if the bbox is empty
-  if (!world.length) {
-    world = (mapInstance.queryRenderedFeatures(opts) || [])
+    let world = (mapInstance.queryRenderedFeatures(box, opts) || [])
       .flatMap(explodeToLineStrings)
       .filter((f) => isBlockBoundingRoad(f.properties));
+
+    if (!world.length) {
+      world = (mapInstance.queryRenderedFeatures(opts) || [])
+        .flatMap(explodeToLineStrings)
+        .filter((f) => isBlockBoundingRoad(f.properties));
+    }
+
+    // Sequentially split the stitched line by each neighbor
+    let frags = [stitchedLine];
+    for (const nb of world) {
+      const next = [];
+      for (const frag of frags) {
+        try {
+          const out = turf.lineSplit(frag, nb);
+          if (out?.features?.length) next.push(...out.features);
+          else next.push(frag);
+        } catch {
+          next.push(frag);
+        }
+      }
+      frags = next;
+    }
+
+    // Pick the fragment closest to the click
+    const clickPt = turf.point([e.lngLat.lng, e.lngLat.lat]);
+    frags.sort(
+      (a, b) =>
+        turf.pointToLineDistance(clickPt, a, { units: "meters" }) -
+        turf.pointToLineDistance(clickPt, b, { units: "meters" })
+    );
+    return frags[0] || null;
   }
 
-  const baseName = streetNameFromProps(stitchedLine.properties);
-  const idKeys = ["osm_id", "osm_way_id", "id"];
-  const sameWay = (a, b) =>
-    idKeys.some((k) => a?.properties?.[k] != null && a.properties[k] === b?.properties?.[k]);
+  // More robust: find intersections (exact or approximate) and slice between them  
+  function sliceBetweenIntersections(mapInstance, stitchedLine, e) {
+    const layerIds = getRoadLineLayerIds(mapInstance);
+    const opts = layerIds.length ? { layers: layerIds } : undefined;
 
-  let intersections = [];
-  for (const nb of world) {
-    const sameName = baseName && streetNameFromProps(nb.properties) === baseName;
-    if (sameWay(nb, stitchedLine) || sameName) continue;
+    const [minLng, minLat, maxLng, maxLat] = turf.bbox(stitchedLine);
+    const p1 = mapInstance.project([minLng, minLat]);
+    const p2 = mapInstance.project([maxLng, maxLat]);
+    const zoom = mapInstance.getZoom();
+    const padPx = Math.max(160, Math.min(320, 28 * (zoom - 7)));
+    const box = [
+      [Math.min(p1.x, p2.x) - padPx, Math.min(p1.y, p2.y) - padPx],
+      [Math.max(p1.x, p2.x) + padPx, Math.max(p1.y, p2.y) + padPx],
+    ];
+
+    const pull = (predicate) =>
+      (mapInstance.queryRenderedFeatures(box, opts) || [])
+        .flatMap(explodeToLineStrings)
+        .filter((f) => predicate(f.properties));
+
+    // 1) exact intersections with block-bounding roads
+    let world = pull(isBlockBoundingRoad);
+
+    // Fallback #1: whole viewport if the bbox is empty
+    if (!world.length) {
+      world = (mapInstance.queryRenderedFeatures(opts) || [])
+        .flatMap(explodeToLineStrings)
+        .filter((f) => isBlockBoundingRoad(f.properties));
+    }
+
+    const baseName = streetNameFromProps(stitchedLine.properties);
+    const idKeys = ["osm_id", "osm_way_id", "id"];
+    const sameWay = (a, b) =>
+      idKeys.some((k) => a?.properties?.[k] != null && a.properties[k] === b?.properties?.[k]);
+
+    let intersections = [];
+    for (const nb of world) {
+      const sameName = baseName && streetNameFromProps(nb.properties) === baseName;
+      if (sameWay(nb, stitchedLine) || sameName) continue;
+      try {
+        const ints = turf.lineIntersect(stitchedLine, nb);
+        for (const f of ints.features || []) {
+          intersections.push(turf.nearestPointOnLine(stitchedLine, f));
+        }
+      } catch {}
+    }
+
+    // Fallback #2: try drivable roads if exact hits are scarce
+    const needApprox = intersections.length < 2;
+    if (needApprox) {
+      const world2 = pull(isDrivableRoad);
+      const GAP_M = 8; // treat close-but-not-touching as connected
+      for (const nb of world2) {
+        if (sameWay(nb, stitchedLine)) continue;
+        // test both ends; if close, project onto stitched line
+        for (const end of [nb.geometry.coordinates[0], nb.geometry.coordinates.at(-1)]) {
+          const proj = turf.nearestPointOnLine(stitchedLine, turf.point(end));
+          const d = proj.properties?.dist ?? turf.distance(turf.point(end), proj, { units: "meters" });
+          if (d <= GAP_M) intersections.push(proj);
+        }
+      }
+    }
+
+    // Always include ends as guards
+    const coords = stitchedLine.geometry.coordinates;
+    intersections.push(turf.point(coords[0]), turf.point(coords[coords.length - 1]));
+
+    // Distance along line from start
+    const start = turf.point(coords[0]);
+    const distAlong = (pt) =>
+      turf.length(turf.lineSlice(start, pt, stitchedLine), { units: "meters" });
+
+    // Deduplicate & sort; filter micro-gaps (crosswalk junk)
+    const seen = new Set();
+    let measures = intersections
+      .map((pt) => {
+        const key = pt.geometry.coordinates.map((c) => +c.toFixed(7)).join(",");
+        if (seen.has(key)) return null;
+        seen.add(key);
+        return { pt, m: distAlong(pt) };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.m - b.m);
+
+    const MIN_GAP_M = 12;
+    measures = measures.filter((cur, i, arr) => i === 0 || cur.m - arr[i - 1].m >= MIN_GAP_M);
+
+    // Use neighbors around the click
+    const clickM = distAlong(
+      turf.nearestPointOnLine(stitchedLine, turf.point([e.lngLat.lng, e.lngLat.lat]))
+    );
+    let before = measures[0], after = measures[measures.length - 1];
+    for (const cur of measures) {
+      if (cur.m <= clickM) before = cur;
+      if (cur.m >= clickM) { after = cur; break; }
+    }
+    if (before.m === after.m) {
+      const idx = measures.findIndex((x) => x.m === before.m);
+      if (idx > 0) before = measures[idx - 1];
+      if (idx < measures.length - 1) after = measures[idx + 1];
+    }
+
     try {
-      const ints = turf.lineIntersect(stitchedLine, nb);
-      for (const f of ints.features || []) {
-        intersections.push(turf.nearestPointOnLine(stitchedLine, f));
-      }
-    } catch {}
-  }
+      let sliced = turf.lineSlice(before.pt, after.pt, stitchedLine);
 
-  // Fallback #2: try drivable roads if exact hits are scarce
-  const needApprox = intersections.length < 2;
-  if (needApprox) {
-    const world2 = pull(isDrivableRoad);
-    const GAP_M = 8; // treat close-but-not-touching as connected
-    for (const nb of world2) {
-      if (sameWay(nb, stitchedLine)) continue;
-      // test both ends; if close, project onto stitched line
-      for (const end of [nb.geometry.coordinates[0], nb.geometry.coordinates.at(-1)]) {
-        const proj = turf.nearestPointOnLine(stitchedLine, turf.point(end));
-        const d = proj.properties?.dist ?? turf.distance(turf.point(end), proj, { units: "meters" });
-        if (d <= GAP_M) intersections.push(proj);
+      // Fallback #3: if insanely long (e.g., intersections still missing), clamp to ~1 block
+      const MAX_BLOCK_M = 260;
+      const len = turf.length(sliced, { units: "meters" });
+      if (len > MAX_BLOCK_M) {
+        const center = turf.nearestPointOnLine(
+          stitchedLine,
+          turf.point([e.lngLat.lng, e.lngLat.lat])
+        );
+        const half = MAX_BLOCK_M / 2;
+        const forward = turf.along(stitchedLine, Math.max(0, clickM + half), { units: "meters" });
+        const back = turf.along(stitchedLine, Math.max(0, clickM - half), { units: "meters" });
+        sliced = turf.lineSlice(back, forward, stitchedLine);
       }
+
+      return sliced;
+    } catch {
+      return null;
     }
   }
 
-  // Always include ends as guards
-  const coords = stitchedLine.geometry.coordinates;
-  intersections.push(turf.point(coords[0]), turf.point(coords[coords.length - 1]));
+  // From the two slicing heuristics, pick the best candidate segment
+  // and clamp to reasonable lengths if needed
+  function pickBestBlockSegment(mapInstance, stitchedLine, e) {
+    const a = sliceOneBlockBySplitting(mapInstance, stitchedLine, e);
+    const b = sliceBetweenIntersections(mapInstance, stitchedLine, e);
 
-  // Distance along line from start
-  const start = turf.point(coords[0]);
-  const distAlong = (pt) =>
-    turf.length(turf.lineSlice(start, pt, stitchedLine), { units: "meters" });
+    const cand = [a, b].filter(Boolean);
+    if (!cand.length) return null;
 
-  // Deduplicate & sort; filter micro-gaps (crosswalk junk)
-  const seen = new Set();
-  let measures = intersections
-    .map((pt) => {
-      const key = pt.geometry.coordinates.map((c) => +c.toFixed(7)).join(",");
-      if (seen.has(key)) return null;
-      seen.add(key);
-      return { pt, m: distAlong(pt) };
-    })
-    .filter(Boolean)
-    .sort((a, b) => a.m - b.m);
+    const lenM = (ln) => turf.length(ln, { units: "meters" });
+    cand.sort((x, y) => lenM(x) - lenM(y));
 
-  const MIN_GAP_M = 12;
-  measures = measures.filter((cur, i, arr) => i === 0 || cur.m - arr[i - 1].m >= MIN_GAP_M);
+    const MIN_M = 40;   // avoid tiny stubs (crosswalk slivers)
+    const MAX_M = 230;  // typical city block upper bound
 
-  // Use neighbors around the click
-  const clickM = distAlong(
-    turf.nearestPointOnLine(stitchedLine, turf.point([e.lngLat.lng, e.lngLat.lat]))
-  );
-  let before = measures[0], after = measures[measures.length - 1];
-  for (const cur of measures) {
-    if (cur.m <= clickM) before = cur;
-    if (cur.m >= clickM) { after = cur; break; }
-  }
-  if (before.m === after.m) {
-    const idx = measures.findIndex((x) => x.m === before.m);
-    if (idx > 0) before = measures[idx - 1];
-    if (idx < measures.length - 1) after = measures[idx + 1];
-  }
+    // Prefer the shortest candidate in-range
+    let best = cand.find(c => {
+      const L = lenM(c);
+      return L >= MIN_M && L <= MAX_M;
+    }) || cand[0];
 
-  try {
-    let sliced = turf.lineSlice(before.pt, after.pt, stitchedLine);
-
-    // Fallback #3: if insanely long (e.g., intersections still missing), clamp to ~1 block
-    const MAX_BLOCK_M = 260;
-    const len = turf.length(sliced, { units: "meters" });
-    if (len > MAX_BLOCK_M) {
-      const center = turf.nearestPointOnLine(
-        stitchedLine,
-        turf.point([e.lngLat.lng, e.lngLat.lat])
-      );
-      const half = MAX_BLOCK_M / 2;
-      const forward = turf.along(stitchedLine, Math.max(0, clickM + half), { units: "meters" });
-      const back = turf.along(stitchedLine, Math.max(0, clickM - half), { units: "meters" });
-      sliced = turf.lineSlice(back, forward, stitchedLine);
+    // If still too long, clamp around the click point
+    const L = lenM(best);
+    if (L > MAX_M) {
+      const click = turf.point([e.lngLat.lng, e.lngLat.lat]);
+      const clickOn = turf.nearestPointOnLine(stitchedLine, click);
+      const start = turf.point(stitchedLine.geometry.coordinates[0]);
+      const mClick = turf.length(turf.lineSlice(start, clickOn, stitchedLine), { units: "meters" });
+      const half = MAX_M / 2;
+      const back = turf.along(stitchedLine, Math.max(0, mClick - half), { units: "meters" });
+      const fwd  = turf.along(stitchedLine, mClick + half, { units: "meters" });
+      best = turf.lineSlice(back, fwd, stitchedLine);
     }
 
-    return sliced;
-  } catch {
-    return null;
-  }
-}
-
-// From the two slicing heuristics, pick the best candidate segment
-// and clamp to reasonable lengths if needed
-function pickBestBlockSegment(mapInstance, stitchedLine, e) {
-  const a = sliceOneBlockBySplitting(mapInstance, stitchedLine, e);
-  const b = sliceBetweenIntersections(mapInstance, stitchedLine, e);
-
-  const cand = [a, b].filter(Boolean);
-  if (!cand.length) return null;
-
-  const lenM = (ln) => turf.length(ln, { units: "meters" });
-  cand.sort((x, y) => lenM(x) - lenM(y));
-
-  const MIN_M = 40;   // avoid tiny stubs (crosswalk slivers)
-  const MAX_M = 230;  // typical city block upper bound
-
-  // Prefer the shortest candidate in-range
-  let best = cand.find(c => {
-    const L = lenM(c);
-    return L >= MIN_M && L <= MAX_M;
-  }) || cand[0];
-
-  // If still too long, clamp around the click point
-  const L = lenM(best);
-  if (L > MAX_M) {
-    const click = turf.point([e.lngLat.lng, e.lngLat.lat]);
-    const clickOn = turf.nearestPointOnLine(stitchedLine, click);
-    const start = turf.point(stitchedLine.geometry.coordinates[0]);
-    const mClick = turf.length(turf.lineSlice(start, clickOn, stitchedLine), { units: "meters" });
-    const half = MAX_M / 2;
-    const back = turf.along(stitchedLine, Math.max(0, mClick - half), { units: "meters" });
-    const fwd  = turf.along(stitchedLine, mClick + half, { units: "meters" });
-    best = turf.lineSlice(back, fwd, stitchedLine);
+    return best;
   }
 
-  return best;
-}
 
+  // Heuristic: public, drivable roads only (OSM + OpenMapTiles)
+  function isDrivableRoad(p = {}) {
+    const hw   = (p.highway || "").toLowerCase();
+    const cls  = (p.class || p.kind || "").toLowerCase();
+    const sub  = (p.subclass || "").toLowerCase();
+    const svc  = (p.service || "").toLowerCase();
+    const accs = [
+      (p.access || "").toLowerCase(),
+      (p.motor_vehicle || "").toLowerCase(),
+      (p.motorcar || "").toLowerCase(),
+      (p.vehicle || "").toLowerCase(),
+    ];
 
-// Heuristic: public, drivable roads only (OSM + OpenMapTiles)
-function isDrivableRoad(p = {}) {
-  const hw   = (p.highway || "").toLowerCase();
-  const cls  = (p.class || p.kind || "").toLowerCase();
-  const sub  = (p.subclass || "").toLowerCase();
-  const svc  = (p.service || "").toLowerCase();
-  const accs = [
-    (p.access || "").toLowerCase(),
-    (p.motor_vehicle || "").toLowerCase(),
-    (p.motorcar || "").toLowerCase(),
-    (p.vehicle || "").toLowerCase(),
-  ];
+    // Access restrictions
+    if (accs.some(v => v === "no" || v === "private" || v === "destination")) return false;
 
-  // Access restrictions
-  if (accs.some(v => v === "no" || v === "private" || v === "destination")) return false;
+    const ALLOW_HW = new Set([
+      "motorway","trunk","primary","secondary","tertiary",
+      "unclassified","residential","living_street",
+      "motorway_link","trunk_link","primary_link","secondary_link","tertiary_link","road"
+    ]);
+    const DENY_HW = new Set([
+      "service","track","path","footway","cycleway","pedestrian","steps",
+      "corridor","bridleway","construction","raceway","proposed"
+    ]);
+    const ALLOW_CLASS = new Set([
+      "motorway","trunk","primary","secondary","tertiary",
+      "minor","residential","living_street","street","link"
+    ]);
 
-  const ALLOW_HW = new Set([
-    "motorway","trunk","primary","secondary","tertiary",
-    "unclassified","residential","living_street",
-    "motorway_link","trunk_link","primary_link","secondary_link","tertiary_link","road"
-  ]);
-  const DENY_HW = new Set([
-    "service","track","path","footway","cycleway","pedestrian","steps",
-    "corridor","bridleway","construction","raceway","proposed"
-  ]);
-  const ALLOW_CLASS = new Set([
-    "motorway","trunk","primary","secondary","tertiary",
-    "minor","residential","living_street","street","link"
-  ]);
+    if (DENY_HW.has(hw)) return false;
+    if (cls === "service" || sub === "service") return false;
 
-  if (DENY_HW.has(hw)) return false;
-  if (cls === "service" || sub === "service") return false;
+    if (ALLOW_HW.has(hw)) return true;
+    if (ALLOW_CLASS.has(cls)) return true;
+    return false;
+  }
 
-  if (ALLOW_HW.has(hw)) return true;
-  if (ALLOW_CLASS.has(cls)) return true;
-  return false;
-}
-
-// REMOVE: useEffect for segmentMode and segmentWidthMeters (onClick handler for segment selection)
+  // REMOVE: useEffect for segmentMode and segmentWidthMeters (onClick handler for segment selection)
 
   // --- effects ----------------------------------------------------
 
@@ -1243,372 +1241,548 @@ function isDrivableRoad(p = {}) {
   }, [drawnCoords, useType]);
 
   // [START/END SEGMENT SELECTION] handle clicks
-useEffect(() => {
-  console.log('startEndMode changed:', startEndMode);
-  if (!map.current) return;
-  if (!startEndMode) return;
-  const m = map.current;
-
-  // Helper: Snap to nearest point on any road (LineString)
-  function getNearestRoadPoint(lngLat) {
-    // Use a generous pixel box around the click for candidate roads
-    const projected = m.project([lngLat.lng, lngLat.lat]);
-    if (!projected || typeof projected.x !== 'number' || typeof projected.y !== 'number') {
-      console.warn('Map.project returned invalid value for', lngLat, projected);
-      return [lngLat.lng, lngLat.lat];
-    }
-    const radiusPx = 60;
-    const box = [
-      [projected.x - radiusPx, projected.y - radiusPx],
-      [projected.x + radiusPx, projected.y + radiusPx]
-    ];
-    const roadLayerIds = getRoadLayerIds(m);
-    console.log('getRoadLayerIds:', roadLayerIds);
-
-    let featuresRaw = [];
-    try {
-      featuresRaw = m.queryRenderedFeatures(box, { layers: roadLayerIds });
-    } catch (err) {
-      console.warn('queryRenderedFeatures failed:', err);
-      return [lngLat.lng, lngLat.lat];
-    }
-    console.log('Candidate features from queryRenderedFeatures:', featuresRaw);
-  featuresRaw.forEach((f, i) => {
-    const isDrivable = isDrivableRoad(f.properties);
-    let snappedDist = "N/A";
-    if (f.geometry?.type === "LineString") {
-      const pt = turf.point([lngLat.lng, lngLat.lat]);
-      const line = turf.lineString(f.geometry.coordinates);
-      const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-      snappedDist = snapped.properties.dist;
-    } else if (f.geometry?.type === "MultiLineString") {
-      const pt = turf.point([lngLat.lng, lngLat.lat]);
-      let minDist = Infinity;
-      let bestSnapped = null;
-      f.geometry.coordinates.forEach((coords, segIdx) => {
-        const line = turf.lineString(coords);
-        const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-        if (snapped.properties.dist < minDist) {
-          minDist = snapped.properties.dist;
-          bestSnapped = snapped;
-        }
-        console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped.properties.dist}`);
-      });
-      if (bestSnapped) {
-        snappedDist = bestSnapped.properties.dist;
-      }
-    }
-    console.log(`Feature #${i} layer.id: ${f.layer?.id} isDrivable: ${isDrivable} snapped distance: ${snappedDist} geometry.type: ${f.geometry?.type} properties:`, f.properties);
-    if (f.geometry?.type !== "LineString") {
-      console.log(`Feature #${i} full object:`, f);
-    }
-  });
-
-  // Filter only drivable roads
-  const features = featuresRaw.filter(f => (f.geometry?.type === "LineString" || f.geometry?.type === "MultiLineString") && isDrivableRoad(f.properties));
-  const pt = turf.point([lngLat.lng, lngLat.lat]);
-  let best = null, bestDist = Infinity;
-  // Detailed logging for each drivable candidate
-  for (const feat of features) {
-    let snapped = null;
-    let dist = null;
-    if (feat.geometry?.type === "LineString") {
-      const line = turf.lineString(feat.geometry.coordinates);
-      snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-      dist = snapped.properties.dist;
-    } else if (feat.geometry?.type === "MultiLineString") {
-      let minDist = Infinity;
-      let bestSnapped = null;
-      feat.geometry.coordinates.forEach((coords, segIdx) => {
-        const line = turf.lineString(coords);
-        const segSnapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-        if (segSnapped.properties.dist < minDist) {
-          minDist = segSnapped.properties.dist;
-          bestSnapped = segSnapped;
-        }
-      });
-      snapped = bestSnapped;
-      dist = minDist;
-    }
-    console.log('Drivable candidate:', {
-      snappedDistance: dist,
-      snappedCoords: snapped?.geometry?.coordinates,
-      clickCoords: [lngLat.lng, lngLat.lat],
-      properties: feat.properties
-    });
-    if (dist !== null && dist < bestDist) {
-      bestDist = dist;
-      best = snapped.geometry.coordinates;
-    }
-  }
-  // Only snap if within 80 meters (TEMPORARY for debugging)
-  if (best && bestDist <= 80) {
-    return best;
-  } else {
-    console.warn('No drivable road within 30 meters of click:', lngLat);
-    return null;
-  }
-  }
-
-  const handleStartEndClick = (e) => {
-    const lngLat = e.lngLat;
-    const snapped = getNearestRoadPoint(lngLat);
-    if (!snapped) {
-      // Optionally show a warning to the user here
-      console.warn('Click ignored: no drivable road nearby');
-      return;
-    }
-    if (!startPoint) {
-      setStartPoint(snapped);
-      console.log('Start point:', snapped);
-    } else if (!endPoint) {
-      setEndPoint(snapped);
-      console.log('End point:', snapped);
-    } else {
-      setStartPoint(snapped);
-      setEndPoint(null);
-      console.log('Resetting selection, new start:', snapped);
-    }
-  };
-
-  m.on("click", handleStartEndClick);
-  return () => m.off("click", handleStartEndClick);
-}, [startEndMode, startPoint, endPoint]);
-
-// [START/END SEGMENT SELECTION] Visual feedback for selected points and drag-to-stretch
-useEffect(() => {
-  if (!map.current) return;
-  if (!startEndMode) return;
-  const m = map.current;
-  if (!m.getSource('start-end-points')) {
-    m.addSource('start-end-points', {
-      type: 'geojson',
-      data: { type: 'FeatureCollection', features: [] }
-    });
-    m.addLayer({
-      id: 'start-end-points-layer',
-      type: 'circle',
-      source: 'start-end-points',
-      paint: {
-        'circle-radius': 8,
-        'circle-color': ['match', ['get', 'type'], 'start', '#28a745', 'end', '#ffc107', '#888'],
-        'circle-stroke-width': 2,
-        'circle-stroke-color': '#fff'
-      }
-    });
-  }
-  const features = [];
-  if (startPoint) {
-    features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: startPoint }, properties: { type: 'start' } });
-  }
-  if (endPoint) {
-    features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: endPoint }, properties: { type: 'end' } });
-  }
-  m.getSource('start-end-points').setData({ type: 'FeatureCollection', features });
-
-  // Drag-to-stretch logic
-  let isDragging = false;
-  let dragType = null;
-
-  function onMouseDown(e) {
-    if (!e.features?.length) return;
-    const feature = e.features[0];
-    if (feature.layer.id !== 'start-end-points-layer') return;
-    dragType = feature.properties.type; // 'start' or 'end'
-    isDragging = true;
-    m.getCanvas().style.cursor = 'grabbing';
-    m.dragPan.disable();
-  }
-
-  function onMouseMove(e) {
-    if (!isDragging || !dragType) return;
-    const lngLat = e.lngLat;
-    // Snap to the nearest point along the currently highlighted road segment
-    // Find the currently highlighted segment geometry
+  useEffect(() => {
+    console.log('startEndMode changed:', startEndMode);
+    if (!map.current) return;
+    if (!startEndMode) return;
     const m = map.current;
-    const source = m.getSource('selected-road-segment');
-    if (!source) return;
-    const data = source._data || source._options?.data;
-    if (!data || !data.geometry || !Array.isArray(data.geometry.coordinates)) return;
-    const line = turf.lineString(data.geometry.coordinates);
-    const snapped = turf.nearestPointOnLine(line, turf.point([lngLat.lng, lngLat.lat]), { units: 'meters' });
-    if (!snapped || !snapped.geometry || !Array.isArray(snapped.geometry.coordinates)) return;
-    if (dragType === 'start') {
-      setStartPoint(snapped.geometry.coordinates);
-    } else if (dragType === 'end') {
-      setEndPoint(snapped.geometry.coordinates);
-    }
-  }
 
-  function onMouseUp() {
-    if (!isDragging) return;
-    isDragging = false;
-    dragType = null;
-    m.getCanvas().style.cursor = '';
-    m.dragPan.enable();
-  }
+    // Helper: Snap to nearest point on any road (LineString)
+    function getNearestRoadPoint(lngLat) {
+      // Use a generous pixel box around the click for candidate roads
+      const projected = m.project([lngLat.lng, lngLat.lat]);
+      if (!projected || typeof projected.x !== 'number' || typeof projected.y !== 'number') {
+        console.warn('Map.project returned invalid value for', lngLat, projected);
+        return [lngLat.lng, lngLat.lat];
+      }
+      const radiusPx = 60;
+      const box = [
+        [projected.x - radiusPx, projected.y - radiusPx],
+        [projected.x + radiusPx, projected.y + radiusPx]
+      ];
+      const roadLayerIds = getRoadLayerIds(m);
+      console.log('getRoadLayerIds:', roadLayerIds);
 
-  m.on('mousedown', 'start-end-points-layer', onMouseDown);
-  m.on('mousemove', onMouseMove);
-  m.on('mouseup', 'start-end-points-layer', onMouseUp);
-
-  return () => {
-    m.off('mousedown', 'start-end-points-layer', onMouseDown);
-    m.off('mousemove', onMouseMove);
-    m.off('mouseup', 'start-end-points-layer', onMouseUp);
-  };
-}, [startEndMode, startPoint, endPoint]);
-
-// [START/END SEGMENT SELECTION] Highlight selected road segment and clear on exit
-useEffect(() => {
-  if (!map.current) return;
-  const m = map.current;
-
-  // Remove previous highlight layer if exists
-  if (m.getLayer('selected-road-segment')) {
-    m.removeLayer('selected-road-segment');
-  }
-  if (m.getSource('selected-road-segment')) {
-    m.removeSource('selected-road-segment');
-  }
-
-  // Only highlight if both points are set and startEndMode is active
-  if (startEndMode && startPoint && endPoint) {
-    // Query a generous bounding box around both points
-    const bounds = turf.bbox({
-      type: 'Feature',
-      geometry: {
-        type: 'LineString',
-        coordinates: [startPoint, endPoint]
+      let featuresRaw = [];
+      try {
+        featuresRaw = m.queryRenderedFeatures(box, { layers: roadLayerIds });
+      } catch (err) {
+        console.warn('queryRenderedFeatures failed:', err);
+        return [lngLat.lng, lngLat.lat];
+      }
+      console.log('Candidate features from queryRenderedFeatures:', featuresRaw);
+    featuresRaw.forEach((f, i) => {
+      const isDrivable = isDrivableRoad(f.properties);
+      let snappedDist = "N/A";
+      if (f.geometry?.type === "LineString") {
+        const pt = turf.point([lngLat.lng, lngLat.lat]);
+        const line = turf.lineString(f.geometry.coordinates);
+        const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+        snappedDist = snapped.properties.dist;
+      } else if (f.geometry?.type === "MultiLineString") {
+        const pt = turf.point([lngLat.lng, lngLat.lat]);
+        let minDist = Infinity;
+        let bestSnapped = null;
+        f.geometry.coordinates.forEach((coords, segIdx) => {
+          const line = turf.lineString(coords);
+          const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+          if (snapped.properties.dist < minDist) {
+            minDist = snapped.properties.dist;
+            bestSnapped = snapped;
+          }
+          console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped.properties.dist}`);
+        });
+        if (bestSnapped) {
+          snappedDist = bestSnapped.properties.dist;
+        }
+      }
+      console.log(`Feature #${i} layer.id: ${f.layer?.id} isDrivable: ${isDrivable} snapped distance: ${snappedDist} geometry.type: ${f.geometry?.type} properties:`, f.properties);
+      if (f.geometry?.type !== "LineString") {
+        console.log(`Feature #${i} full object:`, f);
       }
     });
-    const padding = 0.002; // ~200m
-    bounds[0] -= padding;
-    bounds[1] -= padding;
-    bounds[2] += padding;
-    bounds[3] += padding;
-    const sw = m.project([bounds[0], bounds[1]]);
-    const ne = m.project([bounds[2], bounds[3]]);
-    const roadLayerIds = getRoadLayerIds(m);
-    let featuresRaw = [];
-    try {
-      featuresRaw = m.queryRenderedFeatures([sw, ne], { layers: roadLayerIds });
-    } catch (err) {
-      console.error('Error querying rendered features:', err);
-      return;
-    }
-    // Only drivable road segments
+
+    // Filter only drivable roads
     const features = featuresRaw.filter(f => (f.geometry?.type === "LineString" || f.geometry?.type === "MultiLineString") && isDrivableRoad(f.properties));
-    // Convert features to a network of LineStrings
-    const roadNetwork = features.flatMap(feat => {
-      if (feat.geometry.type === "LineString") {
-        return [turf.lineString(feat.geometry.coordinates)];
-      } else if (feat.geometry.type === "MultiLineString") {
-        return feat.geometry.coordinates.map(coords => turf.lineString(coords));
+    const pt = turf.point([lngLat.lng, lngLat.lat]);
+    let best = null, bestDist = Infinity;
+    // Detailed logging for each drivable candidate
+    for (const feat of features) {
+      let snapped = null;
+      let dist = null;
+      if (feat.geometry?.type === "LineString") {
+        const line = turf.lineString(feat.geometry.coordinates);
+        snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+        dist = snapped.properties.dist;
+      } else if (feat.geometry?.type === "MultiLineString") {
+        let minDist = Infinity;
+        let bestSnapped = null;
+        feat.geometry.coordinates.forEach((coords, segIdx) => {
+          const line = turf.lineString(coords);
+          const segSnapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+          if (segSnapped.properties.dist < minDist) {
+            minDist = segSnapped.properties.dist;
+            bestSnapped = segSnapped;
+          }
+        });
+        snapped = bestSnapped;
+        dist = minDist;
       }
-      return [];
-    });
-    // Snap both points to the nearest road segments
-    function findNearestPointOnNetwork(point, network) {
-      let nearest = null;
-      let minDist = Infinity;
-      network.forEach(line => {
-        const snapped = turf.nearestPointOnLine(line, turf.point(point), { units: 'meters' });
-        if (snapped && snapped.properties.dist < minDist) {
-          minDist = snapped.properties.dist;
-          nearest = snapped;
+      console.log('Drivable candidate:', {
+        snappedDistance: dist,
+        snappedCoords: snapped?.geometry?.coordinates,
+        clickCoords: [lngLat.lng, lngLat.lat],
+        properties: feat.properties
+      });
+      if (dist !== null && dist < bestDist) {
+        bestDist = dist;
+        best = snapped.geometry.coordinates;
+      }
+    }
+    // Only snap if within 80 meters (TEMPORARY for debugging)
+    if (best && bestDist <= 80) {
+      return best;
+    } else {
+      console.warn('No drivable road within 30 meters of click:', lngLat);
+      return null;
+    }
+    }
+
+    const handleStartEndClick = (e) => {
+      const lngLat = e.lngLat;
+      const snapped = getNearestRoadPoint(lngLat);
+      if (!snapped) {
+        // Optionally show a warning to the user here
+        console.warn('Click ignored: no drivable road nearby');
+        return;
+      }
+      if (!startPoint) {
+        setStartPoint(snapped);
+        console.log('Start point:', snapped);
+      } else if (!endPoint) {
+        setEndPoint(snapped);
+        console.log('End point:', snapped);
+      } else {
+        // Clear previous line and points before starting new selection
+        const m = map.current;
+        if (m) {
+          if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
+          if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
+          if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
+          if (m.getSource('start-end-points')) m.removeSource('start-end-points');
+        }
+        setStartPoint(snapped);
+        setEndPoint(null);
+        console.log('Resetting selection, new start:', snapped);
+      }
+    };
+
+    m.on("click", handleStartEndClick);
+    return () => m.off("click", handleStartEndClick);
+  }, [startEndMode, startPoint, endPoint]);
+
+  // [START/END SEGMENT SELECTION] Visual feedback for selected points and drag-to-stretch
+  useEffect(() => {
+    if (!map.current) return;
+    if (!startEndMode) return;
+    const m = map.current;
+    if (!m.getSource('start-end-points')) {
+      m.addSource('start-end-points', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+      m.addLayer({
+        id: 'start-end-points-layer',
+        type: 'circle',
+        source: 'start-end-points',
+        paint: {
+          'circle-radius': 8,
+          'circle-color': ['match', ['get', 'type'], 'start', '#28a745', 'end', '#ffc107', '#888'],
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#fff'
         }
       });
-      return nearest ? nearest.geometry.coordinates : point;
     }
-    const startSnapped = findNearestPointOnNetwork(startPoint, roadNetwork);
-    const endSnapped = findNearestPointOnNetwork(endPoint, roadNetwork);
-    // Find the shortest path using the snapped points
-    let pathLine = findShortestRoadPath(m, startSnapped, endSnapped);
-    // Fallback: if pathLine is null, try to snap to the closest road segment between the snapped points
-    if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
-      // Improved fallback: slice the closest road segment between the snapped points
-      let bestSegment = null;
-      let minDist = Infinity;
-      let bestStartIdx = null;
-      let bestEndIdx = null;
-      for (const line of roadNetwork) {
-        let minStartDist = Infinity, minEndDist = Infinity;
-        let startIdx = 0, endIdx = 0;
-        line.geometry.coordinates.forEach((coord, idx) => {
-          const dStart = turf.distance(turf.point(coord), turf.point(startSnapped), { units: 'meters' });
-          const dEnd = turf.distance(turf.point(coord), turf.point(endSnapped), { units: 'meters' });
-          if (dStart < minStartDist) { minStartDist = dStart; startIdx = idx; }
-          if (dEnd < minEndDist) { minEndDist = dEnd; endIdx = idx; }
+    const features = [];
+    if (startPoint) {
+      features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: startPoint }, properties: { type: 'start' } });
+    }
+    if (endPoint) {
+      features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: endPoint }, properties: { type: 'end' } });
+    }
+    m.getSource('start-end-points').setData({ type: 'FeatureCollection', features });
+
+    // Drag-to-stretch logic
+    let isDragging = false;
+    let dragType = null;
+
+    function onMouseDown(e) {
+      if (!e.features?.length) return;
+      const feature = e.features[0];
+      if (feature.layer.id !== 'start-end-points-layer') return;
+      dragType = feature.properties.type; // 'start' or 'end'
+      isDragging = true;
+      m.getCanvas().style.cursor = 'grabbing';
+      m.dragPan.disable();
+    }
+
+    function onMouseMove(e) {
+      if (!isDragging || !dragType) return;
+      const lngLat = e.lngLat;
+      // Snap to the nearest point along the currently highlighted road segment
+      // Find the currently highlighted segment geometry
+      const m = map.current;
+      const source = m.getSource('selected-road-segment');
+      if (!source) return;
+      const data = source._data || source._options?.data;
+      if (!data || !data.geometry || !Array.isArray(data.geometry.coordinates)) return;
+      const line = turf.lineString(data.geometry.coordinates);
+      const snapped = turf.nearestPointOnLine(line, turf.point([lngLat.lng, lngLat.lat]), { units: 'meters' });
+      if (!snapped || !snapped.geometry || !Array.isArray(snapped.geometry.coordinates)) return;
+      if (dragType === 'start') {
+        setStartPoint(snapped.geometry.coordinates);
+      } else if (dragType === 'end') {
+        setEndPoint(snapped.geometry.coordinates);
+      }
+    }
+
+    function onMouseUp() {
+      if (!isDragging) return;
+      isDragging = false;
+      dragType = null;
+      m.getCanvas().style.cursor = '';
+      m.dragPan.enable();
+    }
+
+    m.on('mousedown', 'start-end-points-layer', onMouseDown);
+    m.on('mousemove', onMouseMove);
+    m.on('mouseup', 'start-end-points-layer', onMouseUp);
+
+    return () => {
+      m.off('mousedown', 'start-end-points-layer', onMouseDown);
+      m.off('mousemove', onMouseMove);
+      m.off('mouseup', 'start-end-points-layer', onMouseUp);
+    };
+  }, [startEndMode, startPoint, endPoint]);
+
+  // [START/END SEGMENT SELECTION] Highlight selected road segment and clear on exit
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+
+    // Only remove highlight and start/end points when exiting start/end mode
+    if (!startEndMode) {
+      if (m.getLayer('selected-road-segment-layer')) {
+        m.removeLayer('selected-road-segment-layer');
+      }
+      if (m.getLayer('selected-road-segment')) {
+        m.removeLayer('selected-road-segment');
+      }
+      if (m.getSource('selected-road-segment')) {
+        m.removeSource('selected-road-segment');
+      }
+      if (m.getLayer('start-end-points-layer')) {
+        m.removeLayer('start-end-points-layer');
+      }
+      if (m.getSource('start-end-points')) {
+        m.removeSource('start-end-points');
+      }
+      return;
+    }
+
+    // Only highlight if both points are set and startEndMode is active
+    if (startEndMode && startPoint && endPoint) {
+      // Always snap both points to nearest road segment using all visible drivable roads
+      const roadLayerIds = getRoadLayerIds(m);
+      let featuresRaw = [];
+      try {
+        featuresRaw = m.queryRenderedFeatures({ layers: roadLayerIds });
+      } catch (err) {
+        console.error('Error querying rendered features:', err);
+        return;
+      }
+      // Only drivable road segments
+      const roadNetwork = featuresRaw.flatMap(feat => {
+        if (feat.geometry?.type === "LineString" && isDrivableRoad(feat.properties)) {
+          return [turf.lineString(feat.geometry.coordinates, feat.properties)];
+        } else if (feat.geometry?.type === "MultiLineString" && isDrivableRoad(feat.properties)) {
+          return feat.geometry.coordinates.map(coords => turf.lineString(coords, feat.properties));
+        }
+        return [];
+      });
+      // Snap both points to the nearest road segment in the network
+      function findNearestPointOnNetwork(point, network) {
+        let nearest = null;
+        let minDist = Infinity;
+        network.forEach(line => {
+          const snapped = turf.nearestPointOnLine(line, turf.point(point), { units: 'meters' });
+          if (snapped.properties.dist < minDist) {
+            minDist = snapped.properties.dist;
+            nearest = snapped.geometry.coordinates;
+          }
         });
-        const threshold = 30; // meters
-        if (minStartDist < threshold && minEndDist < threshold) {
-          const totalDist = minStartDist + minEndDist;
-          if (totalDist < minDist) {
-            minDist = totalDist;
-            bestSegment = line;
-            bestStartIdx = startIdx;
-            bestEndIdx = endIdx;
+        return nearest || point;
+      }
+      const startSnapped = findNearestPointOnNetwork(startPoint, roadNetwork);
+      const endSnapped = findNearestPointOnNetwork(endPoint, roadNetwork);
+
+      // Build a graph of road vertices and compute the shortest path along roads
+      function coordKey(c) {
+        // reduce floating noise so vertices merge reliably
+        return `${c[0].toFixed(6)},${c[1].toFixed(6)}`;
+      }
+      function lineLen(coords) {
+        try { return turf.length(turf.lineString(coords), { units: 'meters' }); } catch { return Infinity; }
+      }
+      function buildGraph(lines) {
+        const adj = new Map(); // key -> [{ to, coords }]
+        function ensure(k) { if (!adj.has(k)) adj.set(k, []); }
+        for (const ln of lines) {
+          const cs = ln.geometry.coordinates;
+          for (let i = 0; i < cs.length - 1; i++) {
+            const a = cs[i], b = cs[i + 1];
+            const ka = coordKey(a), kb = coordKey(b);
+            ensure(ka); ensure(kb);
+            adj.get(ka).push({ to: kb, coords: [a, b] });
+            adj.get(kb).push({ to: ka, coords: [b, a] });
+          }
+        }
+        return adj;
+      }
+      function nearestSnap(lines, pt) {
+        let best = null;
+        let bestLine = null;
+        let bestIdx = null;
+        let minD = Infinity;
+        const target = turf.point(pt);
+        for (const ln of lines) {
+          try {
+            const snapped = turf.nearestPointOnLine(ln, target, { units: 'meters' });
+            if (snapped && snapped.properties.dist < minD) {
+              minD = snapped.properties.dist;
+              best = snapped.geometry.coordinates;
+              bestLine = ln;
+              bestIdx = snapped.properties.index ?? null; // index of segment start
+            }
+          } catch {}
+        }
+        return best ? { coord: best, line: bestLine, segIndex: bestIdx } : null;
+      }
+      function shortestPathOnNetwork(lines, a, b) {
+        const graph = buildGraph(lines);
+        if (!graph || graph.size === 0) return null;
+        const s = nearestSnap(lines, a);
+        const t = nearestSnap(lines, b);
+        if (!s || !t) return null;
+
+        // Attach start/end to graph by connecting to the nearest segment endpoints
+        const startK = coordKey(s.coord);
+        const endK = coordKey(t.coord);
+        if (!graph.has(startK)) graph.set(startK, []);
+        if (!graph.has(endK)) graph.set(endK, []);
+        if (s.line && s.segIndex != null) {
+          const cs = s.line.geometry.coordinates;
+          const i = Math.min(Math.max(0, s.segIndex), cs.length - 2);
+          const A = cs[i], B = cs[i + 1];
+          const kA = coordKey(A), kB = coordKey(B);
+          if (!graph.has(kA)) graph.set(kA, []);
+          if (!graph.has(kB)) graph.set(kB, []);
+          graph.get(startK).push({ to: kA, coords: [s.coord, A] });
+          graph.get(kA).push({ to: startK, coords: [A, s.coord] });
+          graph.get(startK).push({ to: kB, coords: [s.coord, B] });
+          graph.get(kB).push({ to: startK, coords: [B, s.coord] });
+        }
+        if (t.line && t.segIndex != null) {
+          const cs = t.line.geometry.coordinates;
+          const i = Math.min(Math.max(0, t.segIndex), cs.length - 2);
+          const A = cs[i], B = cs[i + 1];
+          const kA = coordKey(A), kB = coordKey(B);
+          if (!graph.has(kA)) graph.set(kA, []);
+          if (!graph.has(kB)) graph.set(kB, []);
+          graph.get(endK).push({ to: kA, coords: [t.coord, A] });
+          graph.get(kA).push({ to: endK, coords: [A, t.coord] });
+          graph.get(endK).push({ to: kB, coords: [t.coord, B] });
+          graph.get(kB).push({ to: endK, coords: [B, t.coord] });
+        }
+
+        // Dijkstra
+        const dist = new Map();
+        const prev = new Map();
+        const visited = new Set();
+        const pq = new Set();
+        for (const k of graph.keys()) { dist.set(k, Infinity); }
+        dist.set(startK, 0);
+        pq.add(startK);
+        function popMin() {
+          let best = null, bestD = Infinity;
+          for (const k of pq) { const d = dist.get(k); if (d < bestD) { bestD = d; best = k; } }
+          if (best != null) pq.delete(best);
+          return best;
+        }
+        while (pq.size) {
+          const u = popMin();
+          if (u == null) break;
+          if (u === endK) break;
+          if (visited.has(u)) continue;
+          visited.add(u);
+          const edges = graph.get(u) || [];
+          for (const e of edges) {
+            const v = e.to;
+            if (visited.has(v)) continue;
+            const w = lineLen(e.coords);
+            const alt = (dist.get(u) ?? Infinity) + w;
+            if (alt < (dist.get(v) ?? Infinity)) {
+              dist.set(v, alt);
+              prev.set(v, { u, coords: e.coords });
+              pq.add(v);
+            }
+          }
+        }
+        if (!prev.has(endK)) return null;
+        // reconstruct path as list of coord segments
+        const segs = [];
+        let cur = endK;
+        while (prev.has(cur)) {
+          const { u, coords } = prev.get(cur);
+          segs.unshift(coords);
+          cur = u;
+        }
+        // flatten with de-duplication
+        const out = [];
+        for (const sCoords of segs) {
+          if (out.length) {
+            const last = out[out.length - 1];
+            if (last[0] === sCoords[0][0] && last[1] === sCoords[0][1]) {
+              out.push(sCoords[1]);
+            } else {
+              out.push(...sCoords);
+            }
+          } else {
+            out.push(...sCoords);
+          }
+        }
+        if (out.length < 2) return null;
+        return turf.lineString(out);
+      }
+
+      let pathLine = shortestPathOnNetwork(roadNetwork, startSnapped, endSnapped);
+      // Fallback: if pathLine is null, try to snap to the closest road segment between the snapped points
+      if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
+        // Improved fallback: slice the closest road segment between the snapped points
+        let bestSegment = null;
+        let minDist = Infinity;
+        let bestStartIdx = null;
+        let bestEndIdx = null;
+        for (const line of roadNetwork) {
+          const coords = line.geometry.coordinates;
+          let startIdx = -1, endIdx = -1;
+          coords.forEach((c, idx) => {
+            const dStart = turf.distance(turf.point(c), turf.point(startSnapped), { units: 'meters' });
+            const dEnd = turf.distance(turf.point(c), turf.point(endSnapped), { units: 'meters' });
+            if (dStart < 1.5) startIdx = idx;
+            if (dEnd < 1.5) endIdx = idx;
+          });
+          if (startIdx !== -1 && endIdx !== -1) {
+            const dist = Math.abs(endIdx - startIdx);
+            if (dist < minDist) {
+              minDist = dist;
+              bestSegment = coords;
+              bestStartIdx = startIdx;
+              bestEndIdx = endIdx;
+            }
+          }
+        }
+        if (bestSegment && bestStartIdx != null && bestEndIdx != null) {
+          pathLine = turf.lineString(bestSegment.slice(Math.min(bestStartIdx, bestEndIdx), Math.max(bestStartIdx, bestEndIdx) + 1));
+        } else {
+          // Advanced fallback: pick the road line that best matches both endpoints
+          let bestSlice = null;
+          let bestScore = Infinity;
+          for (const line of roadNetwork) {
+            try {
+              const a = turf.nearestPointOnLine(line, turf.point(startSnapped), { units: 'meters' });
+              const b = turf.nearestPointOnLine(line, turf.point(endSnapped), { units: 'meters' });
+              const score = (a?.properties?.dist ?? 1e9) + (b?.properties?.dist ?? 1e9);
+              const sliced = turf.lineSlice(a, b, line);
+              if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) continue;
+              if (score < bestScore) {
+                bestScore = score;
+                bestSlice = sliced;
+              }
+            } catch {}
+          }
+          if (bestSlice) {
+            pathLine = bestSlice;
+          } else {
+            // Last-resort fallback: project chord onto network by sampling and snapping
+            function projectChordOntoNetwork(a, b, network, samples = 40, maxSnapM = 80) {
+              const snappedPts = [];
+              for (let i = 0; i <= samples; i++) {
+                const t = i / samples;
+                const p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                let best = null; let bestD = Infinity;
+                for (const ln of network) {
+                  try {
+                    const s = turf.nearestPointOnLine(ln, turf.point(p), { units: 'meters' });
+                    if (s && s.properties.dist < bestD) { bestD = s.properties.dist; best = s.geometry.coordinates; }
+                  } catch {}
+                }
+                if (best && bestD <= maxSnapM) {
+                  if (!snappedPts.length || snappedPts[snappedPts.length - 1][0] !== best[0] || snappedPts[snappedPts.length - 1][1] !== best[1]) {
+                    snappedPts.push(best);
+                  }
+                }
+              }
+              if (snappedPts.length < 2) return null;
+              return turf.lineString(snappedPts);
+            }
+            const projected = projectChordOntoNetwork(startSnapped, endSnapped, roadNetwork);
+            if (projected) {
+              pathLine = projected;
+            } else {
+              return; // abort drawing; still no road-aligned geometry
+            }
           }
         }
       }
-      if (bestSegment && bestStartIdx != null && bestEndIdx != null) {
-        const coords = bestSegment.geometry.coordinates.slice(
-          Math.min(bestStartIdx, bestEndIdx),
-          Math.max(bestStartIdx, bestEndIdx) + 1
-        );
-        coords[0] = startSnapped;
-        coords[coords.length - 1] = endSnapped;
-        pathLine = turf.lineString(coords, bestSegment.properties);
-        console.warn('Fallback: using closest road segment', {
-          segment: bestSegment,
-          startIdx: bestStartIdx,
-          endIdx: bestEndIdx,
-          coords,
-        });
-      } else {
-        console.warn('Fallback: no suitable road segment found, drawing direct line.');
-        pathLine = turf.lineString([startSnapped, endSnapped]);
+      // Clamp to reasonable length if needed
+      const MAX_BLOCK_M = 260;
+      const len = turf.length(pathLine, { units: 'meters' });
+      let finalLine = pathLine;
+      if (len > MAX_BLOCK_M) {
+        // Clamp around midpoint
+        const mid = Math.floor(pathLine.geometry.coordinates.length / 2);
+        const back = turf.along(pathLine, Math.max(0, len / 2 - MAX_BLOCK_M / 2), { units: 'meters' });
+        const fwd = turf.along(pathLine, len / 2 + MAX_BLOCK_M / 2, { units: 'meters' });
+        finalLine = turf.lineSlice(back, fwd, pathLine);
+      }
+      if (finalLine && finalLine.geometry && Array.isArray(finalLine.geometry.coordinates) && finalLine.geometry.coordinates.length >= 2) {
+        // Add or update the source safely
+        if (!m.getSource('selected-road-segment')) {
+          m.addSource('selected-road-segment', {
+            type: 'geojson',
+            data: finalLine
+          });
+        } else {
+          m.getSource('selected-road-segment').setData(finalLine);
+        }
+        // Add the layer to render the highlighted line if not present
+        if (!m.getLayer('selected-road-segment-layer')) {
+          m.addLayer({
+            id: 'selected-road-segment-layer',
+            type: 'line',
+            source: 'selected-road-segment',
+            paint: {
+              'line-color': '#ff9800',
+              'line-width': 6,
+              'line-opacity': 0.85,
+              'line-dasharray': [2, 2]
+            }
+          });
+        }
       }
     }
-    if (pathLine && pathLine.geometry && Array.isArray(pathLine.geometry.coordinates) && pathLine.geometry.coordinates.length >= 2) {
-      m.addSource('selected-road-segment', {
-        type: 'geojson',
-        data: pathLine
-      });
-      m.addLayer({
-        id: 'selected-road-segment',
-        type: 'line',
-        source: 'selected-road-segment',
-        paint: {
-          'line-color': '#3388ff',
-          'line-width': 8,
-          'line-opacity': 0.85
-        },
-        layout: {
-          'line-join': 'round',
-          'line-cap': 'round'
-        }
-      });
-    } else {
-      console.warn('Highlight line not added: path line invalid');
-    }
-  }
-}, [startEndMode, startPoint, endPoint]);
-
-// Clear selections immediately when exiting start/end mode
-useEffect(() => {
-  if (!startEndMode) {
-    setStartPoint(null);
-    setEndPoint(null);
-    if (map.current && map.current.getSource('start-end-points')) {
-      map.current.getSource('start-end-points').setData({
-        type: 'FeatureCollection',
-        features: []
-      });
-    }
-  }
-}, [startEndMode]);
+  }, [startEndMode, startPoint, endPoint]);
 
   // --- Save / finalize helpers -----------------------------------
 
@@ -1619,7 +1793,7 @@ useEffect(() => {
   function finalizeCurrent() {
     if (canFinalizePolygon) return finalizeZone();
     if (canFinalizeStreets) return finalizeStreetSelection();
-}
+  }
 
   const canFinalize = drawMode && drawnCoords.length >= 3;
 
