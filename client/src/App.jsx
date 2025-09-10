@@ -1531,8 +1531,16 @@ export default function App() {
         // reduce floating noise so vertices merge reliably
         return `${c[0].toFixed(6)},${c[1].toFixed(6)}`;
       }
+      function edgePenalty(a, b) {
+        // Prefer car roads over paths; if any endpoint looks like a path segment vertex, add a small penalty
+        // We don't have per-edge props here, so keep it minimal; distance dominates.
+        return 0; // placeholder for future tuning if needed
+      }
       function lineLen(coords) {
-        try { return turf.length(turf.lineString(coords), { units: 'meters' }); } catch { return Infinity; }
+        try {
+          const d = turf.length(turf.lineString(coords), { units: 'meters' });
+          return d + edgePenalty(coords[0], coords[1]);
+        } catch { return Infinity; }
       }
       function buildGraph(lines) {
         const adj = new Map(); // key -> [{ to, coords }]
@@ -1548,6 +1556,17 @@ export default function App() {
           }
         }
         return adj;
+      }
+      function removeUndirectedEdge(graph, k1, k2) {
+        if (!graph) return;
+        if (graph.has(k1)) {
+          const arr = graph.get(k1);
+          graph.set(k1, arr.filter(e => e.to !== k2));
+        }
+        if (graph.has(k2)) {
+          const arr = graph.get(k2);
+          graph.set(k2, arr.filter(e => e.to !== k1));
+        }
       }
       function nearestSnap(lines, pt) {
         let best = null;
@@ -1580,6 +1599,16 @@ export default function App() {
         const endK = coordKey(t.coord);
         if (!graph.has(startK)) graph.set(startK, []);
         if (!graph.has(endK)) graph.set(endK, []);
+
+        // Direction helpers to bias progress toward end
+        const dir = (p, q) => {
+          const dx = q[0] - p[0];
+          const dy = q[1] - p[1];
+          const L = Math.hypot(dx, dy) || 1e-9;
+          return [dx / L, dy / L];
+        };
+        const dot = (u, v) => u[0] * v[0] + u[1] * v[1];
+        const globalDir = dir(s.coord, t.coord);
         if (s.line && s.segIndex != null) {
           const cs = s.line.geometry.coordinates;
           const i = Math.min(Math.max(0, s.segIndex), cs.length - 2);
@@ -1587,10 +1616,15 @@ export default function App() {
           const kA = coordKey(A), kB = coordKey(B);
           if (!graph.has(kA)) graph.set(kA, []);
           if (!graph.has(kB)) graph.set(kB, []);
-          graph.get(startK).push({ to: kA, coords: [s.coord, A] });
-          graph.get(kA).push({ to: startK, coords: [A, s.coord] });
-          graph.get(startK).push({ to: kB, coords: [s.coord, B] });
-          graph.get(kB).push({ to: startK, coords: [B, s.coord] });
+          // Split the underlying edge A<->B at the snapped start; remove direct A<->B to avoid "go to A then back past start to B"
+          removeUndirectedEdge(graph, kA, kB);
+          // Directed edge OUT of start only; choose the neighbor most aligned with the overall direction toward end
+          const dirA = dir(s.coord, A);
+          const dirB = dir(s.coord, B);
+          const scoreA = dot(dirA, globalDir);
+          const scoreB = dot(dirB, globalDir);
+          const pick = scoreA >= scoreB ? { to: kA, coords: [s.coord, A] } : { to: kB, coords: [s.coord, B] };
+          graph.get(startK).push(pick);
         }
         if (t.line && t.segIndex != null) {
           const cs = t.line.geometry.coordinates;
@@ -1599,10 +1633,16 @@ export default function App() {
           const kA = coordKey(A), kB = coordKey(B);
           if (!graph.has(kA)) graph.set(kA, []);
           if (!graph.has(kB)) graph.set(kB, []);
-          graph.get(endK).push({ to: kA, coords: [t.coord, A] });
-          graph.get(kA).push({ to: endK, coords: [A, t.coord] });
-          graph.get(endK).push({ to: kB, coords: [t.coord, B] });
-          graph.get(kB).push({ to: endK, coords: [B, t.coord] });
+          // Split the underlying edge A<->B at the snapped end; remove direct A<->B to avoid overshooting and coming back
+          removeUndirectedEdge(graph, kA, kB);
+          // Directed edge INTO end only; choose the neighbor most aligned with the overall direction
+          const dirAin = dir(A, t.coord);
+          const dirBin = dir(B, t.coord);
+          const scoreAin = dot(dirAin, globalDir);
+          const scoreBin = dot(dirBin, globalDir);
+          const pickIn = scoreAin >= scoreBin ? { from: kA, coords: [A, t.coord] } : { from: kB, coords: [B, t.coord] };
+          const srcK = pickIn.from;
+          graph.get(srcK).push({ to: endK, coords: pickIn.coords });
         }
 
         // Dijkstra
@@ -1647,18 +1687,25 @@ export default function App() {
           segs.unshift(coords);
           cur = u;
         }
-        // flatten with de-duplication
+        // flatten with direction correction and de-duplication
+        const same = (a, b, eps = 1e-7) => Math.abs(a[0] - b[0]) <= eps && Math.abs(a[1] - b[1]) <= eps;
         const out = [];
-        for (const sCoords of segs) {
+        for (let s of segs) {
+          let s0 = s[0], s1 = s[1];
           if (out.length) {
             const last = out[out.length - 1];
-            if (last[0] === sCoords[0][0] && last[1] === sCoords[0][1]) {
-              out.push(sCoords[1]);
+            if (same(last, s0)) {
+              // correct orientation already
+              out.push(s1);
+            } else if (same(last, s1)) {
+              // reverse to maintain continuity
+              out.push(s0);
             } else {
-              out.push(...sCoords);
+              // discontinuity; start a new piece but avoid immediate backtrack spikes
+              out.push(s0, s1);
             }
           } else {
-            out.push(...sCoords);
+            out.push(s0, s1);
           }
         }
         if (out.length < 2) return null;
