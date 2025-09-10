@@ -1149,7 +1149,7 @@ function isDrivableRoad(p = {}) {
 
     mapRef.on("mousedown", "drawn-points-layer", handleMouseDown);
     mapRef.on("mousemove", handleMouseMove);
-    mapRef.on("mouseup", handleMouseUp);
+    mapRef.on("mouseup", "drawn-points-layer", handleMouseUp);
     mapRef.on("contextmenu", "drawn-points-layer", handleRightClick);
 
     return () => {
@@ -1450,12 +1450,12 @@ useEffect(() => {
 
   m.on('mousedown', 'start-end-points-layer', onMouseDown);
   m.on('mousemove', onMouseMove);
-  m.on('mouseup', onMouseUp);
+  m.on('mouseup', 'start-end-points-layer', onMouseUp);
 
   return () => {
     m.off('mousedown', 'start-end-points-layer', onMouseDown);
     m.off('mousemove', onMouseMove);
-    m.off('mouseup', onMouseUp);
+    m.off('mouseup', 'start-end-points-layer', onMouseUp);
   };
 }, [startEndMode, startPoint, endPoint]);
 
@@ -1474,49 +1474,103 @@ useEffect(() => {
 
   // Only highlight if both points are set and startEndMode is active
   if (startEndMode && startPoint && endPoint) {
-    // Find the underlying road segment geometry
+    // Query a generous bounding box around both points
+    const bounds = turf.bbox({
+      type: 'Feature',
+      geometry: {
+        type: 'LineString',
+        coordinates: [startPoint, endPoint]
+      }
+    });
+    const padding = 0.002; // ~200m
+    bounds[0] -= padding;
+    bounds[1] -= padding;
+    bounds[2] += padding;
+    bounds[3] += padding;
+    const sw = m.project([bounds[0], bounds[1]]);
+    const ne = m.project([bounds[2], bounds[3]]);
     const roadLayerIds = getRoadLayerIds(m);
-    const radiusPx = 60;
-    const projected = m.project(startPoint);
-    const box = [
-      [projected.x - radiusPx, projected.y - radiusPx],
-      [projected.x + radiusPx, projected.y + radiusPx]
-    ];
     let featuresRaw = [];
     try {
-      featuresRaw = m.queryRenderedFeatures(box, { layers: roadLayerIds });
+      featuresRaw = m.queryRenderedFeatures([sw, ne], { layers: roadLayerIds });
     } catch (err) {
+      console.error('Error querying rendered features:', err);
       return;
     }
     // Only drivable road segments
     const features = featuresRaw.filter(f => (f.geometry?.type === "LineString" || f.geometry?.type === "MultiLineString") && isDrivableRoad(f.properties));
-    let baseLine = null;
-    let minDist = Infinity;
-    for (const feat of features) {
-      let coordsArr = [];
-      if (feat.geometry?.type === "LineString") {
-        coordsArr = [feat.geometry.coordinates];
-      } else if (feat.geometry?.type === "MultiLineString") {
-        coordsArr = feat.geometry.coordinates;
+    // Convert features to a network of LineStrings
+    const roadNetwork = features.flatMap(feat => {
+      if (feat.geometry.type === "LineString") {
+        return [turf.lineString(feat.geometry.coordinates)];
+      } else if (feat.geometry.type === "MultiLineString") {
+        return feat.geometry.coordinates.map(coords => turf.lineString(coords));
       }
-      for (const coords of coordsArr) {
-        // Find the closest line to the start point
-        const dist = turf.pointToLineDistance(turf.point(startPoint), turf.lineString(coords), { units: 'meters' });
-        if (dist < minDist) {
-          minDist = dist;
-          baseLine = { type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: feat.properties };
+      return [];
+    });
+    // Snap both points to the nearest road segments
+    function findNearestPointOnNetwork(point, network) {
+      let nearest = null;
+      let minDist = Infinity;
+      network.forEach(line => {
+        const snapped = turf.nearestPointOnLine(line, turf.point(point), { units: 'meters' });
+        if (snapped && snapped.properties.dist < minDist) {
+          minDist = snapped.properties.dist;
+          nearest = snapped;
+        }
+      });
+      return nearest ? nearest.geometry.coordinates : point;
+    }
+    const startSnapped = findNearestPointOnNetwork(startPoint, roadNetwork);
+    const endSnapped = findNearestPointOnNetwork(endPoint, roadNetwork);
+    // Find the shortest path using the snapped points
+    let pathLine = findShortestRoadPath(m, startSnapped, endSnapped);
+    // Fallback: if pathLine is null, try to snap to the closest road segment between the snapped points
+    if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
+      // Improved fallback: slice the closest road segment between the snapped points
+      let bestSegment = null;
+      let minDist = Infinity;
+      let bestStartIdx = null;
+      let bestEndIdx = null;
+      for (const line of roadNetwork) {
+        let minStartDist = Infinity, minEndDist = Infinity;
+        let startIdx = 0, endIdx = 0;
+        line.geometry.coordinates.forEach((coord, idx) => {
+          const dStart = turf.distance(turf.point(coord), turf.point(startSnapped), { units: 'meters' });
+          const dEnd = turf.distance(turf.point(coord), turf.point(endSnapped), { units: 'meters' });
+          if (dStart < minStartDist) { minStartDist = dStart; startIdx = idx; }
+          if (dEnd < minEndDist) { minEndDist = dEnd; endIdx = idx; }
+        });
+        const threshold = 30; // meters
+        if (minStartDist < threshold && minEndDist < threshold) {
+          const totalDist = minStartDist + minEndDist;
+          if (totalDist < minDist) {
+            minDist = totalDist;
+            bestSegment = line;
+            bestStartIdx = startIdx;
+            bestEndIdx = endIdx;
+          }
         }
       }
+      if (bestSegment && bestStartIdx != null && bestEndIdx != null) {
+        const coords = bestSegment.geometry.coordinates.slice(
+          Math.min(bestStartIdx, bestEndIdx),
+          Math.max(bestStartIdx, bestEndIdx) + 1
+        );
+        coords[0] = startSnapped;
+        coords[coords.length - 1] = endSnapped;
+        pathLine = turf.lineString(coords, bestSegment.properties);
+        console.warn('Fallback: using closest road segment', {
+          segment: bestSegment,
+          startIdx: bestStartIdx,
+          endIdx: bestEndIdx,
+          coords,
+        });
+      } else {
+        console.warn('Fallback: no suitable road segment found, drawing direct line.');
+        pathLine = turf.lineString([startSnapped, endSnapped]);
+      }
     }
-    if (!baseLine) return;
-    // Minimal pathfinding: highlight shortest path along visible drivable segments
-    let pathLine = findShortestRoadPath(m, startPoint, endPoint);
-    // Fallback: if pathLine is null, draw direct line
-    if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
-      pathLine = turf.lineString([startPoint, endPoint]);
-      console.warn('Pathfinding failed or invalid, drawing direct line.');
-    }
-    console.log('Shortest path line:', pathLine);
     if (pathLine && pathLine.geometry && Array.isArray(pathLine.geometry.coordinates) && pathLine.geometry.coordinates.length >= 2) {
       m.addSource('selected-road-segment', {
         type: 'geojson',
@@ -1527,13 +1581,13 @@ useEffect(() => {
         type: 'line',
         source: 'selected-road-segment',
         paint: {
-          'line-color': '#0074D9', // bright blue
+          'line-color': '#3388ff',
           'line-width': 8,
           'line-opacity': 0.85
         },
         layout: {
-          'line-cap': 'round',
-          'line-join': 'round'
+          'line-join': 'round',
+          'line-cap': 'round'
         }
       });
     } else {
@@ -1797,7 +1851,6 @@ useEffect(() => {
     flexWrap: "wrap",
     alignItems: "center",
     gap: "0.5rem",
-    maxWidth: "calc(100vw - 2rem)",
   };
 
   const buttonStyle = {
