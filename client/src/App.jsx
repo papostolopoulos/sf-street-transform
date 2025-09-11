@@ -1358,10 +1358,10 @@ export default function App() {
       }
       if (!startPoint) {
         setStartPoint(snapped);
-        console.log('Start point:', snapped);
+        console.log('Start point:', JSON.stringify(snapped));
       } else if (!endPoint) {
         setEndPoint(snapped);
-        console.log('End point:', snapped);
+        console.log('End point:', JSON.stringify(snapped));
       } else {
         // Clear previous line and points before starting new selection
         const m = map.current;
@@ -1373,7 +1373,7 @@ export default function App() {
         }
         setStartPoint(snapped);
         setEndPoint(null);
-        console.log('Resetting selection, new start:', snapped);
+  console.log('Resetting selection, new start:', JSON.stringify(snapped));
       }
     };
 
@@ -1590,6 +1590,41 @@ export default function App() {
       function shortestPathOnNetwork(lines, a, b) {
         const graph = buildGraph(lines);
         if (!graph || graph.size === 0) return null;
+        // Helper to attach a point sitting on a line's segment into the graph by splitting that segment
+        function attachPointOnLine(g, ln, c) {
+          try {
+            const snap = turf.nearestPointOnLine(ln, turf.point(c));
+            const idx = Math.min(Math.max(0, snap.properties.index ?? 0), ln.geometry.coordinates.length - 2);
+            const A = ln.geometry.coordinates[idx];
+            const B = ln.geometry.coordinates[idx + 1];
+            const kA = coordKey(A), kB = coordKey(B), kC = coordKey(snap.geometry.coordinates);
+            if (!g.has(kA)) g.set(kA, []);
+            if (!g.has(kB)) g.set(kB, []);
+            if (!g.has(kC)) g.set(kC, []);
+            // remove the original A<->B so we truly split at C
+            removeUndirectedEdge(g, kA, kB);
+            // bi-directional connections
+            g.get(kA).push({ to: kC, coords: [A, snap.geometry.coordinates] });
+            g.get(kC).push({ to: kA, coords: [snap.geometry.coordinates, A] });
+            g.get(kB).push({ to: kC, coords: [B, snap.geometry.coordinates] });
+            g.get(kC).push({ to: kB, coords: [snap.geometry.coordinates, B] });
+            return kC;
+          } catch { return null; }
+        }
+        // Insert virtual nodes at true line intersections to improve connectivity
+        for (let i = 0; i < lines.length; i++) {
+          for (let j = i + 1; j < lines.length; j++) {
+            try {
+              const ints = turf.lineIntersect(lines[i], lines[j]);
+              if (!ints?.features?.length) continue;
+              for (const f of ints.features) {
+                const c = f.geometry.coordinates;
+                attachPointOnLine(graph, lines[i], c);
+                attachPointOnLine(graph, lines[j], c);
+              }
+            } catch {}
+          }
+        }
         const s = nearestSnap(lines, a);
         const t = nearestSnap(lines, b);
         if (!s || !t) return null;
@@ -1618,13 +1653,9 @@ export default function App() {
           if (!graph.has(kB)) graph.set(kB, []);
           // Split the underlying edge A<->B at the snapped start; remove direct A<->B to avoid "go to A then back past start to B"
           removeUndirectedEdge(graph, kA, kB);
-          // Directed edge OUT of start only; choose the neighbor most aligned with the overall direction toward end
-          const dirA = dir(s.coord, A);
-          const dirB = dir(s.coord, B);
-          const scoreA = dot(dirA, globalDir);
-          const scoreB = dot(dirB, globalDir);
-          const pick = scoreA >= scoreB ? { to: kA, coords: [s.coord, A] } : { to: kB, coords: [s.coord, B] };
-          graph.get(startK).push(pick);
+          // Allow both outward options from start to support valid initial turns
+          graph.get(startK).push({ to: kA, coords: [s.coord, A] });
+          graph.get(startK).push({ to: kB, coords: [s.coord, B] });
         }
         if (t.line && t.segIndex != null) {
           const cs = t.line.geometry.coordinates;
@@ -1635,14 +1666,9 @@ export default function App() {
           if (!graph.has(kB)) graph.set(kB, []);
           // Split the underlying edge A<->B at the snapped end; remove direct A<->B to avoid overshooting and coming back
           removeUndirectedEdge(graph, kA, kB);
-          // Directed edge INTO end only; choose the neighbor most aligned with the overall direction
-          const dirAin = dir(A, t.coord);
-          const dirBin = dir(B, t.coord);
-          const scoreAin = dot(dirAin, globalDir);
-          const scoreBin = dot(dirBin, globalDir);
-          const pickIn = scoreAin >= scoreBin ? { from: kA, coords: [A, t.coord] } : { from: kB, coords: [B, t.coord] };
-          const srcK = pickIn.from;
-          graph.get(srcK).push({ to: endK, coords: pickIn.coords });
+          // Allow both incoming options into end
+          graph.get(kA).push({ to: endK, coords: [A, t.coord] });
+          graph.get(kB).push({ to: endK, coords: [B, t.coord] });
         }
 
         // Dijkstra
@@ -1792,17 +1818,8 @@ export default function App() {
           }
         }
       }
-      // Clamp to reasonable length if needed
-      const MAX_BLOCK_M = 260;
-      const len = turf.length(pathLine, { units: 'meters' });
-      let finalLine = pathLine;
-      if (len > MAX_BLOCK_M) {
-        // Clamp around midpoint
-        const mid = Math.floor(pathLine.geometry.coordinates.length / 2);
-        const back = turf.along(pathLine, Math.max(0, len / 2 - MAX_BLOCK_M / 2), { units: 'meters' });
-        const fwd = turf.along(pathLine, len / 2 + MAX_BLOCK_M / 2, { units: 'meters' });
-        finalLine = turf.lineSlice(back, fwd, pathLine);
-      }
+  // Use the full path from start to end without clamping
+  const finalLine = pathLine;
       if (finalLine && finalLine.geometry && Array.isArray(finalLine.geometry.coordinates) && finalLine.geometry.coordinates.length >= 2) {
         // Add or update the source safely
         if (!m.getSource('selected-road-segment')) {
@@ -1834,7 +1851,7 @@ export default function App() {
   // --- Save / finalize helpers -----------------------------------
 
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
-  const canFinalizeStreets = streetsActive && selectedSegments.length > 0;
+  const canFinalizeStreets = streetsActive && !!startPoint && !!endPoint;
   
   // Finalize button handler
   function finalizeCurrent() {
@@ -1850,6 +1867,20 @@ export default function App() {
     setShowSavePanel(true);
     if (!pendingName.trim())
       setPendingName(`Custom Zone ${savedZones.length + 1}`);
+  }
+
+  // Placeholder for street selection finalization; keeps polygon flow intact
+  function finalizeStreetSelection() {
+    // For now we just clear the start/end selection after confirming
+    // In a fuller flow this would add the selected street segment to a list
+    if (!map.current) return;
+    const m = map.current;
+    if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
+    if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
+    if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
+    if (m.getSource('start-end-points')) m.removeSource('start-end-points');
+    setStartPoint(null);
+    setEndPoint(null);
   }
 
   // Create a GeoJSON Feature from the drawn polygon and metadata
