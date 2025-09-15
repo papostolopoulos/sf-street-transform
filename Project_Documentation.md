@@ -168,7 +168,7 @@ The project features below are grouped into deliverable milestones to enable inc
 | M1 | Core Map & Polygon MVP | Fullscreen map, basemap toggle, polygon draw/edit, area & centroid calc, reverse geocode for predefined, help UI, sidebar scaffolding | MapLibre, MapTiler key | 30 |  (capture retrospectively?) | DONE | 100% | All listed features stable; no critical console errors |
 | M2 | Zone Summaries & Save/Load | Persist user‑drawn polygons (name, description, type), compute & show summary (area, address, streets) for user zones | M1 | 18 |  | IN PROGRESS (partially implemented) | 40% | Save, list, select, edit & re-save round trip works |
 | M3 | Street Segment Selection (Start/End) | Select road-aligned path between two points following roads, highlight path, clear/reset selection, prepare for saving as a street transformation zone | Road graph logic, Map layers | 24 |  | IN PROGRESS | 80% | Path consistently follows roads (multi-block), full length, perf timing added, ready for persistence wiring |
-| M3.5 | UI & Interaction Refinement | Consolidate controls, improve discoverability (tool grouping, inline hints), display path metrics, restore polygon tool reliability & mode sync | M1, M3 | 14 |  | NOT STARTED | 0% | Polygon & street tools switch cleanly; key metrics visible; no orphan layers when switching modes |
+| M3.5 | UI & Interaction Refinement | Consolidate controls, improve discoverability (tool grouping, inline hints), display path metrics, restore polygon tool reliability & mode sync, dynamic segment color, unified help panel | M1, M3 | 14 |  | IN PROGRESS | 45% | Polygon & street tools switch cleanly; key metrics visible; dynamic coloring & unified contextual help; no orphan layers when switching modes |
 | M4 | Street Segment Persistence | Save highlighted street segments as features (with type, tags), list & edit, integrate with sidebar summaries | M2, M3 | 16 |  | NOT STARTED | 0% | CRUD for street selections, displayed on load |
 | M5 | Transformation Menu (Phase 1) | Minimal selectable transformation tags (trees, seating, bike lane) applied to a zone/segment, store in properties | M2/M4 | 20 |  | NOT STARTED | 0% | Tags add/remove, persisted & visible in summary |
 | M6 | Impact Panel (Phase 1) | Compute & display basic derived metrics (area %, estimated trees count placeholder, speed calming indicator) | M5 | 14 |  | NOT STARTED | 0% | Metrics render for polygons & segments, no crashes |
@@ -189,6 +189,10 @@ The project features below are grouped into deliverable milestones to enable inc
 | 2025-09-14 | Initialization Update | Documentation Restructure | Added Milestones, Suggested Next Step scaffold, tracking tables | 0.5 |
 | 2025-09-14 | Feature Work (Ongoing) | M3 Path Highlight | Improved road-following, removed block clamp, intersection splitting | (TBD) |
 | 2025-09-14 | Refactor / Fix | M3 + M1 Regression | Restored polygon tool via mode sync, added path length metric, cleanup on mode switch, introduced UI milestone M3.5 | 0.6 |
+| 2025-09-14 | UI Enhancement | M3.5 Dynamic Street Coloring | Street highlight color now reacts instantly to zone type swatch changes | 0.2 |
+| 2025-09-14 | UI Consolidation | M3.5 Unified Help Panel | Merged separate polygon & street help into single contextual panel; removed inline street help block | 0.2 |
+| 2025-09-14 | Label Consistency | M3.5 Terminology Update | Renamed "Segment type" label to "Zone type" in street tool for consistency | 0.05 |
+| 2025-09-14 | Repo Hygiene | Branch Rename | Local branch renamed to `008UpdateDrawingUI` (was `008StretcLineBetweenStartAndEndPoint`) preparing for persistence tasks | 0.05 |
 
 Guideline: Add an entry when a milestone meaningfully advances (≥10% delta) or concludes. Time Logged aggregates focused engineering time (exclude context switching & unrelated research).
 
