@@ -40,23 +40,37 @@ export default function App() {
   const mapContainer = useRef(null);
   // Pending name state
   const [pendingName, setPendingName] = useState("");
+  // Pending description (used in save panel)
+  const [pendingDescription, setPendingDescription] = useState("");
   // Summary context state
   const [summaryContext, setSummaryContext] = useState(null);
   // Zone summary state
   const [zoneSummary, setZoneSummary] = useState(null);
-  // Drawing tool state
-  const [drawTool, setDrawTool] = useState("none");
+  // Unified active tool: 'none' | 'polygon' | 'street'
+  const [activeTool, setActiveTool] = useState('none');
   // --- React state hooks ---
 
   // --- Derived constants ---
-  const polygonActive = drawTool === "polygon";
-  const streetsActive = drawTool === "streets";
+  const polygonActive = activeTool === 'polygon';
+  const streetsActive = activeTool === 'street';
   // End point for segment selection
   const [endPoint, setEndPoint] = useState(null);
   // Start point for segment selection
   const [startPoint, setStartPoint] = useState(null);
-  // Start/end segment selection mode state
-  const [startEndMode, setStartEndMode] = useState(false);
+  // Derived start/end selection mode from active tool
+  const startEndMode = streetsActive;
+  // Length (meters) of current highlighted street path (M3 diagnostic / UX)
+  const [streetPathLengthM, setStreetPathLengthM] = useState(null);
+  // Performance samples for street path build (last N)
+  const [streetPerfSamples, setStreetPerfSamples] = useState([]); // each: { total, featureQuery, graphBuild, pathSolve, renderUpdate, ts }
+
+  function recordStreetPerf(sample) {
+    setStreetPerfSamples(prev => {
+      const next = [...prev, sample];
+      // keep last 25 samples
+      return next.slice(-25);
+    });
+  }
   // Zone type state
   const [useType, setUseType] = useState("mixed-use");
   // Drawn coordinates state
@@ -71,6 +85,21 @@ export default function App() {
   const [savedZones, setSavedZones] = useState([]);
   // Basemap style state
   const [basemapStyle, setBasemapStyle] = useState("streets");
+  // Help box visibility for drawing instructions
+  const [showHelpBox, setShowHelpBox] = useState(true);
+  // Sidebar visibility & width (was referenced but not defined)
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(380);
+
+  // Helper used by flyToSaved for padding with sidebar
+  function getMapPadding() {
+    return {
+      left: 16,
+      right: sidebarVisible ? sidebarWidth + 16 : 16,
+      top: 16,
+      bottom: 16,
+    };
+  }
   // --- Maptiler styles ---
   const maptilerStyles = {
     streets: `https://api.maptiler.com/maps/streets/style.json?key=${MAPTILER_KEY}`,
@@ -457,25 +486,58 @@ export default function App() {
   // Build a zone summary from any Feature<Polygon>
   // typeFallback is used if the feature has no useType prop
   async function buildSummaryFromFeature(mapInstance, feature, typeFallback) {
-    // ...existing code...
-    if (accs.some(v => v === "no" || v === "private" || v === "destination")) return false;
+    try {
+      if (!mapInstance || !feature) return null;
+      const geom = feature.geometry;
+      if (!geom) return null;
+      let polygonLike = null;
+      if (geom.type === 'Polygon') {
+        polygonLike = feature;
+      } else if (geom.type === 'MultiPolygon') {
+        // Use the largest polygon for summary stats
+        let maxArea = -Infinity;
+        let best = null;
+        for (const coords of geom.coordinates) {
+          const poly = turf.polygon(coords, feature.properties || {});
+            const a = turf.area(poly);
+            if (a > maxArea) { maxArea = a; best = poly; }
+        }
+        polygonLike = best;
+      } else {
+        // Not a polygonal feature
+        return null;
+      }
+      if (!polygonLike) return null;
 
-    const EXCLUDED_SUB = new Set(["crossing","footway","path","cycleway","pedestrian","steps","sidewalk","platform","corridor"]);
-    if (EXCLUDED_SUB.has(sub)) return false;
+      const areaM2 = turf.area(polygonLike);
+      const areaFt2 = convertToSquareFeet(areaM2);
+      const centroidPt = turf.centroid(polygonLike).geometry.coordinates;
+      const useType = feature.properties?.useType || typeFallback || 'mixed-use';
 
-    const ALLOW_HW = new Set([
-      "motorway","trunk","primary","secondary","tertiary",
-      "unclassified","residential","living_street",
-      "motorway_link","trunk_link","primary_link","secondary_link","tertiary_link"
-    ]);
-    const ALLOW_CLASS_STRICT = new Set([
-      "motorway","trunk","primary","secondary","tertiary",
-      "residential","street","unclassified","living_street"
-    ]);
+      // Reuse stored address if available, otherwise fetch (async)
+      let address = feature.properties?.address || null;
+      if (!address) {
+        try {
+          address = await reverseGeocode(centroidPt[0], centroidPt[1]);
+        } catch {}
+      }
 
-    if (ALLOW_HW.has(hw)) return true;
-    if (ALLOW_CLASS_STRICT.has(cls)) return true;
-    return false;
+      // Intersecting street names using existing helper
+      let streets = [];
+      try { streets = getIntersectingStreetNames(mapInstance, polygonLike); } catch { streets = []; }
+
+      return {
+        areaM2,
+        areaFt2,
+        centroid: centroidPt,
+        address,
+        streets,
+        useType,
+      };
+    } catch (err) {
+      console.warn('buildSummaryFromFeature failed:', err);
+      return null;
+    }
   }
 
   // Pick the closest drivable road line at the click
@@ -999,7 +1061,7 @@ export default function App() {
       refreshMapData(map.current, drawnCoords, useType, savedZones);
       applySelectedFilter(map.current, selectedSavedIndex);
       // ensure street layers match current tool
-      const visStreets = drawTool === "streets" ? "visible" : "none";
+  const visStreets = activeTool === 'street' ? 'visible' : 'none';
       ["street-selections-line","street-selections-casing","street-buffer-fill","street-buffer-outline"]
       .forEach(id => map.current.getLayer(id) && map.current.setLayoutProperty(id, "visibility", visStreets));
     });
@@ -1085,6 +1147,33 @@ export default function App() {
       setShowHelpBox(true);
     }
   }, [drawMode]);
+
+  // Keep drawMode in sync with active tool & clear when switching away
+  useEffect(() => {
+    const polygonSelected = activeTool === 'polygon';
+    setDrawMode(polygonSelected);
+    if (!polygonSelected) {
+      // Clear any in-progress polygon when leaving polygon tool
+      setDrawnCoords([]);
+      setZoneSummary(null);
+      setShowSavePanel(false);
+      setEditingSavedIndex(null);
+      setSummaryContext(null);
+    }
+    // If switching away from street tool, cleanup points/line
+    if (activeTool !== 'street') {
+      setStartPoint(null);
+      setEndPoint(null);
+      if (map.current) {
+        const m = map.current;
+        if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
+        if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
+        if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
+        if (m.getSource('start-end-points')) m.removeSource('start-end-points');
+      }
+      setStreetPathLengthM(null);
+    }
+  }, [activeTool]);
 
   // Render updates when coords change
   useEffect(() => {
@@ -1487,11 +1576,13 @@ export default function App() {
       if (m.getSource('start-end-points')) {
         m.removeSource('start-end-points');
       }
+  setStreetPathLengthM(null);
       return;
     }
 
     // Only highlight if both points are set and startEndMode is active
     if (startEndMode && startPoint && endPoint) {
+      const t0 = performance.now();
       // Always snap both points to nearest road segment using all visible drivable roads
       const roadLayerIds = getRoadLayerIds(m);
       let featuresRaw = [];
@@ -1501,6 +1592,7 @@ export default function App() {
         console.error('Error querying rendered features:', err);
         return;
       }
+      const t1 = performance.now();
       // Only drivable road segments
       const roadNetwork = featuresRaw.flatMap(feat => {
         if (feat.geometry?.type === "LineString" && isDrivableRoad(feat.properties)) {
@@ -1510,6 +1602,7 @@ export default function App() {
         }
         return [];
       });
+      // graph build & snapping timing occurs inside shortestPathOnNetwork; capture intermediate markers
       // Snap both points to the nearest road segment in the network
       function findNearestPointOnNetwork(point, network) {
         let nearest = null;
@@ -1525,6 +1618,7 @@ export default function App() {
       }
       const startSnapped = findNearestPointOnNetwork(startPoint, roadNetwork);
       const endSnapped = findNearestPointOnNetwork(endPoint, roadNetwork);
+      const t2 = performance.now();
 
       // Build a graph of road vertices and compute the shortest path along roads
       function coordKey(c) {
@@ -1738,7 +1832,8 @@ export default function App() {
         return turf.lineString(out);
       }
 
-      let pathLine = shortestPathOnNetwork(roadNetwork, startSnapped, endSnapped);
+  let pathLine = shortestPathOnNetwork(roadNetwork, startSnapped, endSnapped);
+  const t3_preFallback = performance.now();
       // Fallback: if pathLine is null, try to snap to the closest road segment between the snapped points
       if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
         // Improved fallback: slice the closest road segment between the snapped points
@@ -1818,8 +1913,9 @@ export default function App() {
           }
         }
       }
-  // Use the full path from start to end without clamping
-  const finalLine = pathLine;
+      const t3 = performance.now();
+      // Use the full path from start to end without clamping
+      const finalLine = pathLine;
       if (finalLine && finalLine.geometry && Array.isArray(finalLine.geometry.coordinates) && finalLine.geometry.coordinates.length >= 2) {
         // Add or update the source safely
         if (!m.getSource('selected-road-segment')) {
@@ -1837,16 +1933,53 @@ export default function App() {
             type: 'line',
             source: 'selected-road-segment',
             paint: {
-              'line-color': '#ff9800',
+              // Dynamic color reflects current zone/segment (useType)
+              'line-color': colorByUse[useType] || '#ff9800',
               'line-width': 6,
               'line-opacity': 0.85,
               'line-dasharray': [2, 2]
             }
           });
         }
+        else {
+          // Update color immediately on subsequent renders if type changed
+          try {
+            m.setPaintProperty('selected-road-segment-layer','line-color', colorByUse[useType] || '#ff9800');
+          } catch {}
+        }
+        try {
+          const lenM = turf.length(finalLine, { units: 'meters' });
+          setStreetPathLengthM(lenM);
+        } catch { setStreetPathLengthM(null); }
+        const t4 = performance.now();
+        const sample = {
+          total: t4 - t0,
+            featureQuery: t1 - t0,
+            snapPrep: t2 - t1,
+            graphAndSolve: t3_preFallback - t2,
+            fallbackAndFinalize: t3 - t3_preFallback,
+            renderUpdate: t4 - t3,
+            ts: Date.now()
+        };
+        recordStreetPerf(sample);
+        // Structured console log
+        // eslint-disable-next-line no-console
+        console.log('[street-perf]', sample);
       }
     }
   }, [startEndMode, startPoint, endPoint]);
+
+  // Reactive: update selected road segment line color when zone type toggles
+  useEffect(() => {
+    if (!map.current) return;
+    if (!streetsActive) return; // only relevant in street tool
+    const m = map.current;
+    if (m.getLayer('selected-road-segment-layer')) {
+      try {
+        m.setPaintProperty('selected-road-segment-layer', 'line-color', colorByUse[useType] || '#ff9800');
+      } catch {}
+    }
+  }, [useType, streetsActive]);
 
   // --- Save / finalize helpers -----------------------------------
 
@@ -1921,7 +2054,7 @@ export default function App() {
     setShowSavePanel(false);
     setPendingName("");
     setPendingDescription("");
-    setDrawTool("none");
+  setActiveTool('none');
     setDrawnCoords([]);
     setZoneSummary(null);
     setEditingSavedIndex(null);
@@ -1937,7 +2070,7 @@ export default function App() {
     setShowSavePanel(false);
     setPendingName("");
     setPendingDescription("");
-    setDrawTool("none");
+  setActiveTool('none');
     setDrawnCoords([]);
     setZoneSummary(null);
     setEditingSavedIndex(null);
@@ -1951,7 +2084,7 @@ export default function App() {
       setShowSavePanel(false);
       setPendingName("");
       setPendingDescription("");
-      setDrawTool("none");
+    setActiveTool('none');
       setDrawnCoords([]);
       setZoneSummary(null);
       setEditingSavedIndex(null);
@@ -2049,7 +2182,7 @@ export default function App() {
     } catch {}
 
     // Enter draw mode with the polygon loaded
-    setDrawTool("polygon");
+  setActiveTool('polygon');
     setDrawnCoords(openRing);
   }
 
@@ -2128,6 +2261,14 @@ export default function App() {
   };
 
   const showRightPanel = zoneSummary || savedZones.length > 0;
+  // Card style reused for summary panel (was referenced but not declared)
+  const cardStyle = {
+    background: '#ffffff',
+    border: '1px solid #e5e5e5',
+    borderRadius: 8,
+    padding: '0.75rem 0.85rem',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.08)'
+  };
 
   // Display name for the summary header
   const displayName =
@@ -2144,193 +2285,196 @@ export default function App() {
       />
 
       <div style={controlPanelStyle}>
-        <div style={{ display: "grid", gap: "0.25rem", minWidth: 220 }}>
-          <div style={labelStyle}>Drawing mode</div>
-          <select
-            value={drawTool}
-            onChange={(e) => setDrawTool(e.target.value)}
-            style={selectStyle}
-            title="Choose how you want to draw"
-          >
-            <option value="none">None</option>
-            <option value="polygon">Polygon</option>
-            <option value="streets">Street segments</option>
-          </select>
-        </div>
-
-        <div style={{ display: "grid", gap: "0.25rem", minWidth: 140 }}>
-          <div style={labelStyle}>Basemap</div>
-          <select
-            value={basemapStyle}
-            onChange={(e) => setBasemapStyle(e.target.value)}
-            title="Switch base map style"
-            style={selectStyle}
-          >
-            <option value="streets">Streets</option>
-            <option value="satellite">Satellite</option>
-          </select>
-        </div>
-
-        <div style={{ display: "grid", gap: "0.25rem", minWidth: 160 }}>
-          <div style={labelStyle}>Zone type</div>
-          <select
-            value={useType}
-            onChange={(e) => setUseType(e.target.value)}
-            title="Choose category/color for the polygon you're drawing"
-            style={selectStyle}
-          >
-            <option value="mixed-use">Mixed Use</option>
-            <option value="residential">Residential</option>
-            <option value="commercial">Commercial</option>
-          </select>
-        </div>
-
-        {/* ✅ Street selection controls now inside the panel */}
-        <div style={{ display: "grid", gap: "0.25rem", minWidth: 180 }}>
-          <div style={labelStyle}>Street selection</div>
-          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-            <button
-              onClick={() => {
-                if (startEndMode) {
-                  // Exiting start/end mode: clear selections immediately
-                  setStartPoint(null);
-                  setEndPoint(null);
-                }
-                setStartEndMode((v) => !v);
-              }}
-              title="Select a road segment by clicking start and end points"
-              style={{
-                ...buttonStyle,
-                backgroundColor: startEndMode ? "#28a745" : "#ffc107",
-              }}
-            >
-              {startEndMode ? "Exit Start/End Mode" : "Select by Start/End"}
-            </button>
+  <div style={{ display: 'grid', gap: '0.25rem', minWidth: 200 }}>
+          <div style={labelStyle}>Drawing tool</div>
+          <div style={{ display: 'flex', gap: '0.4rem' }} role="radiogroup" aria-label="Drawing tool">
+            {[
+              { key: 'none', label: 'Off' },
+              { key: 'polygon', label: 'Polygon' },
+              { key: 'street', label: 'Street' }
+            ].map(btn => {
+              const active = activeTool === btn.key;
+              return (
+                <button
+                  key={btn.key}
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => setActiveTool(btn.key)}
+                  style={{
+                    ...buttonStyle,
+                    backgroundColor: active ? '#007bff' : '#e2e6ea',
+                    color: active ? '#fff' : '#222',
+                    fontWeight: active ? 600 : 500,
+                    padding: '0.4rem 0.65rem',
+                    minWidth: 62
+                  }}
+                >{btn.label}</button>
+              );
+            })}
           </div>
         </div>
+        {polygonActive && (
+          <div style={{ display: 'grid', gap: '0.25rem' }}>
+            <div style={labelStyle}>Zone type</div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              {['mixed-use','residential','commercial'].map(t => (
+                <button
+                  key={t}
+                  aria-label={`Set zone type ${t}`}
+                  onClick={() => setUseType(t)}
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 6,
+                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
+                    background: colorByUse[t],
+                    cursor: 'pointer',
+                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
+                  }}
+                  title={t.replace('-', ' ')}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+        {streetsActive && (
+          <div style={{ display: 'grid', gap: '0.25rem' }}>
+    <div style={labelStyle}>Zone type</div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              {['mixed-use','residential','commercial'].map(t => (
+                <button
+                  key={t}
+                  aria-label={`Set zone type ${t}`}
+                  onClick={() => setUseType(t)}
+                  style={{
+                    width: 30,
+                    height: 30,
+                    borderRadius: 6,
+                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
+                    background: colorByUse[t],
+                    cursor: 'pointer',
+                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
+                  }}
+                  title={t.replace('-', ' ')}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+  {/* Basemap control removed from primary drawing panel (relocated bottom-left) */}
+
+  {/* Zone type picker removed from global panel (now contextual) */}
+
+        {/* ✅ Street selection controls now inside the panel */}
+        {/* Street metrics shown only when Street tool active */}
+    {streetsActive && (
+          <div style={{ display: 'grid', gap: '0.25rem', minWidth: 160 }}>
+            <div style={labelStyle}>Street metrics</div>
+      {streetPathLengthM != null && (
+              <div style={{ fontSize: '0.7rem', color: '#444' }}>
+                Length: {streetPathLengthM.toFixed(1)} m
+              </div>
+            )}
+      {/* Dev-only perf metrics */}
+      {import.meta.env.DEV && streetPerfSamples.length > 0 && (() => {
+              const last = streetPerfSamples[streetPerfSamples.length - 1];
+              const avg = streetPerfSamples.reduce((s, p) => s + p.total, 0) / streetPerfSamples.length;
+              return (
+                <div style={{ fontSize: '0.65rem', color: '#555', lineHeight: 1.3 }}>
+                  <div>Last: {last.total.toFixed(1)} ms</div>
+                  <div>Avg: {avg.toFixed(1)} ms</div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
       </div>
 
-      {/* Zone type legend */}
-      <div
-        style={{
-          position: "absolute",
-          left: "1rem",
-          bottom: "1rem",
-          zIndex: 10,
-          backgroundColor: "white",
-          padding: "0.5rem 0.75rem",
-          borderRadius: "0.5rem",
-          boxShadow: "0 2px 10px rgba(0,0,0,0.15)",
-          fontSize: "0.9rem",
-        }}
-      >
-        <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>
-          Zone type
-        </div>
-        <div
-          style={{
-            display: "flex",
-            gap: "0.5rem",
-            alignItems: "center",
-            marginBottom: "0.25rem",
-          }}
-        >
-                   <span
-            style={{
-              width: 12,
-              height: 12,
-              borderRadius: 2,
-              backgroundColor: colorByUse["mixed-use"],
-              display: "inline-block",
-            }}
-          />
-          Mixed Use
-        </div>
-        <div
-          style={{
-            display: "flex",
-            gap: "0.5rem",
-            alignItems: "center",
-            marginBottom: "0.25rem",
-          }}
-        >
-          <span
-            style={{
-              width: 12,
-              height: 12,
-              borderRadius: 2,
-              backgroundColor: colorByUse["residential"],
-              display: "inline-block",
-            }}
-          />
-          Residential
-        </div>
-        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-          <span
-            style={{
-              width: 12,
-              height: 12,
-              borderRadius: 2,
-              backgroundColor: colorByUse["commercial"],
-              display: "inline-block",
-            }}
-          />
-          Commercial
+      {/* Bottom-left basemap toggle */}
+      <div style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10 }}>
+        <div style={{ display:'flex', gap:'0.4rem', background:'#ffffffd9', backdropFilter:'blur(4px)', padding:'0.4rem 0.6rem', borderRadius:8, boxShadow:'0 2px 8px rgba(0,0,0,0.15)' }} aria-label="Basemap style" role="radiogroup">
+          {[
+            { key:'streets', label:'Streets' },
+            { key:'satellite', label:'Satellite' }
+          ].map(opt => {
+            const active = basemapStyle === opt.key;
+            return (
+              <button
+                key={opt.key}
+                role="radio"
+                aria-checked={active}
+                onClick={() => setBasemapStyle(opt.key)}
+                style={{
+                  border:'none',
+                  background: active ? '#007bff' : '#e2e6ea',
+                  color: active ? '#fff' : '#222',
+                  padding:'0.35rem 0.75rem',
+                  borderRadius:6,
+                  fontSize:'0.75rem',
+                  fontWeight:600,
+                  cursor:'pointer'
+                }}
+                title={`Switch to ${opt.label}`}
+              >{opt.label}</button>
+            );
+          })}
         </div>
       </div>
 
       {/* Help box during draw */}
-      {drawMode && (
+      {(polygonActive || streetsActive) && (
         <div
           style={{
-            position: "absolute",
-            top: "6rem",
-            left: "1rem",
-            backgroundColor: "#fffff3",
-            border: "1px solid #ccc",
-            padding: "1rem",
-            borderRadius: "0.5rem",
+            position: 'absolute',
+            top: '6rem',
+            left: '1rem',
+            backgroundColor: '#fffff3',
+            border: '1px solid #ccc',
+            padding: '1rem 1.1rem .9rem',
+            borderRadius: '0.5rem',
             zIndex: 11,
-            maxWidth: "300px",
-            boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+            maxWidth: 320,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.1)'
           }}
         >
           <button
             onClick={() => setShowHelpBox(!showHelpBox)}
             style={{
-              position: "absolute",
-              top: "0.25rem",
-              right: "0.5rem",
-              border: "none",
-              background: "transparent",
-              fontSize: "1.2rem",
-              cursor: "pointer",
-              color: "#888",
+              position: 'absolute',
+              top: '0.25rem',
+              right: '0.5rem',
+              border: 'none',
+              background: 'transparent',
+              fontSize: '1.2rem',
+              cursor: 'pointer',
+              color: '#888'
             }}
             aria-label="Toggle help"
           >
-            {showHelpBox ? "×" : "ℹ️"}
+            {showHelpBox ? '×' : 'ℹ️'}
           </button>
           {showHelpBox && (
             <>
-              <h4 style={{ marginTop: 0 }}>Drawing Help</h4>
-              <ul
-                style={{
-                  paddingLeft: "1rem",
-                  fontSize: "0.9rem",
-                  lineHeight: "1.5",
-                }}
-              >
-                <li>Click to add points</li>
-                <li>Right-click a point to delete it</li>
-                <li>Drag a point to move it</li>
-                <li>
-                  Use the <strong>Zone type</strong> dropdown (top-left) to
-                  change a zone’s category/color while drawing or editing. For
-                  saved zones, change <strong>Type</strong> in the Saved Zones
-                  list.
-                </li>
-              </ul>
+              <h4 style={{ margin: '0 0 .5rem', fontSize: '1rem' }}>
+                {polygonActive ? 'Polygon Tool Help' : 'Street Tool Help'}
+              </h4>
+              {polygonActive && (
+                <ul style={{ paddingLeft: '1rem', fontSize: '.85rem', lineHeight: 1.5, margin: 0 }}>
+                  <li>Click to add polygon vertices.</li>
+                  <li>Drag a vertex to move it; right-click to delete.</li>
+                  <li>Change <strong>Zone type</strong> using swatches while drawing or editing.</li>
+                  <li>Finalize & Save to store the zone with stats.</li>
+                </ul>
+              )}
+              {streetsActive && (
+                <ul style={{ paddingLeft: '1rem', fontSize: '.85rem', lineHeight: 1.5, margin: 0 }}>
+                  <li>Click start, then end along roads to trace path.</li>
+                  <li>Drag endpoints to refine alignment.</li>
+                  <li>Switch <strong>Zone type</strong> to recolor the segment.</li>
+                  <li>Finalize & Save to persist the street segment.</li>
+                </ul>
+              )}
             </>
           )}
         </div>
@@ -2564,6 +2708,26 @@ export default function App() {
                               flexWrap: "wrap",
                             }}
                           >
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                              <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>Type:</span>
+                              {['mixed-use','residential','commercial'].map(t => (
+                                <button
+                                  key={t}
+                                  onClick={() => setUseType(t)}
+                                  title={t}
+                                  aria-label={`Set type ${t}`}
+                                  style={{
+                                    width: 28,
+                                    height: 28,
+                                    borderRadius: 6,
+                                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
+                                    background: colorByUse[t],
+                                    cursor: 'pointer',
+                                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
+                                  }}
+                                />
+                              ))}
+                            </div>
                             <button
                               onClick={saveZone}
                               style={{
