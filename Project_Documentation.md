@@ -101,6 +101,7 @@ The following functionalities have been successfully implemented in the applicat
 * **Collapsible Sidebar:** A sidebar is implemented to display summary information.  
 * **Reverse Geocoding for Predefined Zones:** The sidebar displays address details (street, postal code, neighborhood, city, state, country) obtained from MapTiler's reverse geocoding API, based on the centroid of the *selected predefined zone*.  
 * **Modular and Commented Codebase:** The existing code is well-organized into React components and hooks, with extensive comments explaining logic and functionality.
+* **Street Segment Selection & Editing (M3 DONE):** Road-following shortest path between two points with: network snapping, extended drag (lengthen/shorten) support, fast-path same-line slicing (prevents detour bounce), precision trimming between endpoints, adaptive snapping radius, path length metric, recompute trigger, performance instrumentation, defensive coordinate validation, and save readiness groundwork.
 
 ## **8\. What Is Planned to Be Built (Planned Features / Roadmap)**
 
@@ -167,13 +168,13 @@ The project features below are grouped into deliverable milestones to enable inc
 |----|-----------|---------------|------------------|-----------|--------------|--------|------------|---------------------------|
 | M1 | Core Map & Polygon MVP | Fullscreen map, basemap toggle, polygon draw/edit, area & centroid calc, reverse geocode for predefined, help UI, sidebar scaffolding | MapLibre, MapTiler key | 30 |  (capture retrospectively?) | DONE | 100% | All listed features stable; no critical console errors |
 | M2 | Zone Summaries & Save/Load | Persist user‑drawn polygons (name, description, type), compute & show summary (area, address, streets) for user zones | M1 | 18 |  | IN PROGRESS (partially implemented) | 40% | Save, list, select, edit & re-save round trip works |
-| M3 | Street Segment Selection (Start/End) | Select road-aligned path between two points following roads, highlight path, clear/reset selection, prepare for saving as a street transformation zone | Road graph logic, Map layers | 24 |  | IN PROGRESS | 80% | Path consistently follows roads (multi-block), full length, perf timing added, ready for persistence wiring |
-| M3.5 | UI & Interaction Refinement | Consolidate controls, improve discoverability (tool grouping, inline hints), display path metrics, restore polygon tool reliability & mode sync, dynamic segment color, unified help panel | M1, M3 | 14 |  | IN PROGRESS | 45% | Polygon & street tools switch cleanly; key metrics visible; dynamic coloring & unified contextual help; no orphan layers when switching modes |
+| M3 | Street Segment Selection (Start/End) | Select road-aligned path between two points following roads, highlight path, clear/reset selection, prepare for saving as a street transformation zone | Road graph logic, Map layers | 24 |  | DONE | 100% | Path follows multi-block roads; extended drag + shorten stable (no bounce); fast-path slice + precise trimming; perf timings logged; no runtime errors |
+| M3.5 | UI & Interaction Refinement | Consolidate controls, improve discoverability (tool grouping, inline hints), display path metrics, restore polygon tool reliability & mode sync, dynamic segment color, unified help panel | M1, M3 | 14 |  | IN PROGRESS | 55% | Polygon & street tools switch cleanly; dynamic coloring, unified help panel, path length metric, recompute trigger; pending: minor UI affordances (button for save segment, subtle hints) & log noise reduction |
 | M4 | Street Segment Persistence | Save highlighted street segments as features (with type, tags), list & edit, integrate with sidebar summaries | M2, M3 | 16 |  | NOT STARTED | 0% | CRUD for street selections, displayed on load |
 | M5 | Transformation Menu (Phase 1) | Minimal selectable transformation tags (trees, seating, bike lane) applied to a zone/segment, store in properties | M2/M4 | 20 |  | NOT STARTED | 0% | Tags add/remove, persisted & visible in summary |
 | M6 | Impact Panel (Phase 1) | Compute & display basic derived metrics (area %, estimated trees count placeholder, speed calming indicator) | M5 | 14 |  | NOT STARTED | 0% | Metrics render for polygons & segments, no crashes |
 | M7 | Before / After View (2D) | Static split view slider with baseline vs transformed stylistic overlay | M5 | 28 |  | NOT STARTED | 0% | Slider works, assets load, performance ok |
-| M8 | Auth & Persistence (Cloud) | User auth (email or OAuth) + cloud persistence (e.g., Firebase) for zones & segments | M2, M4 | 34 |  | NOT STARTED | 0% | Login, save, reload on new session |
+| M8 | Auth & Persistence (Cloud) | User auth (email or OAuth) + cloud persistence (e.g., Firebase) for zones & segments | M2, M4 | 34 |  | NOT STARTED | 0% | Login, save, reload on new session |the improvements 
 | M9 | Counterpoint Mode (Phase 1) | Toggle that changes displayed impact subset (pedestrian, business, fire dept) | M6 | 12 |  | NOT STARTED | 0% | Toggle switches metric subsets reliably |
 | M10 | MVP Release | Stabilization, documentation, lightweight landing content, error handling & perf passes | M1–M6 baseline | 24 |  | NOT STARTED | 0% | All MVP scope accepted; open defects severity ≤ medium only |
 | M11 | 3D / Advanced Visualization (Stretch) | Optional 3D interactive view prototype | M7 | 40 |  | NOT STARTED | 0% | Prototype loads & navigates for at least one saved design |
@@ -193,26 +194,44 @@ The project features below are grouped into deliverable milestones to enable inc
 | 2025-09-14 | UI Consolidation | M3.5 Unified Help Panel | Merged separate polygon & street help into single contextual panel; removed inline street help block | 0.2 |
 | 2025-09-14 | Label Consistency | M3.5 Terminology Update | Renamed "Segment type" label to "Zone type" in street tool for consistency | 0.05 |
 | 2025-09-14 | Repo Hygiene | Branch Rename | Local branch renamed to `008UpdateDrawingUI` (was `008StretcLineBetweenStartAndEndPoint`) preparing for persistence tasks | 0.05 |
+| 2025-09-16 | Feature Work | M3 Extended Drag | Replaced path-constrained drag with full-network snapping; endpoints can now extend path over new road network segments | (TBD) |
+| 2025-09-16 | Enhancement | M3 Recompute Helper | Added `recomputeStreetPathRef` + nonce to force explicit path recomputation after drag commit; improved effect dependency clarity | (TBD) |
+| 2025-09-16 | Documentation | Milestone & Next Step Update | Updated milestone percentages (M3 90%, M3.5 55%); refreshed Suggested Next Step section | 0.2 |
+| 2025-09-16 | Reliability Fix | M3 Path Shortening | Added same-line fast-path slice & precision trimming to eliminate intersection bounce | 0.4 |
+| 2025-09-16 | Defensive Coding | M3 Snapping Validation | Hardened snapping against malformed coordinates (guards + logging) | 0.2 |
 
 Guideline: Add an entry when a milestone meaningfully advances (≥10% delta) or concludes. Time Logged aggregates focused engineering time (exclude context switching & unrelated research).
 
 ## **13. Suggested Next Step**
 
-Current focus candidate: **Finish M3 (Street Segment Selection) and immediately persist result (start M4 minimally) to enable end-to-end saving of both polygons and street segments.**
+Updated (2025-09-16)
 
-Rationale:
-* Unlocks a demonstrable path from selection → highlight → saved artifact → re-load → display in sidebar (foundational for Tagging & Impact panels).
-* Reduces risk of accumulating complex pathfinding changes without persistence.
-* Enables earliest thin-slice of a user journey: "Design a street change and save it" (core MVP value proposition).
+Primary objective: **Close out M3 and deliver a minimal slice of M4 (street segment persistence) to enable save & recall of street transformations.**
 
-Proposed concrete scope for the next iteration (Sprint 1.1):
-1. Add a "Save Street Segment" button when a start & end path exists.
-2. Persist selected path as a GeoJSON `Feature<LineString>` with properties: `{ id, name (auto), type: 'street-segment', lengthM, createdAt }`.
-3. Display saved segments in a dedicated layer + clickable list (reuse sidebar filtering approach used for zones).
-4. Allow selecting a saved segment to re-highlight it (non-edit for first pass).
-5. Log actual hours in Progress Log per sub-task.
+Why now:
+* M3 core pathfinding + extended drag + recompute trigger are in place; remaining work is validation (robustness & cleanup) not new architecture.
+* Persistence unlocks downstream milestones (Transformation tags, Impact metrics) by giving a stable entity to attach properties.
+* Early save/load reduces future integration risk and establishes data shape conventions before adding complexity (tags, impacts, auth).
 
-Exit Criteria for this step: All 5 items complete; path reliability (no mid-line clipping) validated on 10+ random test pairs; no duplicate source/layer errors; average highlight update time <150ms at zoom 14 in target neighborhoods.
+Recommended focused scope (Sprint 1.2):
+1. Validation Harness (Dev Only): Add lightweight function to randomly sample 10 start/end pairs in current viewport, compute paths, log length & elapsed; flag anomalies (e.g., null path, <20m, repeated coordinates). (Supports M3 DONE decision.)
+2. Street Segment Save Button: Visible when both start/end + path exist; auto‑generates name (e.g., "Segment #{n}" or nearest street name pair) and stores GeoJSON in in‑memory `savedSegments` array (analogous to polygons) with properties `{ id, name, type:'street-segment', useType, lengthM, createdAt }`.
+3. Sidebar Integration: New list section below zones showing saved segments (click to highlight, sets selection state; no edit first pass).
+4. Layer & Source: Add `saved-street-segments` source + line layer (casing + fill) with color by `useType`; selected style emphasis.
+5. Cleanup & Reliability: Remove verbose debug logs from drag snapping and path build after validation; keep perf summary logs gated behind a DEV flag.
+
+Exit Criteria (to mark M3 DONE & partial M4):
+* 10/10 validation runs produce non-null paths, no duplicate consecutive coordinates, length >= 40m unless clearly short by design (cul-de-sac).
+* Save → list → reselect round trip works with ≥2 segments.
+* No console errors (except expected MapLibre warnings) and no duplicate layer/source warnings.
+* Average path recompute (selection → highlight) <150ms at zoom 14 for validation runs (log median & max).
+
+Stretch (optional if time remains):
+* Add simple delete (trash icon) for saved segments.
+* Derive default segment name using reverse geocoded nearest two intersecting street names (e.g., "Oak St to Fell St").
+* Quick filter toggle: show/hide saved segments layer.
+
+Deferral (explicitly NOT in this step): Editing saved segment geometry; multi-segment corridor merging; cloud persistence; transformation tags.
 
 ## **14. Agile Delivery & Process Improvements**
 
@@ -239,4 +258,4 @@ Recommended workflow:
 
 ---
 
-_Documentation updated: 2025-09-14_
+_Documentation updated: 2025-09-16 (post M3 completion)_
