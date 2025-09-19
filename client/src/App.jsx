@@ -23,15 +23,15 @@ function explodeToLineStrings(feature) {
       }));
     }
     return [];
-  }
-  return [];
-}
-
-
-export default function App() {
-  // Show save panel state
-  const [showSavePanel, setShowSavePanel] = useState(false);
-  // Map instance ref
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 6 }}>
+                            <select id={`street-${idx}-type`} name="streetItemType"
+                              value={f.properties?.useType || 'mixed-use'}
+                              onChange={e => {
+                                const newType = e.target.value;
+                                setSavedStreetSegments(prev => prev.map(sf => sf.properties?.id === segId ? { ...sf, properties: { ...sf.properties, useType: newType, updatedAt: Date.now() } } : sf));
+                              }}
+                              style={{ padding: '0.5rem', borderRadius: '0.375rem', fontSize: '0.9rem' }}
+                            >
   const map = useRef(null);
   // Use type to color mapping
   const colorByUse = {
