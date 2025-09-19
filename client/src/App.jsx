@@ -2266,6 +2266,26 @@ export default function App() {
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
   const canFinalizeStreets = streetsActive && !!startPoint && !!endPoint;
   const hasActiveStreetPath = streetsActive && !!startPoint && !!endPoint && streetPathLengthM != null;
+
+  function cancelAllSelections() {
+    setSelectedSavedIndex(null);
+    setSelectedStreetSegmentIndex(null);
+    setEditingSavedIndex(null);
+    setEditingStreetSegmentId(null);
+    setZoneSummary(null);
+    setStreetSegmentSummary(null);
+    setEphemeralStreetPathSummary(null);
+    setDrawMode(null);
+    setStartPoint(null);
+    setEndPoint(null);
+    setStreetPathLengthM(null);
+    // remove ephemeral map layers if present
+    if (map.current) {
+      const m = map.current;
+      ['selected-road-segment-layer','start-end-points-layer'].forEach(l=>{ if (m.getLayer(l)) try{ m.removeLayer(l);}catch{} });
+      ['selected-road-segment','start-end-points'].forEach(s=>{ if (m.getSource(s)) try{ m.removeSource(s);}catch{} });
+    }
+  }
   
   // Finalize button handler
   function finalizeCurrent() {
@@ -2939,9 +2959,12 @@ export default function App() {
             />
             {(zoneSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (
               <div style={cardStyle} className="summary-card" id="summary-card">
-                <h2 style={{ fontSize: "1.2rem", marginBottom: "0.75rem", borderBottom: "2px solid #eee", paddingBottom: "0.5rem" }}>
-                  {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
-                </h2>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'0.75rem', borderBottom:'2px solid #eee', paddingBottom:'0.5rem', gap:'0.5rem' }}>
+                  <h2 style={{ fontSize: '1.2rem', margin:0 }}>
+                    {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
+                  </h2>
+                  <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                </div>
                 {zoneSummary && (
                   <div className="summary-card__zone">
                     <p style={{ marginBottom: "0.5rem" }}><strong>Name:</strong> {displayName}</p>
@@ -3016,22 +3039,17 @@ export default function App() {
                     )}
                   </div>
                 )}
-                {/* Street finalize when ephemeral unsaved path present */}
+                {/* Street finalize when ephemeral unsaved path present (only once) */}
                 {ephemeralStreetPathSummary && !zoneSummary && (
-                  <div style={{ marginTop: '0.75rem' }}>
+                  <div style={{ marginTop: '0.75rem', display:'flex', gap:'0.5rem', flexWrap:'wrap' }}>
                     <button onClick={finalizeStreetSelection} className="btn btn--finalize" style={buttonVariants.success}>Finalize & Save</button>
+                    <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
                   </div>
                 )}
               </div>
             )}
             {/* Saved items lists follow */}
-
-            {/* Inline finalize for ephemeral street path when not editing an existing saved segment */}
-            {ephemeralStreetPathSummary && !zoneSummary && (
-              <div style={{ marginTop: '0.75rem' }}>
-                <button onClick={finalizeStreetSelection} className="btn btn--finalize" style={buttonVariants.success}>Finalize & Save</button>
-              </div>
-            )}
+            {/* (Removed duplicate street finalize block) */}
 
             {/* Saved zones list */}
             {savedZones.length > 0 && (
@@ -3279,7 +3297,7 @@ export default function App() {
                               style={sel ? buttonVariants.success : buttonVariants.info}
                             >{sel ? 'Selected' : 'Select'}</button>
                             <button
-                              title={editingThis ? 'Commit updated geometry by re-finalizing' : 'Load geometry for re-edit'}
+                              title={editingThis ? 'Commit updated geometry by re-finalizing' : 'Load geometry for edit'}
                               onClick={() => {
                                 // Start geometry re-edit: set endpoints from first & last coordinate and mark editingStreetSegmentId
                                 try {
@@ -3295,9 +3313,9 @@ export default function App() {
                                   }
                                 } catch {}
                               }}
-                              className={`btn ${editingThis ? 'btn--editing' : 'btn--reedit'}`}
+                              className={`btn ${editingThis ? 'btn--editing' : 'btn--edit'}`}
                               style={editingThis ? buttonVariants.warning : buttonVariants.muted}
-                            >{editingThis ? 'Editing' : 'Re-edit'}</button>
+                            >{editingThis ? 'Editing…' : 'Edit geometry'}</button>
                             {editingThis && (
                               <button
                                 title="Save changes"
