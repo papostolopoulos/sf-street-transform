@@ -97,6 +97,11 @@ export default function App() {
       const lenM = selectedStreetSegment.properties?.lengthM ?? (()=>{ try { return turf.length(selectedStreetSegment,{units:'meters'}) } catch { return null; } })();
       const start = coords[0];
       const end = coords[coords.length-1];
+      // If the saved feature lacks precomputed streets, attempt to compute now
+      let streetsNames = selectedStreetSegment.properties?.streets || [];
+      if ((!streetsNames || streetsNames.length === 0) && map.current) {
+        try { streetsNames = getStreetLineNames(map.current, turf.lineString(coords)); } catch {}
+      }
       return {
         id: selectedStreetSegment.properties?.id,
         name: selectedStreetSegment.properties?.name,
@@ -104,7 +109,7 @@ export default function App() {
         lengthM: lenM,
         start,
         end,
-        streets: selectedStreetSegment.properties?.streets || []
+        streets: streetsNames
       };
     } catch { return null; }
   }, [selectedStreetSegment]);
@@ -129,6 +134,19 @@ export default function App() {
     if (streetPathLengthM == null) return null;
     if (editingStreetSegmentId) return null; // editing existing feature handled via saved summary
     if (selectedStreetSegment) return null; // saved selection takes precedence
+    // Try to derive the street names for the in-progress path
+    let streetsNames = [];
+    try {
+      if (map.current) {
+        const src = map.current.getSource('selected-road-segment');
+        // @ts-ignore internal _data
+        const data = src?._data;
+        if (data?.geometry?.type === 'LineString') {
+          const ln = turf.lineString(data.geometry.coordinates);
+          streetsNames = getStreetLineNames(map.current, ln);
+        }
+      }
+    } catch {}
     return {
       id: null,
       name: pendingStreetName.trim() || 'Unsaved Segment',
@@ -136,6 +154,7 @@ export default function App() {
       lengthM: streetPathLengthM,
       start: startPoint,
       end: endPoint,
+      streets: streetsNames,
       transient: true
     };
   }, [streetsActive, startPoint, endPoint, streetPathLengthM, useType, selectedStreetSegment, editingStreetSegmentId, pendingStreetName]);
@@ -2381,9 +2400,7 @@ export default function App() {
         geometry: { type: 'LineString', coordinates: [...lineData.geometry.coordinates] },
         properties: { ...baseProps, id: genId() }
       };
-      setSavedStreetSegments(prev => [newFeature, ...prev]);
-      // Auto-select newly saved segment so summary persists
-      setSelectedStreetSegmentIndex(0);
+  setSavedStreetSegments(prev => [newFeature, ...prev]);
     }
     // Clear ephemeral selection layers
     if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
@@ -3337,20 +3354,27 @@ export default function App() {
                           <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
                             <button
                               onClick={() => {
-                                setSelectedStreetSegmentIndex(idx);
-                                if (map.current) {
-                                  const m = map.current;
-                                  const filt = ['==',['get','__sid'], idx];
-                                  try { m.setFilter('saved-street-segments-selected', filt); } catch {}
-                                  try {
-                                    const bb = turf.bbox(f);
-                                    m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
-                                  } catch {}
+                                if (sel) {
+                                  setSelectedStreetSegmentIndex(null);
+                                  if (map.current) {
+                                    try { map.current.setFilter('saved-street-segments-selected', null); } catch {}
+                                  }
+                                } else {
+                                  setSelectedStreetSegmentIndex(idx);
+                                  if (map.current) {
+                                    const m = map.current;
+                                    const filt = ['==',['get','__sid'], idx];
+                                    try { m.setFilter('saved-street-segments-selected', filt); } catch {}
+                                    try {
+                                      const bb = turf.bbox(f);
+                                      m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                    } catch {}
+                                  }
                                 }
                               }}
                               className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
                               style={sel ? buttonVariants.success : buttonVariants.info}
-                            >{sel ? 'Selected' : 'Select'}</button>
+                            >{sel ? 'Deselect' : 'Select'}</button>
                             <button
                               title={editingThis ? 'Commit updated geometry by re-finalizing' : 'Load geometry for edit'}
                               onClick={() => {
