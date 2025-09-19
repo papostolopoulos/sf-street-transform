@@ -106,6 +106,23 @@ export default function App() {
       };
     } catch { return null; }
   }, [selectedStreetSegment]);
+  // Ephemeral summary (unsaved street path) for fresh load first street action
+  const ephemeralStreetPathSummary = React.useMemo(()=>{
+    if (!streetsActive) return null;
+    if (!startPoint || !endPoint) return null;
+    if (streetPathLengthM == null) return null;
+    if (editingStreetSegmentId) return null; // editing existing feature handled via saved summary
+    if (selectedStreetSegment) return null; // saved selection takes precedence
+    return {
+      id: null,
+      name: 'Unsaved Segment',
+      useType,
+      lengthM: streetPathLengthM,
+      start: startPoint,
+      end: endPoint,
+      transient: true
+    };
+  }, [streetsActive, startPoint, endPoint, streetPathLengthM, useType, selectedStreetSegment, editingStreetSegmentId]);
   // Editing an existing saved street segment geometry
   const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
   // Performance samples for street path build (last N)
@@ -2303,6 +2320,8 @@ export default function App() {
         properties: { ...baseProps, id: genId() }
       };
       setSavedStreetSegments(prev => [newFeature, ...prev]);
+      // Auto-select newly saved segment so summary persists
+      setSelectedStreetSegmentIndex(0);
     }
     // Clear ephemeral selection layers
     if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
@@ -2894,7 +2913,7 @@ export default function App() {
                 background: "transparent",
               }}
             />
-            {(zoneSummary || streetSegmentSummary) && (
+            {(zoneSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (
               <>
                 <div style={cardStyle}>
                   <h2
@@ -2915,17 +2934,17 @@ export default function App() {
                       <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
                     </>
                   )}
-                  {streetSegmentSummary && (
+                  {(streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = streetSegmentSummary || ephemeralStreetPathSummary; return (
                     <>
-                      <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {streetSegmentSummary.name}</p>
-                      <p style={{ marginBottom: '0.5rem' }}><strong>Type:</strong> {streetSegmentSummary.useType}</p>
-                      {streetSegmentSummary.lengthM != null && (
-                        <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {streetSegmentSummary.lengthM.toFixed(1)} m</p>
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {ss.name}</p>
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Type:</strong> {ss.useType}</p>
+                      {ss.lengthM != null && (
+                        <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {ss.lengthM.toFixed(1)} m</p>
                       )}
-                      <p style={{ marginBottom: '0.5rem' }}><strong>Start:</strong> {streetSegmentSummary.start[0].toFixed(6)}, {streetSegmentSummary.start[1].toFixed(6)}</p>
-                      <p style={{ marginBottom: '1rem' }}><strong>End:</strong> {streetSegmentSummary.end[0].toFixed(6)}, {streetSegmentSummary.end[1].toFixed(6)}</p>
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Start:</strong> {ss.start[0].toFixed(6)}, {ss.start[1].toFixed(6)}</p>
+                      <p style={{ marginBottom: '1rem' }}><strong>End:</strong> {ss.end[0].toFixed(6)}, {ss.end[1].toFixed(6)}</p>
                     </>
-                  )}
+                  )})()}
 
                   {zoneSummary && zoneSummary.address && (
                     <>
@@ -3010,7 +3029,7 @@ export default function App() {
                     </>
                   )}
 
-                  {/* Finalize / Save block only for drawings */}
+                  {/* Finalize / Save block for polygon drawings */}
                   {(zoneSummary && (summaryContext === "draw" || editingSavedIndex != null)) && (
                     <div
                       style={{
@@ -3125,38 +3144,10 @@ export default function App() {
               </>
             )}
 
-            {/* Street Segment Summary (ephemeral before save) */}
-            {hasActiveStreetPath && streetsActive && (
-              <div style={{ ...cardStyle, marginTop: zoneSummary ? '1rem' : 0 }}>
-                <h2 style={{ fontSize: '1.1rem', margin: '0 0 .6rem', borderBottom: '2px solid #eee', paddingBottom: '.45rem' }}>Street Segment Summary</h2>
-                <div style={{ fontSize: '.8rem', marginBottom: '.4rem' }}>Name (auto): <strong>Segment {savedStreetSegments.length + 1}</strong></div>
-                {streetPathLengthM != null && (
-                  <div style={{ fontSize: '.8rem', marginBottom: '.4rem' }}>Length: {streetPathLengthM.toFixed(1)} m</div>
-                )}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem', marginBottom: '.65rem' }}>
-                  <span style={{ fontSize: '.7rem', fontWeight: 600 }}>Type</span>
-                  {['mixed-use','residential','commercial'].map(t => (
-                    <button
-                      key={t}
-                      onClick={() => setUseType(t)}
-                      title={t}
-                      aria-label={`Set type ${t}`}
-                      style={{
-                        width: 28,
-                        height: 28,
-                        borderRadius: 6,
-                        border: useType === t ? '2px solid #222' : '1px solid #bbb',
-                        background: colorByUse[t],
-                        cursor: 'pointer',
-                        boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
-                      }}
-                    />
-                  ))}
-                </div>
-                <button
-                  onClick={finalizeStreetSelection}
-                  style={{ ...buttonStyle, backgroundColor: '#28a745' }}
-                >Finalize & Save</button>
+            {/* Inline finalize for ephemeral street path when not editing an existing saved segment */}
+            {ephemeralStreetPathSummary && !zoneSummary && (
+              <div style={{ marginTop: '0.75rem' }}>
+                <button onClick={finalizeStreetSelection} style={{ ...buttonStyle, backgroundColor: '#28a745' }}>Finalize & Save</button>
               </div>
             )}
 
