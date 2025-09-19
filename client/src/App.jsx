@@ -317,6 +317,39 @@ export default function App() {
     return Array.from(names).sort((a, b) => a.localeCompare(b));
   }
 
+  // Street line intersecting/overlapping names (used for segment summary)
+  function getStreetLineNames(mapInstance, lineFeature) {
+    if (!mapInstance) return [];
+    const layerIds = getRoadLayerIds(mapInstance);
+    const [minLng, minLat, maxLng, maxLat] = turf.bbox(lineFeature);
+    const p1 = mapInstance.project([minLng, minLat]);
+    const p2 = mapInstance.project([maxLng, maxLat]);
+    const pad = 12;
+    const minX = Math.min(p1.x, p2.x) - pad;
+    const minY = Math.min(p1.y, p2.y) - pad;
+    const maxX = Math.max(p1.x, p2.x) + pad;
+    const maxY = Math.max(p1.y, p2.y) + pad;
+    const pixelBox = [ [minX, minY], [maxX, maxY] ];
+    const options = layerIds.length ? { layers: layerIds } : undefined;
+    let candidates = mapInstance.queryRenderedFeatures(pixelBox, options);
+    if (!candidates || candidates.length === 0) candidates = mapInstance.queryRenderedFeatures(options);
+    const names = new Set();
+    const nameKeys = ['name','name_en','name:en','name:latin','street','ref'];
+    for (const feat of candidates) {
+      let nm=null; for (const k of nameKeys) { if (feat.properties?.[k]) { nm=feat.properties[k]; break; } }
+      if (!nm && feat.properties?.class) nm = feat.properties.class;
+      if (!nm) continue;
+      const g = feat.geometry?.type;
+      if (g==='LineString' || g==='MultiLineString') {
+        const asTurf = g==='LineString' ? turf.lineString(feat.geometry.coordinates) : turf.multiLineString(feat.geometry.coordinates);
+        try { if (turf.booleanIntersects(asTurf, lineFeature)) names.add(nm); } catch {}
+      } else if (g==='Point') {
+        try { const pt = turf.point(feat.geometry.coordinates); if (turf.booleanPointInPolygon(pt, turf.buffer(lineFeature, 0.0005))) names.add(nm); } catch {}
+      }
+    }
+    return Array.from(names).sort((a,b)=>a.localeCompare(b));
+  }
+
   // Ensure sources and layers exist after load/style switch
   function ensureSourcesAndLayers(mapInstance) {
     // Add source for drawn line if not present
@@ -2992,7 +3025,15 @@ export default function App() {
                       <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {ss.lengthM.toFixed(1)} m</p>
                     )}
                     <p style={{ marginBottom: '0.5rem' }}><strong>Start:</strong> {ss.start[0].toFixed(6)}, {ss.start[1].toFixed(6)}</p>
-                    <p style={{ marginBottom: '1rem' }}><strong>End:</strong> {ss.end[0].toFixed(6)}, {ss.end[1].toFixed(6)}</p>
+                    <p style={{ marginBottom: ss.streets && ss.streets.length ? '0.5rem' : '1rem' }}><strong>End:</strong> {ss.end[0].toFixed(6)}, {ss.end[1].toFixed(6)}</p>
+                    {ss.streets && ss.streets.length > 0 && (
+                      <div style={{ marginBottom:'0.75rem' }}>
+                        <h3 style={{ fontSize:'1.05rem', margin:'0.75rem 0 0.4rem', borderBottom:'1px solid #ddd', paddingBottom:'0.25rem' }}>Streets intersecting segment</h3>
+                        <ul style={{ paddingLeft:'1rem', listStyle:'disc', lineHeight:'1.5' }}>
+                          {ss.streets.map((s,i)=>(<li key={i}>{s}</li>))}
+                        </ul>
+                      </div>
+                    )}
                   </div>
                 )})()}
                 {zoneSummary && zoneSummary.address && (
@@ -3031,10 +3072,10 @@ export default function App() {
                         {editingSavedIndex != null && (
                           <div style={{ fontSize: "0.85rem", color: "#555" }}>Editing saved zone #{editingSavedIndex + 1}</div>
                         )}
-                        <label style={{ fontSize: "0.85rem" }}>Name</label>
-                        <input value={pendingName} onChange={e=>setPendingName(e.target.value)} placeholder="Custom Zone" style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6 }} />
-                        <label style={{ fontSize: "0.85rem" }}>Description</label>
-                        <textarea value={pendingDescription} onChange={e=>setPendingDescription(e.target.value)} rows={3} placeholder="Notes, purpose, constraints" style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6 }} />
+                        <label htmlFor="zone-name" style={{ fontSize: "0.85rem" }}>Name</label>
+                        <input id="zone-name" name="zoneName" value={pendingName} onChange={e=>setPendingName(e.target.value)} placeholder="Custom Zone" style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6 }} />
+                        <label htmlFor="zone-description" style={{ fontSize: "0.85rem" }}>Description</label>
+                        <textarea id="zone-description" name="zoneDescription" value={pendingDescription} onChange={e=>setPendingDescription(e.target.value)} rows={3} placeholder="Notes, purpose, constraints" style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6 }} />
                         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
                             <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>Type:</span>
@@ -3052,9 +3093,19 @@ export default function App() {
                 )}
                 {/* Street finalize when ephemeral unsaved path present (only once) */}
                 {ephemeralStreetPathSummary && !zoneSummary && (
-                  <div style={{ marginTop: '0.75rem', display:'flex', gap:'0.5rem', flexWrap:'wrap' }}>
-                    <button onClick={finalizeStreetSelection} className="btn btn--finalize" style={buttonVariants.success}>Finalize & Save</button>
-                    <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                  <div style={{ marginTop: '0.75rem', display:'grid', gap:'0.5rem' }}>
+                    <label htmlFor="street-name" style={{ fontSize:'0.85rem' }}>Name</label>
+                    <input id="street-name" name="streetName" value={pendingStreetName} onChange={e=>setPendingStreetName(e.target.value)} placeholder="Segment name" style={{ padding:'0.45rem', border:'1px solid #ccc', borderRadius:6 }} />
+                    <div style={{ display:'flex', alignItems:'center', gap:'0.5rem', flexWrap:'wrap' }}>
+                      <span style={{ fontSize:'0.75rem', fontWeight:600 }}>Type:</span>
+                      {['mixed-use','residential','commercial'].map(t => (
+                        <button key={t} id={`street-type-${t}`} name="streetType" onClick={()=>setUseType(t)} title={t} aria-label={`Set type ${t}`} style={{ width: 28, height: 28, borderRadius: 6, border: useType === t ? '2px solid #222' : '1px solid #bbb', background: colorByUse[t], cursor: 'pointer', boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none' }} />
+                      ))}
+                    </div>
+                    <div style={{ display:'flex', gap:'0.5rem', flexWrap:'wrap' }}>
+                      <button onClick={finalizeStreetSelection} className="btn btn--finalize" style={buttonVariants.success}>Finalize & Save</button>
+                      <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -3164,19 +3215,7 @@ export default function App() {
                             <option value="residential">Residential</option>
                             <option value="commercial">Commercial</option>
                           </select>
-                          <span
-                            style={{
-                              width: 12,
-                              height: 12,
-                              borderRadius: 2,
-                              backgroundColor:
-                                colorByUse[
-                                  f.properties?.useType || "mixed-use"
-                                ],
-                              display: "inline-block",
-                              border: "1px solid #ccc",
-                            }}
-                          />
+                          {/* removed inner swatch to avoid duplication; header shows swatch */}
                         </div>
 
                         <div
@@ -3191,14 +3230,19 @@ export default function App() {
                             disabled={isEditingSaved}
                             onClick={() => {
                               if (isEditingSaved) return;
-                              setSelectedSavedIndex(idx);
-                              applySelectedFilter(map.current, idx);
-                              flyToSaved(f);
+                              if (selectedSavedIndex === idx) {
+                                setSelectedSavedIndex(null);
+                                applySelectedFilter(map.current, null);
+                              } else {
+                                setSelectedSavedIndex(idx);
+                                applySelectedFilter(map.current, idx);
+                                flyToSaved(f);
+                              }
                             }}
                             className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
                             title={isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
                             style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: isEditingSaved ? 0.6 : 1, cursor: isEditingSaved ? 'not-allowed':'pointer' }}
-                          >{selectedSavedIndex===idx ? 'Selected' : 'Select'}</button>
+                          >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
 
                           <button
                             disabled={isEditingSaved && editingSavedIndex !== idx}
