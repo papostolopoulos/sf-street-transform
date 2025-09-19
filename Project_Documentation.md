@@ -102,6 +102,7 @@ The following functionalities have been successfully implemented in the applicat
 * **Reverse Geocoding for Predefined Zones:** The sidebar displays address details (street, postal code, neighborhood, city, state, country) obtained from MapTiler's reverse geocoding API, based on the centroid of the *selected predefined zone*.  
 * **Modular and Commented Codebase:** The existing code is well-organized into React components and hooks, with extensive comments explaining logic and functionality.
 * **Street Segment Selection & Editing (M3 DONE):** Road-following shortest path between two points with: network snapping, extended drag (lengthen/shorten) support, fast-path same-line slicing (prevents detour bounce), precision trimming between endpoints, adaptive snapping radius, path length metric, recompute trigger, performance instrumentation, defensive coordinate validation, and save readiness groundwork.
+* **Local Persistence (M4 – in progress):** Client-side (localStorage) save/load for both user-drawn zones and saved street segments (with stable unique IDs, rename, useType update, in-place segment geometry re-edit, delete, and auto length recompute on finalize).
 
 ## **8\. What Is Planned to Be Built (Planned Features / Roadmap)**
 
@@ -110,7 +111,8 @@ The future development of the "SF Street Transform" application will focus on en
 * **Full Integration of User-Drawn Zones:**  
   * Display the calculated area and geocoded address for *user-drawn polygons* directly in the sidebar.  
   * Allow users to "finalize" or "save" a drawn zone, potentially giving it a custom name and description.  
-* **Street Segment Selection:** Implement a feature allowing users to select existing street segments (e.g., using custom vector tiles) rather than just drawing freehand polygons. This will provide more precise and realistic transformation areas.  
+* (Completed – moved to Section 7) Street Segment Selection.  
+* Street Segment Persistence Enhancements: Tagging & richer metadata (phase continuation of M4).  
 * **Enhanced Scale UX:** Ensure the application seamlessly supports design and visualization for varying scales, from small blocks to entire neighborhoods.  
 * **Mode Switching for Selection:** Introduce a clear mode switch between "Draw Zone" (freehand polygon) and "Select Streets" (segment selection).  
 * **Advanced Transformation Menu:** Develop the interactive "Transformation Menu" as depicted in the mockups, allowing users to select specific urban elements (e.g., trees, bike lane barriers, playgrounds) to apply to their chosen zone.  
@@ -170,7 +172,7 @@ The project features below are grouped into deliverable milestones to enable inc
 | M2 | Zone Summaries & Save/Load | Persist user‑drawn polygons (name, description, type), compute & show summary (area, address, streets) for user zones | M1 | 18 |  | IN PROGRESS (partially implemented) | 40% | Save, list, select, edit & re-save round trip works |
 | M3 | Street Segment Selection (Start/End) | Select road-aligned path between two points following roads, highlight path, clear/reset selection, prepare for saving as a street transformation zone | Road graph logic, Map layers | 24 |  | DONE | 100% | Path follows multi-block roads; extended drag + shorten stable (no bounce); fast-path slice + precise trimming; perf timings logged; no runtime errors |
 | M3.5 | UI & Interaction Refinement | Consolidate controls, improve discoverability (tool grouping, inline hints), display path metrics, restore polygon tool reliability & mode sync, dynamic segment color, unified help panel | M1, M3 | 14 |  | IN PROGRESS | 55% | Polygon & street tools switch cleanly; dynamic coloring, unified help panel, path length metric, recompute trigger; pending: minor UI affordances (button for save segment, subtle hints) & log noise reduction |
-| M4 | Street Segment Persistence | Save highlighted street segments as features (with type, tags), list & edit, integrate with sidebar summaries | M2, M3 | 16 |  | NOT STARTED | 0% | CRUD for street selections, displayed on load |
+| M4 | Street Segment Persistence | Persist & manage street segments and zones locally (IDs, create, select, rename, re-edit geometry, delete, useType change, auto length), groundwork for tags | M2, M3 | 16 |  | IN PROGRESS | 55% | Segments & zones survive reload, edit-in-place updates existing feature, rename & type change persist, no storage corruption |
 | M5 | Transformation Menu (Phase 1) | Minimal selectable transformation tags (trees, seating, bike lane) applied to a zone/segment, store in properties | M2/M4 | 20 |  | NOT STARTED | 0% | Tags add/remove, persisted & visible in summary |
 | M6 | Impact Panel (Phase 1) | Compute & display basic derived metrics (area %, estimated trees count placeholder, speed calming indicator) | M5 | 14 |  | NOT STARTED | 0% | Metrics render for polygons & segments, no crashes |
 | M7 | Before / After View (2D) | Static split view slider with baseline vs transformed stylistic overlay | M5 | 28 |  | NOT STARTED | 0% | Slider works, assets load, performance ok |
@@ -199,6 +201,9 @@ The project features below are grouped into deliverable milestones to enable inc
 | 2025-09-16 | Documentation | Milestone & Next Step Update | Updated milestone percentages (M3 90%, M3.5 55%); refreshed Suggested Next Step section | 0.2 |
 | 2025-09-16 | Reliability Fix | M3 Path Shortening | Added same-line fast-path slice & precision trimming to eliminate intersection bounce | 0.4 |
 | 2025-09-16 | Defensive Coding | M3 Snapping Validation | Hardened snapping against malformed coordinates (guards + logging) | 0.2 |
+| 2025-09-17 | Feature Work | M4 Local Persistence | Added localStorage load/save for zones & street segments with stable IDs | (TBD) |
+| 2025-09-17 | Enhancement | M4 Segment Re-edit | Geometry re-edit flow (load saved path, adjust, re-finalize updates same ID & length) | (TBD) |
+| 2025-09-17 | Enhancement | M4 Rename & UseType | Inline rename + per-segment useType dropdown with immediate recolor & persistence | (TBD) |
 
 Guideline: Add an entry when a milestone meaningfully advances (≥10% delta) or concludes. Time Logged aggregates focused engineering time (exclude context switching & unrelated research).
 
@@ -258,4 +263,4 @@ Recommended workflow:
 
 ---
 
-_Documentation updated: 2025-09-16 (post M3 completion)_
+_Documentation updated: 2025-09-17 (M4 persistence progress)_

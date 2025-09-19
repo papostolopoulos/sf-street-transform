@@ -2,6 +2,10 @@ const MAPTILER_KEY = "DyVFUZmyKdCywxRTVU9B";
 import React, { useState, useRef, useEffect } from "react";
 import * as turf from "@turf/turf";
 import maplibregl from "maplibre-gl";
+// Simple id generator (not crypto strong but stable enough for local features)
+function genId() {
+  return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,9);
+}
 // Utility: Explode GeoJSON features to array of LineStrings
 function explodeToLineStrings(feature) {
 
@@ -67,6 +71,43 @@ export default function App() {
   // Saved street segments (M4 slice)
   const [savedStreetSegments, setSavedStreetSegments] = useState([]); // Feature<LineString>[]
   const [selectedStreetSegmentIndex, setSelectedStreetSegmentIndex] = useState(null);
+  // Unified selection clearing when tool switches
+  useEffect(()=>{
+    if (polygonActive) {
+      // Clear street selection state when switching to polygon tool
+      setSelectedStreetSegmentIndex(null);
+      setEditingStreetSegmentId(null);
+    } else if (streetsActive) {
+      // Clear polygon selection/editing when switching to street tool
+      setSelectedSavedIndex(null);
+      setEditingSavedIndex(null);
+    }
+  }, [polygonActive, streetsActive]);
+
+  // Derive currently selected saved street segment
+  const selectedStreetSegment = (typeof selectedStreetSegmentIndex === 'number' && selectedStreetSegmentIndex >=0) ? savedStreetSegments[selectedStreetSegmentIndex] : null;
+
+  // Build a lightweight street segment summary similar to zone summary
+  const streetSegmentSummary = React.useMemo(()=>{
+    if (!selectedStreetSegment) return null;
+    try {
+      const coords = selectedStreetSegment.geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) return null;
+      const lenM = selectedStreetSegment.properties?.lengthM ?? (()=>{ try { return turf.length(selectedStreetSegment,{units:'meters'}) } catch { return null; } })();
+      const start = coords[0];
+      const end = coords[coords.length-1];
+      return {
+        id: selectedStreetSegment.properties?.id,
+        name: selectedStreetSegment.properties?.name,
+        useType: selectedStreetSegment.properties?.useType,
+        lengthM: lenM,
+        start,
+        end
+      };
+    } catch { return null; }
+  }, [selectedStreetSegment]);
+  // Editing an existing saved street segment geometry
+  const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
   // Performance samples for street path build (last N)
   const [streetPerfSamples, setStreetPerfSamples] = useState([]); // each: { total, featureQuery, graphBuild, pathSolve, renderUpdate, ts }
 
@@ -89,6 +130,36 @@ export default function App() {
   const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
   // Saved zones state
   const [savedZones, setSavedZones] = useState([]);
+  // --- Persistence load (zones + street segments) ---
+  useEffect(()=>{
+    try {
+      const zRaw = localStorage.getItem('sfst_savedZones_v1');
+      if (zRaw) {
+        const arr = JSON.parse(zRaw);
+        if (Array.isArray(arr)) {
+          const sanitized = arr.filter(f => f && f.geometry && f.geometry.type === 'Polygon' && Array.isArray(f.geometry.coordinates));
+          setSavedZones(sanitized);
+        }
+      }
+    } catch {}
+    try {
+      const sRaw = localStorage.getItem('sfst_savedStreetSegments_v1');
+      if (sRaw) {
+        const arr = JSON.parse(sRaw);
+        if (Array.isArray(arr)) {
+          const sanitized = arr.filter(f => f && f.geometry && f.geometry.type === 'LineString' && Array.isArray(f.geometry.coordinates) && f.geometry.coordinates.length >= 2);
+          setSavedStreetSegments(sanitized);
+        }
+      }
+    } catch {}
+  }, []);
+  // Persist on change
+  useEffect(()=>{
+    try { localStorage.setItem('sfst_savedZones_v1', JSON.stringify(savedZones)); } catch {}
+  }, [savedZones]);
+  useEffect(()=>{
+    try { localStorage.setItem('sfst_savedStreetSegments_v1', JSON.stringify(savedStreetSegments)); } catch {}
+  }, [savedStreetSegments]);
   // Basemap style state
   const [basemapStyle, setBasemapStyle] = useState("streets");
   // Help box visibility for drawing instructions
@@ -2211,17 +2282,28 @@ export default function App() {
       return; // nothing to save
     }
     const lenM = streetPathLengthM || (() => { try { return turf.length(lineData, { units: 'meters' }); } catch { return null; } })();
-    const newFeature = {
-      type: 'Feature',
-      geometry: { type: 'LineString', coordinates: [...lineData.geometry.coordinates] },
-      properties: {
-        name: `Segment ${savedStreetSegments.length + 1}`,
-        useType,
-        lengthM: lenM,
-        createdAt: Date.now()
-      }
+    const baseProps = {
+      name: `Segment ${savedStreetSegments.length + 1}`,
+      useType,
+      lengthM: lenM,
+      createdAt: Date.now()
     };
-    setSavedStreetSegments(prev => [newFeature, ...prev]);
+    if (editingStreetSegmentId) {
+      // Update existing
+      setSavedStreetSegments(prev => prev.map(f => f.properties?.id === editingStreetSegmentId ? {
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [...lineData.geometry.coordinates] },
+        properties: { ...f.properties, ...baseProps, id: editingStreetSegmentId, updatedAt: Date.now() }
+      } : f));
+      setEditingStreetSegmentId(null);
+    } else {
+      const newFeature = {
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [...lineData.geometry.coordinates] },
+        properties: { ...baseProps, id: genId() }
+      };
+      setSavedStreetSegments(prev => [newFeature, ...prev]);
+    }
     // Clear ephemeral selection layers
     if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
     if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
@@ -2297,6 +2379,7 @@ export default function App() {
     return {
       type: "Feature",
       properties: {
+        id: genId(),
         name:
           nameOverride ??
           (pendingName.trim() || `Custom Zone ${savedZones.length + 1}`),
@@ -2317,7 +2400,7 @@ export default function App() {
 
     if (editingSavedIndex != null) {
       setSavedZones((prev) =>
-        prev.map((f, i) => (i === editingSavedIndex ? feature : f))
+        prev.map((f, i) => (i === editingSavedIndex ? { ...feature, properties: { ...feature.properties, id: f.properties?.id || genId() } } : f))
       );
     } else {
       setSavedZones((prev) => [feature, ...prev]);
@@ -2817,7 +2900,7 @@ export default function App() {
                 background: "transparent",
               }}
             />
-            {zoneSummary && (
+            {(zoneSummary || streetSegmentSummary) && (
               <>
                 <div style={cardStyle}>
                   <h2
@@ -2828,26 +2911,29 @@ export default function App() {
                       paddingBottom: "0.5rem",
                     }}
                   >
-                    Zone Summary
+                    {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
                   </h2>
+                  {zoneSummary && (
+                    <>
+                      <p style={{ marginBottom: "0.5rem" }}><strong>Name:</strong> {displayName}</p>
+                      <p style={{ marginBottom: "0.5rem" }}><strong>Type:</strong> {zoneSummary.useType}</p>
+                      <p style={{ marginBottom: "0.5rem" }}><strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² / {zoneSummary.areaFt2.toFixed(2)} ft²</p>
+                      <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
+                    </>
+                  )}
+                  {streetSegmentSummary && (
+                    <>
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {streetSegmentSummary.name}</p>
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Type:</strong> {streetSegmentSummary.useType}</p>
+                      {streetSegmentSummary.lengthM != null && (
+                        <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {streetSegmentSummary.lengthM.toFixed(1)} m</p>
+                      )}
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Start:</strong> {streetSegmentSummary.start[0].toFixed(6)}, {streetSegmentSummary.start[1].toFixed(6)}</p>
+                      <p style={{ marginBottom: '1rem' }}><strong>End:</strong> {streetSegmentSummary.end[0].toFixed(6)}, {streetSegmentSummary.end[1].toFixed(6)}</p>
+                    </>
+                  )}
 
-                  <p style={{ marginBottom: "0.5rem" }}>
-                    <strong>Name:</strong> {displayName}
-                  </p>
-                  <p style={{ marginBottom: "0.5rem" }}>
-                    <strong>Type:</strong> {zoneSummary.useType}
-                  </p>
-                  <p style={{ marginBottom: "0.5rem" }}>
-                    <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
-                    {zoneSummary.areaFt2.toFixed(2)} ft²
-                  </p>
-                  <p style={{ marginBottom: "1rem" }}>
-                    <strong>Centroid:</strong>{" "}
-                    {zoneSummary.centroid[0].toFixed(6)},{" "}
-                    {zoneSummary.centroid[1].toFixed(6)}
-                  </p>
-
-                  {zoneSummary.address && (
+                  {zoneSummary && zoneSummary.address && (
                     <>
                       <h3
                         style={{
@@ -2904,7 +2990,7 @@ export default function App() {
                     </>
                   )}
 
-                  {zoneSummary.streets && zoneSummary.streets.length > 0 && (
+                  {zoneSummary && zoneSummary.streets && zoneSummary.streets.length > 0 && (
                     <>
                       <h3
                         style={{
@@ -2931,7 +3017,7 @@ export default function App() {
                   )}
 
                   {/* Finalize / Save block only for drawings */}
-                  {(summaryContext === "draw" || editingSavedIndex != null) && (
+                  {(zoneSummary && (summaryContext === "draw" || editingSavedIndex != null)) && (
                     <div
                       style={{
                         marginTop: "1rem",
@@ -3300,6 +3386,8 @@ export default function App() {
                   <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: '0.5rem' }}>
                     {savedStreetSegments.map((f, idx) => {
                       const sel = selectedStreetSegmentIndex === idx;
+                      const segId = f.properties?.id;
+                      const editingThis = editingStreetSegmentId && editingStreetSegmentId === segId;
                       return (
                         <li key={idx} style={{
                           background: '#fff',
@@ -3310,10 +3398,45 @@ export default function App() {
                           gap: '0.35rem'
                         }}>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>{f.properties?.name || `Segment ${idx + 1}`}{sel ? ' • selected' : ''}</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
+                              {editingThis ? (
+                                <input
+                                  style={{ fontSize: '0.8rem', padding: '2px 4px' }}
+                                  defaultValue={f.properties?.name || ''}
+                                  onKeyDown={e => {
+                                    if (e.key === 'Enter') {
+                                      const val = e.currentTarget.value.trim();
+                                      if (val) {
+                                        setSavedStreetSegments(prev => prev.map(sf => sf.properties?.id === segId ? { ...sf, properties: { ...sf.properties, name: val, updatedAt: Date.now() } } : sf));
+                                        setEditingStreetSegmentId(null);
+                                      }
+                                    } else if (e.key === 'Escape') {
+                                      setEditingStreetSegmentId(null);
+                                    }
+                                  }}
+                                />
+                              ) : (
+                                <span onDoubleClick={()=> setEditingStreetSegmentId(segId)} title="Double-click to rename">{f.properties?.name || `Segment ${idx + 1}`}</span>
+                              )}
+                              {sel ? ' • selected' : ''}
+                            </div>
                             <span style={{ width: 12, height: 12, borderRadius: 3, background: colorByUse[f.properties?.useType || 'mixed-use'], border: '1px solid #ccc' }} />
                           </div>
                           <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
+                          <div style={{ fontSize: '0.65rem', color: '#777' }}>ID: {segId?.slice(0,10)}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <label style={{ fontSize: '0.65rem' }}>Type:</label>
+                            <select
+                              value={f.properties?.useType || 'mixed-use'}
+                              onChange={e => {
+                                const newType = e.target.value;
+                                setSavedStreetSegments(prev => prev.map(sf => sf.properties?.id === segId ? { ...sf, properties: { ...sf.properties, useType: newType, updatedAt: Date.now() } } : sf));
+                              }}
+                              style={{ fontSize: '0.65rem' }}
+                            >
+                              {Object.keys(colorByUse).map(t => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </div>
                           <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
                             <button
                               onClick={() => {
@@ -3331,9 +3454,29 @@ export default function App() {
                               style={{ ...buttonStyle, backgroundColor: sel ? '#28a745' : '#17a2b8', color: sel ? '#fff' : '#000' }}
                             >{sel ? 'Selected' : 'Select'}</button>
                             <button
+                              title={editingThis ? 'Commit updated geometry by re-finalizing' : 'Load geometry for re-edit'}
+                              onClick={() => {
+                                // Start geometry re-edit: set endpoints from first & last coordinate and mark editingStreetSegmentId
+                                try {
+                                  const coords = f.geometry?.coordinates;
+                                  if (Array.isArray(coords) && coords.length >= 2) {
+                                    setStartPoint(coords[0]);
+                                    setEndPoint(coords[coords.length -1]);
+                                    setEditingStreetSegmentId(segId);
+                                    setStreetPathLengthM(f.properties?.lengthM || null);
+                                    setActiveTool('street');
+                                    // force recompute to show path
+                                    if (recomputeStreetPathRef.current) setTimeout(()=>recomputeStreetPathRef.current(),0);
+                                  }
+                                } catch {}
+                              }}
+                              style={{ ...buttonStyle, backgroundColor: editingThis ? '#ffc107' : '#6c757d', color: '#fff' }}
+                            >{editingThis ? 'Editing' : 'Re-edit'}</button>
+                            <button
                               onClick={() => {
                                 setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
                                 if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
+                                if (editingStreetSegmentId === segId) setEditingStreetSegmentId(null);
                               }}
                               style={{ ...buttonStyle, backgroundColor: '#dc3545', color: '#fff' }}
                             >Delete</button>
