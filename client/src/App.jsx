@@ -3339,7 +3339,7 @@ export default function App() {
                           <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
                           <div style={{ fontSize: '0.65rem', color: '#777' }}>ID: {segId?.slice(0,10)}</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                            <label style={{ fontSize: '0.65rem' }}>Type:</label>
+                            <label style={{ fontSize: '0.75rem', fontWeight:600 }}>Type:</label>
                             <select
                               value={f.properties?.useType || 'mixed-use'}
                               onChange={e => {
