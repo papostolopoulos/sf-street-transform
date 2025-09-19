@@ -46,6 +46,7 @@ export default function App() {
   const [pendingName, setPendingName] = useState("");
   // Pending description (used in save panel)
   const [pendingDescription, setPendingDescription] = useState("");
+  const [pendingStreetName, setPendingStreetName] = useState("");
   // Summary context state
   const [summaryContext, setSummaryContext] = useState(null);
   // Zone summary state
@@ -102,7 +103,8 @@ export default function App() {
         useType: selectedStreetSegment.properties?.useType,
         lengthM: lenM,
         start,
-        end
+        end,
+        streets: selectedStreetSegment.properties?.streets || []
       };
     } catch { return null; }
   }, [selectedStreetSegment]);
@@ -129,14 +131,14 @@ export default function App() {
     if (selectedStreetSegment) return null; // saved selection takes precedence
     return {
       id: null,
-      name: 'Unsaved Segment',
+      name: pendingStreetName.trim() || 'Unsaved Segment',
       useType,
       lengthM: streetPathLengthM,
       start: startPoint,
       end: endPoint,
       transient: true
     };
-  }, [streetsActive, startPoint, endPoint, streetPathLengthM, useType, selectedStreetSegment, editingStreetSegmentId]);
+  }, [streetsActive, startPoint, endPoint, streetPathLengthM, useType, selectedStreetSegment, editingStreetSegmentId, pendingStreetName]);
   // Drawn coordinates state
   const [drawnCoords, setDrawnCoords] = useState([]);
   // Editing saved zone index state
@@ -2279,6 +2281,7 @@ export default function App() {
     setStartPoint(null);
     setEndPoint(null);
     setStreetPathLengthM(null);
+    setPendingStreetName("");
     // remove ephemeral map layers if present
     if (map.current) {
       const m = map.current;
@@ -2318,10 +2321,17 @@ export default function App() {
       return; // nothing to save
     }
     const lenM = streetPathLengthM || (() => { try { return turf.length(lineData, { units: 'meters' }); } catch { return null; } })();
+    // Collect intersecting/overlapping street names for the line itself
+    let streets = [];
+    try {
+      const lineFeature = turf.lineString(lineData.geometry.coordinates);
+      streets = getStreetLineNames(m, lineFeature);
+    } catch {}
     const baseProps = {
-      name: `Segment ${savedStreetSegments.length + 1}`,
+      name: (pendingStreetName.trim() || `Segment ${savedStreetSegments.length + 1}`),
       useType,
       lengthM: lenM,
+      streets,
       createdAt: Date.now()
     };
     if (editingStreetSegmentId) {
@@ -2350,6 +2360,7 @@ export default function App() {
     setStartPoint(null);
     setEndPoint(null);
     setStreetPathLengthM(null);
+    setPendingStreetName("");
   }
 
   // Dev-only validation harness for M3 path reliability
