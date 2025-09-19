@@ -198,6 +198,8 @@ export default function App() {
   const [basemapStyle, setBasemapStyle] = useState("streets");
   // Help box visibility for drawing instructions
   const [showHelpBox, setShowHelpBox] = useState(true);
+  // Whether the zone save form panel is visible while drawing/editing a zone
+  const [showSavePanel, setShowSavePanel] = useState(false);
   // Sidebar visibility & width (was referenced but not defined)
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(380);
@@ -1331,6 +1333,47 @@ export default function App() {
       m.off("click", "saved-zones-fill", onClickSaved);
     };
   }, [savedZones, editingSavedIndex, basemapStyle]);
+
+  // Click on saved street segments to select & fly
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const handler = (e) => {
+      // Ignore while editing a different street geometry (editingStreetSegmentId) or in polygon draw mode
+      if (editingStreetSegmentId) return;
+      if (drawMode) return;
+      const f = e.features?.[0];
+      if (!f) return;
+      const sid = f.properties?.__sid;
+      if (typeof sid === 'number') {
+        setSelectedStreetSegmentIndex(sid);
+        // Update map filter for selected styling
+        try {
+          const filt = ['==', ['get','__sid'], sid];
+          m.setFilter('saved-street-segments-selected', filt);
+        } catch {}
+        // Fly to bounds of the segment
+        const seg = savedStreetSegments[sid];
+        if (seg?.geometry?.type === 'LineString') {
+          try {
+            const lineBbox = turf.bbox(seg);
+            m.fitBounds([[lineBbox[0], lineBbox[1]],[lineBbox[2], lineBbox[3]]], { padding: getMapPadding(), duration: 650 });
+          } catch {}
+        }
+        // Ensure sidebar is visible when selecting via map
+        setSidebarVisible(true);
+      }
+    };
+
+    // Prefer clicking the main line layer (not the casing) for selection
+    m.on('click', 'saved-street-segments-line', handler);
+    // As a fallback also allow casing clicks (larger hit target)
+    m.on('click', 'saved-street-segments-casing', handler);
+    return () => {
+      m.off('click', 'saved-street-segments-line', handler);
+      m.off('click', 'saved-street-segments-casing', handler);
+    };
+  }, [savedStreetSegments, editingStreetSegmentId, drawMode, basemapStyle]);
 
   // Enter/exit draw mode housekeeping
   useEffect(() => {
