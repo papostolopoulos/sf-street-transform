@@ -2743,13 +2743,7 @@ export default function App() {
                 </div>
               );
             })()}
-            {import.meta.env.DEV && (
-              <button
-                onClick={() => runStreetValidation(8)}
-                style={{ ...buttonStyle, backgroundColor: '#6f42c1', marginTop: '.25rem' }}
-                title="Run random path validation (dev)"
-              >Validate paths</button>
-            )}
+            {/* Removed dev-only Validate paths button */}
           </div>
         )}
       </div>
