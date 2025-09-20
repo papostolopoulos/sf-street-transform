@@ -43,6 +43,9 @@ export default function App() {
   // Pending description (used in save panel)
   const [pendingDescription, setPendingDescription] = useState("");
   const [pendingStreetName, setPendingStreetName] = useState("");
+  // Street editing metadata (mirrors zone name/description editing UX)
+  const [editingStreetName, setEditingStreetName] = useState("");
+  const [editingStreetDescription, setEditingStreetDescription] = useState("");
   // Summary context state
   const [summaryContext, setSummaryContext] = useState(null);
   // Zone summary state
@@ -68,6 +71,8 @@ export default function App() {
   // Saved street segments (M4 slice)
   const [savedStreetSegments, setSavedStreetSegments] = useState([]); // Feature<LineString>[]
   const [selectedStreetSegmentIndex, setSelectedStreetSegmentIndex] = useState(null);
+  // Editing an existing saved street segment geometry (declare early so downstream hooks can reference)
+  const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
   // Unified selection clearing when tool switches
   useEffect(()=>{
     if (polygonActive) {
@@ -109,8 +114,43 @@ export default function App() {
       };
     } catch { return null; }
   }, [selectedStreetSegment]);
-  // Editing an existing saved street segment geometry
-  const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
+  // Editing street segment summary (reuse feature even if not selected)
+  const editingStreetSegmentSummary = React.useMemo(()=>{
+    if (!editingStreetSegmentId) return null;
+    const feat = savedStreetSegments.find(f=>f.properties?.id===editingStreetSegmentId);
+    if (!feat) return null;
+    try {
+      const coords = feat.geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) return null;
+      const lenM = feat.properties?.lengthM ?? (()=>{ try { return turf.length(feat,{units:'meters'}) } catch { return null; } })();
+      let streetsNames = feat.properties?.streets || [];
+      if ((!streetsNames || streetsNames.length === 0) && map.current) {
+        try { streetsNames = getStreetLineNames(map.current, turf.lineString(coords)); } catch {}
+      }
+      const centroid = (()=>{ try { const c = turf.center(feat).geometry.coordinates; return c;} catch { return null; }})();
+      return {
+        id: feat.properties?.id,
+        name: editingStreetName || feat.properties?.name,
+        description: editingStreetDescription || feat.properties?.description,
+        useType: feat.properties?.useType,
+        lengthM: lenM,
+        lengthFt: (lenM != null) ? lenM * 3.28084 : null,
+        centroid,
+        streets: streetsNames
+      };
+    } catch { return null; }
+  }, [editingStreetSegmentId, savedStreetSegments, editingStreetName, editingStreetDescription]);
+  // When entering street geometry edit, seed temporary metadata fields
+  useEffect(()=>{
+    if (editingStreetSegmentId) {
+      const feat = savedStreetSegments.find(f=>f.properties?.id===editingStreetSegmentId);
+      setEditingStreetName(feat?.properties?.name || "");
+      setEditingStreetDescription(feat?.properties?.description || "");
+    } else {
+      setEditingStreetName("");
+      setEditingStreetDescription("");
+    }
+  }, [editingStreetSegmentId, savedStreetSegments]);
   // Performance samples for street path build (last N)
   const [streetPerfSamples, setStreetPerfSamples] = useState([]); // each: { total, featureQuery, graphBuild, pathSolve, renderUpdate, ts }
 
@@ -1406,6 +1446,10 @@ export default function App() {
       setEditingSavedIndex(null);
       setSummaryContext(null);
     }
+    // Abort any street editing session when switching to polygon editing
+    if (polygonSelected && editingStreetSegmentId) {
+      setEditingStreetSegmentId(null);
+    }
     // If switching away from street tool, cleanup points/line
     if (activeTool !== 'street') {
       setStartPoint(null);
@@ -2419,7 +2463,8 @@ export default function App() {
       streets = getStreetLineNames(m, lineFeature);
     } catch {}
     const baseProps = {
-      name: (pendingStreetName.trim() || `Segment ${savedStreetSegments.length + 1}`),
+      name: editingStreetSegmentId ? (editingStreetName.trim() || `Segment`) : (pendingStreetName.trim() || `Segment ${savedStreetSegments.length + 1}`),
+      description: editingStreetSegmentId ? (editingStreetDescription.trim() || null) : null,
       useType,
       lengthM: lenM,
       streets,
@@ -2450,6 +2495,31 @@ export default function App() {
     setEndPoint(null);
     setStreetPathLengthM(null);
     setPendingStreetName("");
+    setEditingStreetName("");
+    setEditingStreetDescription("");
+  }
+
+  // Cancel an in-progress street geometry edit without saving changes
+  function cancelStreetGeometryEdit() {
+    if (!editingStreetSegmentId) return;
+    // Clear editing flags & temporary metadata
+    setEditingStreetSegmentId(null);
+    setEditingStreetName("");
+    setEditingStreetDescription("");
+    // Remove transient path layers
+    if (map.current) {
+      const m = map.current;
+      ['selected-road-segment-layer','start-end-points-layer'].forEach(l=>{
+        if (m.getLayer(l)) { try { m.removeLayer(l); } catch {} }
+      });
+      ['selected-road-segment','start-end-points'].forEach(s=>{
+        if (m.getSource(s)) { try { m.removeSource(s); } catch {} }
+      });
+    }
+    // Clear ephemeral path state
+    setStartPoint(null);
+    setEndPoint(null);
+    setStreetPathLengthM(null);
   }
 
   // Dev-only validation harness for M3 path reliability
@@ -2555,21 +2625,7 @@ export default function App() {
     setSummaryContext(null);
   }
 
-  // Save as new even when editing an existing zone
-  function saveAsNewZone() {
-    const feature = makeFeatureFromDrawn();
-    if (!feature) return;
-    setSavedZones((prev) => [feature, ...prev]);
-    // Keep editing state off after saving as new
-    setShowSavePanel(false);
-    setPendingName("");
-    setPendingDescription("");
-  setActiveTool('none');
-    setDrawnCoords([]);
-    setZoneSummary(null);
-    setEditingSavedIndex(null);
-    setSummaryContext(null);
-  }
+  // Removed saveAsNewZone per updated UX (single save/update path only)
 
   // Cancel from the save panel
   function handleCancelSave() {
@@ -2774,7 +2830,8 @@ export default function App() {
     color: "#555",
   };
 
-  const showRightPanel = zoneSummary || savedZones.length > 0;
+  const showRightPanel = zoneSummary || savedZones.length > 0 || editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary || savedStreetSegments.length > 0;
+  const streetCreationLock = streetsActive && ephemeralStreetPathSummary && !editingStreetSegmentId; // restrict other UI while first street segment unsaved
   // Card style reused for summary panel (was referenced but not declared)
   const cardStyle = {
     background: '#ffffff',
@@ -2852,24 +2909,25 @@ export default function App() {
           </div>
         )}
         {streetsActive && (
-          <div style={{ display: 'grid', gap: '0.25rem' }}>
+          <div style={{ display: 'grid', gap: '0.25rem', opacity: streetCreationLock ? 0.45 : 1 }}>
     <div style={labelStyle}>Zone type</div>
             <div style={{ display: 'flex', gap: '0.5rem' }}>
               {['mixed-use','residential','commercial'].map(t => (
                 <button
                   key={t}
                   aria-label={`Set zone type ${t}`}
-                  onClick={() => setUseType(t)}
+                  onClick={() => { if (streetCreationLock) return; setUseType(t);} }
                   style={{
                     width: 30,
                     height: 30,
                     borderRadius: 6,
                     border: useType === t ? '2px solid #222' : '1px solid #bbb',
                     background: colorByUse[t],
-                    cursor: 'pointer',
+                    cursor: streetCreationLock ? 'not-allowed':'pointer',
                     boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
                   }}
                   title={t.replace('-', ' ')}
+                  disabled={streetCreationLock}
                 />
               ))}
             </div>
@@ -2883,7 +2941,7 @@ export default function App() {
         {/* ✅ Street selection controls now inside the panel */}
         {/* Street metrics shown only when Street tool active */}
     {streetsActive && (
-          <div className="street-metrics" id="street-metrics-panel" style={{ display: 'grid', gap: '0.25rem', minWidth: 160 }}>
+      <div className="street-metrics" id="street-metrics-panel" style={{ display: 'grid', gap: '0.25rem', minWidth: 160, opacity: streetCreationLock ? 0.4 : 1, pointerEvents: streetCreationLock ? 'none':'auto' }}>
             <div style={labelStyle} className="street-metrics__label">Street metrics</div>
       {streetPathLengthM != null && (
               <div className="street-metrics__length" style={{ fontSize: '0.7rem', color: '#444' }}>
@@ -2907,7 +2965,7 @@ export default function App() {
       </div>
 
       {/* Bottom-left basemap toggle */}
-      <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10 }}>
+  <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10, opacity: streetCreationLock ? 0.5 : 1, pointerEvents: streetCreationLock ? 'none':'auto' }}>
         <div className="basemap-toggle__options" style={{ display:'flex', gap:'0.4rem', background:'#ffffffd9', backdropFilter:'blur(4px)', padding:'0.4rem 0.6rem', borderRadius:8, boxShadow:'0 2px 8px rgba(0,0,0,0.15)' }} aria-label="Basemap style" role="radiogroup">
           {[
             { key:'streets', label:'Streets' },
@@ -2988,7 +3046,7 @@ export default function App() {
                 <ul style={{ paddingLeft: '1rem', fontSize: '.85rem', lineHeight: 1.5, margin: 0 }}>
                   <li>Click start, then end along roads to trace path.</li>
                   <li>Drag endpoints to refine alignment.</li>
-                  <li>Switch <strong>Zone type</strong> to recolor the segment.</li>
+                  <li>Switch <strong>Zone type</strong> to recolor the segment{streetCreationLock ? ' (locked until saved/cancelled)' : ''}.</li>
                   <li>Finalize & Save to persist the street segment.</li>
                 </ul>
               )}
@@ -3063,7 +3121,9 @@ export default function App() {
                   <h2 style={{ fontSize: '1.2rem', margin:0 }}>
                     {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
                   </h2>
-                  <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                  { (zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && (
+                    <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                  ) }
                 </div>
                 {zoneSummary && (
                   <div className="summary-card__zone">
@@ -3073,12 +3133,15 @@ export default function App() {
                     <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
                   </div>
                 )}
-                {(streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = streetSegmentSummary || ephemeralStreetPathSummary; return (
+                {(editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary; return (
                   <div className="summary-card__street">
                     <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {ss.name}</p>
                     <p style={{ marginBottom: '0.5rem' }}><strong>Type:</strong> {ss.useType}</p>
                     {ss.lengthM != null && (
-                      <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {ss.lengthM.toFixed(1)} m</p>
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {ss.lengthM.toFixed(1)} m{ss.lengthFt ? ` / ${ss.lengthFt.toFixed(1)} ft` : ''}</p>
+                    )}
+                    {ss.centroid && (
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Centroid:</strong> {ss.centroid[0].toFixed(6)}, {ss.centroid[1].toFixed(6)}</p>
                     )}
                     <p style={{ marginBottom: '0.5rem' }}><strong>Start:</strong> {ss.start[0].toFixed(6)}, {ss.start[1].toFixed(6)}</p>
                     <p style={{ marginBottom: ss.streets && ss.streets.length ? '0.5rem' : '1rem' }}><strong>End:</strong> {ss.end[0].toFixed(6)}, {ss.end[1].toFixed(6)}</p>
@@ -3089,6 +3152,9 @@ export default function App() {
                           {ss.streets.map((s,i)=>(<li key={i}>{s}</li>))}
                         </ul>
                       </div>
+                    )}
+                    {editingStreetSegmentSummary && (
+                      <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
                     )}
                   </div>
                 )})()}
@@ -3119,9 +3185,9 @@ export default function App() {
                     {!showSavePanel ? (
                       <button
                         onClick={finalizeCurrent}
-                        disabled={!(canFinalizePolygon || canFinalizeStreets)}
+                        disabled={!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)}
                         className="btn btn--finalize"
-                        style={{ ...(canFinalizePolygon || canFinalizeStreets ? buttonVariants.success : buttonVariants.success), opacity: (canFinalizePolygon || canFinalizeStreets) ? 1 : 0.6 }}
+                        style={{ ...(canFinalizePolygon || canFinalizeStreets ? buttonVariants.success : buttonVariants.success), opacity: (!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)) ? 0.5 : 1 }}
                       >Finalize & Save</button>
                     ) : (
                       <div style={{ display: "grid", gap: "0.5rem" }}>
@@ -3140,7 +3206,6 @@ export default function App() {
                             ))}
                           </div>
                           <button onClick={saveZone} className="btn btn--save" style={buttonVariants.success}>{editingSavedIndex != null ? 'Save changes' : 'Save'}</button>
-                          {editingSavedIndex != null && (<button onClick={saveAsNewZone} className="btn btn--save-new" style={buttonVariants.info}>Save as new</button>)}
                           <button onClick={handleCancelSave} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
                         </div>
                       </div>
@@ -3159,7 +3224,7 @@ export default function App() {
                       ))}
                     </div>
                     <div style={{ display:'flex', gap:'0.5rem', flexWrap:'wrap' }}>
-                      <button onClick={finalizeStreetSelection} className="btn btn--finalize" style={buttonVariants.success}>Finalize & Save</button>
+                      <button onClick={finalizeStreetSelection} disabled={!!editingStreetSegmentId} className="btn btn--finalize" style={{...buttonVariants.success, opacity: editingStreetSegmentId ? 0.5 : 1}}>Finalize & Save</button>
                       <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
                     </div>
                   </div>
@@ -3251,78 +3316,95 @@ export default function App() {
                             ""}
                         </div>
 
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "0.5rem",
-                            marginTop: 6,
-                          }}
-                        >
-                          <label htmlFor={`zone-${idx}-useType`} style={{ fontSize: "0.75rem", fontWeight:600, color:'#555' }}>Type</label>
-                          <select
-                            id={`zone-${idx}-useType`}
-                            name="zoneUseType"
-                            value={f.properties?.useType || "mixed-use"}
-                            onChange={(e) => updateSavedUseType(idx, e.target.value)}
-                            style={selectStyle}
+                        {!isEditingSaved && (
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "0.5rem",
+                              marginTop: 6,
+                            }}
                           >
-                            <option value="mixed-use">Mixed Use</option>
-                            <option value="residential">Residential</option>
-                            <option value="commercial">Commercial</option>
-                          </select>
-                          {/* removed inner swatch to avoid duplication; header shows swatch */}
-                        </div>
+                            <label htmlFor={`zone-${idx}-useType`} style={{ fontSize: "0.75rem", fontWeight:600, color:'#555' }}>Type</label>
+                            <select
+                              id={`zone-${idx}-useType`}
+                              name="zoneUseType"
+                              value={f.properties?.useType || "mixed-use"}
+                              onChange={(e) => updateSavedUseType(idx, e.target.value)}
+                              style={selectStyle}
+                            >
+                              <option value="mixed-use">Mixed Use</option>
+                              <option value="residential">Residential</option>
+                              <option value="commercial">Commercial</option>
+                            </select>
+                          </div>
+                        )}
 
-                        <div
-                          style={{
-                            display: "flex",
-                            gap: "0.5rem",
-                            marginTop: 6,
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <button
-                            disabled={isEditingSaved}
-                            onClick={() => {
-                              if (isEditingSaved) return;
-                              if (selectedSavedIndex === idx) {
-                                setSelectedSavedIndex(null);
-                                applySelectedFilter(map.current, null);
-                              } else {
-                                setSelectedSavedIndex(idx);
-                                applySelectedFilter(map.current, idx);
-                                flyToSaved(f);
-                              }
+                        {!isEditingSaved && (
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: "0.5rem",
+                              marginTop: 6,
+                              flexWrap: "wrap",
                             }}
-                            className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
-                            title={isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
-                            style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: isEditingSaved ? 0.6 : 1, cursor: isEditingSaved ? 'not-allowed':'pointer' }}
-                          >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
+                          >
+                            <button
+                              disabled={isEditingSaved}
+                              onClick={() => {
+                                if (isEditingSaved) return;
+                                if (selectedSavedIndex === idx) {
+                                  setSelectedSavedIndex(null);
+                                  applySelectedFilter(map.current, null);
+                                } else {
+                                  setSelectedSavedIndex(idx);
+                                  applySelectedFilter(map.current, idx);
+                                  flyToSaved(f);
+                                }
+                              }}
+                              className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
+                              title={isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
+                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: isEditingSaved ? 0.6 : 1, cursor: isEditingSaved ? 'not-allowed':'pointer' }}
+                            >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
 
-                          <button
-                            disabled={isEditingSaved && editingSavedIndex !== idx}
-                            onClick={() => {
-                              if (isEditingSaved && editingSavedIndex !== idx) return;
-                              loadSavedIntoDraw(idx, true);
-                            }}
-                            className={`btn btn--edit ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
-                            title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Edit geometry'}
-                            style={{ ...(isEditingSaved && editingSavedIndex === idx ? buttonVariants.warning : buttonVariants.info), opacity: isEditingSaved && editingSavedIndex !== idx ? 0.6 : 1, cursor: isEditingSaved && editingSavedIndex !== idx ? 'not-allowed':'pointer' }}
-                          >{isEditingSaved && editingSavedIndex === idx ? 'Editing…' : 'Edit geometry'}</button>
+                            <button
+                              disabled={isEditingSaved && editingSavedIndex !== idx}
+                              onClick={() => {
+                                if (isEditingSaved && editingSavedIndex !== idx) return;
+                                loadSavedIntoDraw(idx, true);
+                              }}
+                              className={`btn btn--edit ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
+                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Edit geometry'}
+                              style={{ ...(isEditingSaved && editingSavedIndex === idx ? buttonVariants.warning : buttonVariants.muted), opacity: isEditingSaved && editingSavedIndex !== idx ? 0.6 : 1, cursor: isEditingSaved && editingSavedIndex !== idx ? 'not-allowed':'pointer' }}
+                            >{isEditingSaved && editingSavedIndex === idx ? 'Editing…' : 'Edit geometry'}</button>
 
-                          <button
-                            disabled={isEditingSaved && editingSavedIndex !== idx}
-                            onClick={() => deleteSaved(idx)}
-                            className={`btn btn--delete ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
-                            title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Delete'}
-                            style={{ ...buttonVariants.danger, opacity: isEditingSaved && editingSavedIndex !== idx ? 0.6 : 1, cursor: isEditingSaved && editingSavedIndex !== idx ? 'not-allowed':'pointer' }}
-                          >Delete</button>
-                        </div>
+                            <button
+                              disabled={isEditingSaved && editingSavedIndex !== idx}
+                              onClick={() => deleteSaved(idx)}
+                              className={`btn btn--delete ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
+                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Delete'}
+                              style={{ ...buttonVariants.danger, opacity: isEditingSaved && editingSavedIndex !== idx ? 0.6 : 1, cursor: isEditingSaved && editingSavedIndex !== idx ? 'not-allowed':'pointer' }}
+                            >Delete</button>
+                          </div>
+                        )}
                       </li>
                     );})}
                   </ul>
                 </div>
+              </div>
+            )}
+
+            {editingStreetSegmentId && (
+              <div style={{
+                background: '#fff3cd',
+                border: '1px solid #ffeeba',
+                color: '#856404',
+                padding: '0.5rem',
+                borderRadius: 6,
+                margin: '0.5rem 0',
+                fontSize: '0.8rem'
+              }}>
+                You're editing a street. Finish or cancel to select or edit a different one.
               </div>
             )}
 
@@ -3340,6 +3422,7 @@ export default function App() {
                       const sel = selectedStreetSegmentIndex === idx;
                       const segId = f.properties?.id;
                       const editingThis = editingStreetSegmentId && editingStreetSegmentId === segId;
+                      const editingActive = !!editingStreetSegmentId || editingSavedIndex != null; // any geometry edit in progress
                       return (
                         <li key={idx} className={`list-item street-item ${sel ? 'is-selected' : ''}`} style={{
                           background: '#fff',
@@ -3352,25 +3435,7 @@ export default function App() {
                         }}>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                             <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
-                              {editingThis ? (
-                                <input
-                                  style={{ fontSize: '0.8rem', padding: '2px 4px' }}
-                                  defaultValue={f.properties?.name || ''}
-                                  onKeyDown={e => {
-                                    if (e.key === 'Enter') {
-                                      const val = e.currentTarget.value.trim();
-                                      if (val) {
-                                        setSavedStreetSegments(prev => prev.map(sf => sf.properties?.id === segId ? { ...sf, properties: { ...sf.properties, name: val, updatedAt: Date.now() } } : sf));
-                                        setEditingStreetSegmentId(null);
-                                      }
-                                    } else if (e.key === 'Escape') {
-                                      setEditingStreetSegmentId(null);
-                                    }
-                                  }}
-                                />
-                              ) : (
-                                <span onDoubleClick={()=> setEditingStreetSegmentId(segId)} title="Double-click to rename">{f.properties?.name || `Segment ${idx + 1}`}</span>
-                              )}
+                              <span>{f.properties?.name || `Segment ${idx + 1}`}</span>
                               {sel ? ' • selected' : ''}
                             </div>
                             <span style={{ width: 12, height: 12, borderRadius: 3, background: colorByUse[f.properties?.useType || 'mixed-use'], border: '1px solid #ccc' }} />
@@ -3389,73 +3454,121 @@ export default function App() {
                               }}
                               style={selectStyle}
                             >
-                              {Object.keys(colorByUse).map(t => <option key={t} value={t}>{t}</option>)}
+                              {Object.keys(colorByUse).map(t => {
+                                const labelMap = {
+                                  'mixed-use': 'Mixed Use',
+                                  'residential': 'Residential',
+                                  'commercial': 'Commercial'
+                                };
+                                return <option key={t} value={t}>{labelMap[t] || t}</option>;
+                              })}
                             </select>
                           </div>
-                          <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-                            <button
-                              onClick={() => {
-                                if (sel) {
-                                  setSelectedStreetSegmentIndex(null);
-                                  if (map.current) {
-                                    try { map.current.setFilter('saved-street-segments-selected', null); } catch {}
-                                  }
-                                } else {
-                                  setSelectedStreetSegmentIndex(idx);
-                                  if (map.current) {
-                                    const m = map.current;
-                                    const filt = ['==',['get','__sid'], idx];
-                                    try { m.setFilter('saved-street-segments-selected', filt); } catch {}
-                                    try {
-                                      const bb = turf.bbox(f);
-                                      m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
-                                    } catch {}
-                                  }
-                                }
-                              }}
-                              className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
-                              style={sel ? buttonVariants.success : buttonVariants.info}
-                            >{sel ? 'Deselect' : 'Select'}</button>
-                            <button
-                              title={editingThis ? 'Commit updated geometry by re-finalizing' : 'Load geometry for edit'}
-                              onClick={() => {
-                                // Start geometry re-edit: set endpoints from first & last coordinate and mark editingStreetSegmentId
-                                try {
-                                  const coords = f.geometry?.coordinates;
-                                  if (Array.isArray(coords) && coords.length >= 2) {
-                                    setStartPoint(coords[0]);
-                                    setEndPoint(coords[coords.length -1]);
-                                    setEditingStreetSegmentId(segId);
-                                    setStreetPathLengthM(f.properties?.lengthM || null);
-                                    setActiveTool('street');
-                                    // force recompute to show path
-                                    if (recomputeStreetPathRef.current) setTimeout(()=>recomputeStreetPathRef.current(),0);
-                                  }
-                                } catch {}
-                              }}
-                              className={`btn ${editingThis ? 'btn--editing' : 'btn--edit'}`}
-                              style={editingThis ? buttonVariants.warning : buttonVariants.muted}
-                            >{editingThis ? 'Editing…' : 'Edit geometry'}</button>
-                            {editingThis && (
+                          {editingThis && (
+                            <div style={{ display:'grid', gap:'0.35rem', marginTop:2 }}>
+                              <label htmlFor={`street-${idx}-name`} style={{ fontSize:'0.7rem', fontWeight:600 }}>Name</label>
+                              <input
+                                id={`street-${idx}-name`}
+                                name="streetName"
+                                value={editingStreetName}
+                                onChange={e=> setEditingStreetName(e.target.value)}
+                                placeholder="Segment Name"
+                                style={{ padding:'0.35rem 0.5rem', fontSize:'0.75rem', border:'1px solid #ccc', borderRadius:4 }}
+                              />
+                              <label htmlFor={`street-${idx}-desc`} style={{ fontSize:'0.7rem', fontWeight:600 }}>Description</label>
+                              <textarea
+                                id={`street-${idx}-desc`}
+                                name="streetDescription"
+                                value={editingStreetDescription || ''}
+                                onChange={e=> setEditingStreetDescription(e.target.value)}
+                                placeholder="Optional description"
+                                rows={2}
+                                style={{ resize:'vertical', padding:'0.4rem 0.5rem', fontSize:'0.7rem', border:'1px solid #ccc', borderRadius:4 }}
+                              />
+                            </div>
+                          )}
+                          <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', marginTop: editingThis ? 4 : 0 }}>
+                            {!editingStreetSegmentId && (
                               <button
-                                title="Save changes"
+                                disabled={editingActive && !editingThis}
                                 onClick={() => {
-                                  // finalizeStreetSelection will detect editingStreetSegmentId and update
-                                  finalizeStreetSelection();
+                                  if (sel) {
+                                    setSelectedStreetSegmentIndex(null);
+                                    if (map.current) {
+                                      try { map.current.setFilter('saved-street-segments-selected', null); } catch {}
+                                    }
+                                  } else {
+                                    setSelectedStreetSegmentIndex(idx);
+                                    if (map.current) {
+                                      const m = map.current;
+                                      const filt = ['==',['get','__sid'], idx];
+                                      try { m.setFilter('saved-street-segments-selected', filt); } catch {}
+                                      try {
+                                        const bb = turf.bbox(f);
+                                        m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                      } catch {}
+                                    }
+                                  }
                                 }}
-                                className="btn btn--save-changes"
-                                style={buttonVariants.success}
-                              >Save changes</button>
+                                className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
+                                style={{...(sel ? buttonVariants.success : buttonVariants.info), opacity: (editingActive && !editingThis) ? 0.5 : 1, cursor: (editingActive && !editingThis) ? 'not-allowed':'pointer'}}
+                              >{sel ? 'Deselect' : 'Select'}</button>
                             )}
-                            <button
-                              onClick={() => {
-                                setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
-                                if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
-                                if (editingStreetSegmentId === segId) setEditingStreetSegmentId(null);
-                              }}
-                              className="btn btn--delete"
-                              style={buttonVariants.danger}
-                            >Delete</button>
+                            {editingThis ? (
+                              <>
+                                <button
+                                  title="Save changes"
+                                  onClick={() => finalizeStreetSelection() }
+                                  className="btn btn--save-changes"
+                                  style={buttonVariants.success}
+                                >Save changes</button>
+                                <button
+                                  title="Cancel editing"
+                                  onClick={cancelStreetGeometryEdit}
+                                  className="btn btn--cancel-edit"
+                                  style={buttonVariants.outline}
+                                >Cancel</button>
+                              </>
+                            ) : (
+                              <button
+                                title='Edit geometry'
+                                disabled={editingActive}
+                                onClick={() => {
+                                  try {
+                                    const coords = f.geometry?.coordinates;
+                                    if (Array.isArray(coords) && coords.length >= 2) {
+                                      setStartPoint(coords[0]);
+                                      setEndPoint(coords[coords.length -1]);
+                                      setEditingStreetSegmentId(segId);
+                                      setStreetPathLengthM(f.properties?.lengthM || null);
+                                      setActiveTool('street');
+                                      if (recomputeStreetPathRef.current) setTimeout(()=>recomputeStreetPathRef.current(),0);
+                                      // Fly to segment
+                                      if (map.current) {
+                                        try {
+                                          const bb = turf.bbox(f);
+                                          map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                        } catch {}
+                                      }
+                                    }
+                                  } catch {}
+                                }}
+                                className='btn btn--edit'
+                                style={{...buttonVariants.muted, opacity: editingActive ? 0.5 : 1, cursor: editingActive ? 'not-allowed':'pointer'}}
+                              >Edit geometry</button>
+                            )}
+                            {!editingThis && !editingStreetSegmentId && (
+                              <button
+                                disabled={editingActive}
+                                onClick={() => {
+                                  setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
+                                  if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
+                                  if (editingStreetSegmentId === segId) setEditingStreetSegmentId(null);
+                                }}
+                                className="btn btn--delete"
+                                style={{...buttonVariants.danger, opacity: editingActive ? 0.5 : 1, cursor: editingActive ? 'not-allowed':'pointer'}}
+                              >Delete</button>
+                            )}
                           </div>
                         </li>
                       );
