@@ -3259,12 +3259,12 @@ export default function App() {
                             marginTop: 6,
                           }}
                         >
-                          <span style={{ fontSize: "0.75rem", fontWeight:600, color:'#555' }}>Type</span>
+                          <label htmlFor={`zone-${idx}-useType`} style={{ fontSize: "0.75rem", fontWeight:600, color:'#555' }}>Type</label>
                           <select
+                            id={`zone-${idx}-useType`}
+                            name="zoneUseType"
                             value={f.properties?.useType || "mixed-use"}
-                            onChange={(e) =>
-                              updateSavedUseType(idx, e.target.value)
-                            }
+                            onChange={(e) => updateSavedUseType(idx, e.target.value)}
                             style={selectStyle}
                           >
                             <option value="mixed-use">Mixed Use</option>
@@ -3378,14 +3378,16 @@ export default function App() {
                           <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
                           <div style={{ fontSize: '0.65rem', color: '#777' }}>ID: {segId?.slice(0,10)}</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                            <label style={{ fontSize: '0.75rem', fontWeight:600 }}>Type:</label>
+                            <label htmlFor={`street-${idx}-useType`} style={{ fontSize: '0.75rem', fontWeight:600 }}>Type:</label>
                             <select
+                              id={`street-${idx}-useType`}
+                              name="streetUseType"
                               value={f.properties?.useType || 'mixed-use'}
                               onChange={e => {
                                 const newType = e.target.value;
                                 setSavedStreetSegments(prev => prev.map(sf => sf.properties?.id === segId ? { ...sf, properties: { ...sf.properties, useType: newType, updatedAt: Date.now() } } : sf));
                               }}
-                              style={{ fontSize: '0.65rem' }}
+                              style={selectStyle}
                             >
                               {Object.keys(colorByUse).map(t => <option key={t} value={t}>{t}</option>)}
                             </select>
