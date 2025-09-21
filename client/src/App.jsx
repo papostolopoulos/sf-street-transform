@@ -2,6 +2,9 @@ const MAPTILER_KEY = "DyVFUZmyKdCywxRTVU9B";
 import React, { useState, useRef, useEffect } from "react";
 import * as turf from "@turf/turf";
 import maplibregl from "maplibre-gl";
+import EditForm from './components/EditForm.jsx';
+import { colorByUse as themeColorByUse } from './theme.js';
+
 // Simple id generator (not crypto strong but stable enough for local features)
 function genId() {
   return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,9);
@@ -1753,6 +1756,7 @@ export default function App() {
           if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
           if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
           if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
+
           if (m.getSource('start-end-points')) m.removeSource('start-end-points');
         }
         setStartPoint(snapped);
@@ -2410,8 +2414,7 @@ export default function App() {
     setEditingSavedIndex(null);
     setEditingStreetSegmentId(null);
     setZoneSummary(null);
-    setStreetSegmentSummary(null);
-    setEphemeralStreetPathSummary(null);
+    // streetSegmentSummary & ephemeralStreetPathSummary are derived via useMemo, so clearing source state is enough
     setDrawMode(null);
     setStartPoint(null);
     setEndPoint(null);
@@ -2708,7 +2711,7 @@ export default function App() {
           const poly = turf.polygon([ring], {
             useType: f.properties?.useType || useType,
           });
-          const streets = getIntersectingStreetNames(m, poly);
+          const streets = getStreetIntersectingNames(m, poly);
           setZoneSummary((s) => (s ? { ...s, streets } : s));
         } catch {}
       };
@@ -2832,6 +2835,14 @@ export default function App() {
 
   const showRightPanel = zoneSummary || savedZones.length > 0 || editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary || savedStreetSegments.length > 0;
   const streetCreationLock = streetsActive && ephemeralStreetPathSummary && !editingStreetSegmentId; // restrict other UI while first street segment unsaved
+  // New polygon creation lock (when drawing a brand new zone, not editing an existing one, and before showing save panel)
+  const polygonCreationLock = polygonActive && zoneSummary && summaryContext === 'draw' && editingSavedIndex == null && !showSavePanel;
+  // Unified lock for any new unsaved geometry (polygon or street)
+  const creationLock = streetCreationLock || polygonCreationLock;
+  // Additional lock when editing an existing street segment
+  const editingStreetLock = !!editingStreetSegmentId;
+  // Overarching UI lock used to disable selection/edit/delete elsewhere, but NOT the active editing form itself
+  const uiLock = creationLock || (editingStreetLock && !editingStreetSegmentSummary ? true : creationLock);
   // Card style reused for summary panel (was referenced but not declared)
   const cardStyle = {
     background: '#ffffff',
@@ -2870,69 +2881,24 @@ export default function App() {
                   key={btn.key}
                   role="radio"
                   aria-checked={active}
-                  onClick={() => setActiveTool(btn.key)}
+                  disabled={creationLock}
+                  onClick={() => { if (creationLock) return; setActiveTool(btn.key); }}
                   style={{
                     ...buttonStyle,
                     backgroundColor: active ? '#007bff' : '#e2e6ea',
                     color: active ? '#fff' : '#222',
                     fontWeight: active ? 600 : 500,
                     padding: '0.4rem 0.65rem',
-                    minWidth: 62
+                    minWidth: 62,
+                    opacity: creationLock ? 0.5 : 1,
+                    cursor: creationLock ? 'not-allowed':'pointer'
                   }}
                 >{btn.label}</button>
               );
             })}
           </div>
         </div>
-        {polygonActive && (
-          <div style={{ display: 'grid', gap: '0.25rem' }}>
-            <div style={labelStyle}>Zone type</div>
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              {['mixed-use','residential','commercial'].map(t => (
-                <button
-                  key={t}
-                  aria-label={`Set zone type ${t}`}
-                  onClick={() => setUseType(t)}
-                  style={{
-                    width: 34,
-                    height: 34,
-                    borderRadius: 6,
-                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
-                    background: colorByUse[t],
-                    cursor: 'pointer',
-                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
-                  }}
-                  title={t.replace('-', ' ')}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-        {streetsActive && (
-          <div style={{ display: 'grid', gap: '0.25rem', opacity: streetCreationLock ? 0.45 : 1 }}>
-    <div style={labelStyle}>Zone type</div>
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              {['mixed-use','residential','commercial'].map(t => (
-                <button
-                  key={t}
-                  aria-label={`Set zone type ${t}`}
-                  onClick={() => { if (streetCreationLock) return; setUseType(t);} }
-                  style={{
-                    width: 30,
-                    height: 30,
-                    borderRadius: 6,
-                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
-                    background: colorByUse[t],
-                    cursor: streetCreationLock ? 'not-allowed':'pointer',
-                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
-                  }}
-                  title={t.replace('-', ' ')}
-                  disabled={streetCreationLock}
-                />
-              ))}
-            </div>
-          </div>
-        )}
+        {/* Removed global Zone type pickers; now shown contextually in save/finalize panels only */}
 
   {/* Basemap control removed from primary drawing panel (relocated bottom-left) */}
 
@@ -2941,7 +2907,7 @@ export default function App() {
         {/* ✅ Street selection controls now inside the panel */}
         {/* Street metrics shown only when Street tool active */}
     {streetsActive && (
-      <div className="street-metrics" id="street-metrics-panel" style={{ display: 'grid', gap: '0.25rem', minWidth: 160, opacity: streetCreationLock ? 0.4 : 1, pointerEvents: streetCreationLock ? 'none':'auto' }}>
+      <div className="street-metrics" id="street-metrics-panel" style={{ display: 'grid', gap: '0.25rem', minWidth: 160, opacity: (streetCreationLock || polygonCreationLock) ? 0.4 : 1, pointerEvents: (streetCreationLock || polygonCreationLock) ? 'none':'auto' }}>
             <div style={labelStyle} className="street-metrics__label">Street metrics</div>
       {streetPathLengthM != null && (
               <div className="street-metrics__length" style={{ fontSize: '0.7rem', color: '#444' }}>
@@ -2965,7 +2931,7 @@ export default function App() {
       </div>
 
       {/* Bottom-left basemap toggle */}
-  <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10, opacity: streetCreationLock ? 0.5 : 1, pointerEvents: streetCreationLock ? 'none':'auto' }}>
+  <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10, opacity: (streetCreationLock || polygonCreationLock) ? 0.5 : 1, pointerEvents: (streetCreationLock || polygonCreationLock) ? 'none':'auto' }}>
         <div className="basemap-toggle__options" style={{ display:'flex', gap:'0.4rem', background:'#ffffffd9', backdropFilter:'blur(4px)', padding:'0.4rem 0.6rem', borderRadius:8, boxShadow:'0 2px 8px rgba(0,0,0,0.15)' }} aria-label="Basemap style" role="radiogroup">
           {[
             { key:'streets', label:'Streets' },
@@ -3117,16 +3083,12 @@ export default function App() {
             />
             {(zoneSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (
               <div style={cardStyle} className="summary-card" id="summary-card">
-                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'0.75rem', borderBottom:'2px solid #eee', paddingBottom:'0.5rem', gap:'0.5rem' }}>
-                  <h2 style={{ fontSize: '1.2rem', margin:0 }}>
-                    {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
-                  </h2>
-                  { (zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && (
+                  { (zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && !polygonCreationLock && !(showSavePanel && polygonActive && editingSavedIndex == null) && !(showSavePanel && polygonActive && editingSavedIndex != null) && (
                     <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
                   ) }
                 </div>
                 {zoneSummary && (
-                  <div className="summary-card__zone">
+                  <div className="summary-card__zone" style={polygonCreationLock ? { pointerEvents:'auto' } : {}}>
                     <p style={{ marginBottom: "0.5rem" }}><strong>Name:</strong> {displayName}</p>
                     <p style={{ marginBottom: "0.5rem" }}><strong>Type:</strong> {zoneSummary.useType}</p>
                     <p style={{ marginBottom: "0.5rem" }}><strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² / {zoneSummary.areaFt2.toFixed(2)} ft²</p>
@@ -3156,6 +3118,25 @@ export default function App() {
                     {editingStreetSegmentSummary && (
                       <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
                     )}
+                    {editingStreetSegmentId && editingStreetSegmentSummary && (
+                      <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>
+                        <EditForm
+                          mode="street"
+                          name={editingStreetName}
+                          description={editingStreetDescription}
+                          useType={useType}
+                          onNameChange={setEditingStreetName}
+                          onDescriptionChange={setEditingStreetDescription}
+                          onTypeChange={setUseType}
+                          onCancel={cancelStreetGeometryEdit}
+                          onSave={finalizeStreetSelection}
+                          savingLabel="Save changes"
+                          note={<div style={{ fontSize:'0.65rem', color:'#555' }}>Editing saved street segment</div>}
+                          colorByUse={colorByUse}
+                          buttonVariants={buttonVariants}
+                        />
+                      </div>
+                    )}
                   </div>
                 )})()}
                 {zoneSummary && zoneSummary.address && (
@@ -3183,32 +3164,33 @@ export default function App() {
                 {(zoneSummary && (summaryContext === "draw" || editingSavedIndex != null)) && (
                   <div style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid #eee" }}>
                     {!showSavePanel ? (
-                      <button
-                        onClick={finalizeCurrent}
-                        disabled={!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)}
-                        className="btn btn--finalize"
-                        style={{ ...(canFinalizePolygon || canFinalizeStreets ? buttonVariants.success : buttonVariants.success), opacity: (!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)) ? 0.5 : 1 }}
-                      >Finalize & Save</button>
-                    ) : (
-                      <div style={{ display: "grid", gap: "0.5rem" }}>
-                        {editingSavedIndex != null && (
-                          <div style={{ fontSize: "0.85rem", color: "#555" }}>Editing saved zone #{editingSavedIndex + 1}</div>
+                      <div style={{ display:'flex', gap:'0.5rem', flexWrap:'wrap' }}>
+                        <button
+                          onClick={finalizeCurrent}
+                          disabled={!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)}
+                          className="btn btn--finalize"
+                          style={{ ...(canFinalizePolygon || canFinalizeStreets ? buttonVariants.success : buttonVariants.success), opacity: (!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)) ? 0.5 : 1 }}
+                        >Finalize & Save</button>
+                        {polygonCreationLock && (
+                          <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
                         )}
-                        <label htmlFor="zone-name" style={{ fontSize: "0.85rem" }}>Name</label>
-                        <input id="zone-name" name="zoneName" value={pendingName} onChange={e=>setPendingName(e.target.value)} placeholder="Custom Zone" style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6 }} />
-                        <label htmlFor="zone-description" style={{ fontSize: "0.85rem" }}>Description</label>
-                        <textarea id="zone-description" name="zoneDescription" value={pendingDescription} onChange={e=>setPendingDescription(e.target.value)} rows={3} placeholder="Notes, purpose, constraints" style={{ padding: "0.5rem", border: "1px solid #ccc", borderRadius: 6 }} />
-                        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                            <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>Type:</span>
-                            {['mixed-use','residential','commercial'].map(t => (
-                              <button key={t} onClick={()=>setUseType(t)} title={t} aria-label={`Set type ${t}`} style={{ width: 28, height: 28, borderRadius: 6, border: useType === t ? '2px solid #222' : '1px solid #bbb', background: colorByUse[t], cursor: 'pointer', boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none' }} />
-                            ))}
-                          </div>
-                          <button onClick={saveZone} className="btn btn--save" style={buttonVariants.success}>{editingSavedIndex != null ? 'Save changes' : 'Save'}</button>
-                          <button onClick={handleCancelSave} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
-                        </div>
                       </div>
+                    ) : (
+                      <EditForm
+                        mode="zone"
+                        name={pendingName}
+                        description={pendingDescription}
+                        useType={useType}
+                        onNameChange={setPendingName}
+                        onDescriptionChange={setPendingDescription}
+                        onTypeChange={setUseType}
+                        onCancel={handleCancelSave}
+                        onSave={saveZone}
+                        savingLabel={editingSavedIndex != null ? 'Save changes' : 'Save'}
+                        note={editingSavedIndex != null ? (<div style={{ fontSize:'0.75rem', color:'#555' }}>Editing saved zone #{editingSavedIndex + 1}</div>) : null}
+                        colorByUse={colorByUse}
+                        buttonVariants={buttonVariants}
+                      />
                     )}
                   </div>
                 )}
@@ -3236,7 +3218,8 @@ export default function App() {
 
             {/* Saved zones list */}
             {savedZones.length > 0 && (
-              <div style={{ marginTop: zoneSummary ? "1rem" : 0 }}>
+              <div style={{ marginTop: zoneSummary ? "1rem" : 0, opacity: uiLock ? 0.45 : 1, pointerEvents: uiLock ? 'none':'auto' }} aria-disabled={uiLock}
+              >
                 {/* Saved Zones "card" with a distinct background */}
                 <div
                   style={{
@@ -3316,29 +3299,7 @@ export default function App() {
                             ""}
                         </div>
 
-                        {!isEditingSaved && (
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: "0.5rem",
-                              marginTop: 6,
-                            }}
-                          >
-                            <label htmlFor={`zone-${idx}-useType`} style={{ fontSize: "0.75rem", fontWeight:600, color:'#555' }}>Type</label>
-                            <select
-                              id={`zone-${idx}-useType`}
-                              name="zoneUseType"
-                              value={f.properties?.useType || "mixed-use"}
-                              onChange={(e) => updateSavedUseType(idx, e.target.value)}
-                              style={selectStyle}
-                            >
-                              <option value="mixed-use">Mixed Use</option>
-                              <option value="residential">Residential</option>
-                              <option value="commercial">Commercial</option>
-                            </select>
-                          </div>
-                        )}
+                        {/* Removed per-zone inline type select to simplify UI */}
 
                         {!isEditingSaved && (
                           <div
@@ -3350,9 +3311,9 @@ export default function App() {
                             }}
                           >
                             <button
-                              disabled={isEditingSaved}
+                              disabled={isEditingSaved || creationLock}
                               onClick={() => {
-                                if (isEditingSaved) return;
+                                if (isEditingSaved || creationLock) return;
                                 if (selectedSavedIndex === idx) {
                                   setSelectedSavedIndex(null);
                                   applySelectedFilter(map.current, null);
@@ -3364,26 +3325,26 @@ export default function App() {
                               }}
                               className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
                               title={isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
-                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: isEditingSaved ? 0.6 : 1, cursor: isEditingSaved ? 'not-allowed':'pointer' }}
+                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: (isEditingSaved || creationLock) ? 0.6 : 1, cursor: (isEditingSaved || creationLock) ? 'not-allowed':'pointer' }}
                             >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
 
                             <button
-                              disabled={isEditingSaved && editingSavedIndex !== idx}
+                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
                               onClick={() => {
-                                if (isEditingSaved && editingSavedIndex !== idx) return;
+                                if ((isEditingSaved && editingSavedIndex !== idx) || creationLock) return;
                                 loadSavedIntoDraw(idx, true);
                               }}
                               className={`btn btn--edit ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
                               title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Edit geometry'}
-                              style={{ ...(isEditingSaved && editingSavedIndex === idx ? buttonVariants.warning : buttonVariants.muted), opacity: isEditingSaved && editingSavedIndex !== idx ? 0.6 : 1, cursor: isEditingSaved && editingSavedIndex !== idx ? 'not-allowed':'pointer' }}
+                              style={{ ...(isEditingSaved && editingSavedIndex === idx ? buttonVariants.warning : buttonVariants.muted), opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
                             >{isEditingSaved && editingSavedIndex === idx ? 'Editing…' : 'Edit geometry'}</button>
 
                             <button
-                              disabled={isEditingSaved && editingSavedIndex !== idx}
+                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
                               onClick={() => deleteSaved(idx)}
                               className={`btn btn--delete ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
                               title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Delete'}
-                              style={{ ...buttonVariants.danger, opacity: isEditingSaved && editingSavedIndex !== idx ? 0.6 : 1, cursor: isEditingSaved && editingSavedIndex !== idx ? 'not-allowed':'pointer' }}
+                              style={{ ...buttonVariants.danger, opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
                             >Delete</button>
                           </div>
                         )}
@@ -3409,7 +3370,7 @@ export default function App() {
             )}
 
             {savedStreetSegments.length > 0 && (
-              <div style={{ marginTop: '1rem' }}>
+              <div style={{ marginTop: '1rem', opacity: uiLock ? 0.45 : 1, pointerEvents: uiLock ? 'none':'auto' }} aria-disabled={uiLock}>
                 <div style={{
                   background: '#f6fff7',
                   border: '1px solid #cde9d6',
@@ -3423,6 +3384,9 @@ export default function App() {
                       const segId = f.properties?.id;
                       const editingThis = editingStreetSegmentId && editingStreetSegmentId === segId;
                       const editingActive = !!editingStreetSegmentId || editingSavedIndex != null; // any geometry edit in progress
+                      // Disable interactions with saved segments while a new unsaved geometry (street or polygon) is being created
+                      const savedActionsLocked = creationLock || (editingActive && !editingThis);
+                      const anyEditLock = editingActive || creationLock; // unified lock for edit buttons
                       return (
                         <li key={idx} className={`list-item street-item ${sel ? 'is-selected' : ''}`} style={{
                           background: '#fff',
@@ -3442,56 +3406,16 @@ export default function App() {
                           </div>
                           <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
                           <div style={{ fontSize: '0.65rem', color: '#777' }}>ID: {segId?.slice(0,10)}</div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                            <label htmlFor={`street-${idx}-useType`} style={{ fontSize: '0.75rem', fontWeight:600 }}>Type:</label>
-                            <select
-                              id={`street-${idx}-useType`}
-                              name="streetUseType"
-                              value={f.properties?.useType || 'mixed-use'}
-                              onChange={e => {
-                                const newType = e.target.value;
-                                setSavedStreetSegments(prev => prev.map(sf => sf.properties?.id === segId ? { ...sf, properties: { ...sf.properties, useType: newType, updatedAt: Date.now() } } : sf));
-                              }}
-                              style={selectStyle}
-                            >
-                              {Object.keys(colorByUse).map(t => {
-                                const labelMap = {
-                                  'mixed-use': 'Mixed Use',
-                                  'residential': 'Residential',
-                                  'commercial': 'Commercial'
-                                };
-                                return <option key={t} value={t}>{labelMap[t] || t}</option>;
-                              })}
-                            </select>
-                          </div>
+                          {/* Removed per-street inline type select (editing block now owns type changes) */}
                           {editingThis && (
-                            <div style={{ display:'grid', gap:'0.35rem', marginTop:2 }}>
-                              <label htmlFor={`street-${idx}-name`} style={{ fontSize:'0.7rem', fontWeight:600 }}>Name</label>
-                              <input
-                                id={`street-${idx}-name`}
-                                name="streetName"
-                                value={editingStreetName}
-                                onChange={e=> setEditingStreetName(e.target.value)}
-                                placeholder="Segment Name"
-                                style={{ padding:'0.35rem 0.5rem', fontSize:'0.75rem', border:'1px solid #ccc', borderRadius:4 }}
-                              />
-                              <label htmlFor={`street-${idx}-desc`} style={{ fontSize:'0.7rem', fontWeight:600 }}>Description</label>
-                              <textarea
-                                id={`street-${idx}-desc`}
-                                name="streetDescription"
-                                value={editingStreetDescription || ''}
-                                onChange={e=> setEditingStreetDescription(e.target.value)}
-                                placeholder="Optional description"
-                                rows={2}
-                                style={{ resize:'vertical', padding:'0.4rem 0.5rem', fontSize:'0.7rem', border:'1px solid #ccc', borderRadius:4 }}
-                              />
-                            </div>
+                            <div style={{ fontSize:'0.65rem', color:'#555' }}>Editing form shown above.</div>
                           )}
                           <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', marginTop: editingThis ? 4 : 0 }}>
                             {!editingStreetSegmentId && (
                               <button
-                                disabled={editingActive && !editingThis}
+                                disabled={savedActionsLocked}
                                 onClick={() => {
+                                  if (savedActionsLocked) return;
                                   if (sel) {
                                     setSelectedStreetSegmentIndex(null);
                                     if (map.current) {
@@ -3511,7 +3435,7 @@ export default function App() {
                                   }
                                 }}
                                 className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
-                                style={{...(sel ? buttonVariants.success : buttonVariants.info), opacity: (editingActive && !editingThis) ? 0.5 : 1, cursor: (editingActive && !editingThis) ? 'not-allowed':'pointer'}}
+                                  style={{...(sel ? buttonVariants.success : buttonVariants.info), opacity: savedActionsLocked ? 0.5 : 1, cursor: savedActionsLocked ? 'not-allowed':'pointer'}}
                               >{sel ? 'Deselect' : 'Select'}</button>
                             )}
                             {editingThis ? (
@@ -3532,8 +3456,9 @@ export default function App() {
                             ) : (
                               <button
                                 title='Edit geometry'
-                                disabled={editingActive}
+                                disabled={anyEditLock}
                                 onClick={() => {
+                                  if (anyEditLock) return;
                                   try {
                                     const coords = f.geometry?.coordinates;
                                     if (Array.isArray(coords) && coords.length >= 2) {
@@ -3554,19 +3479,20 @@ export default function App() {
                                   } catch {}
                                 }}
                                 className='btn btn--edit'
-                                style={{...buttonVariants.muted, opacity: editingActive ? 0.5 : 1, cursor: editingActive ? 'not-allowed':'pointer'}}
+                                style={{...buttonVariants.muted, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
                               >Edit geometry</button>
                             )}
                             {!editingThis && !editingStreetSegmentId && (
                               <button
-                                disabled={editingActive}
+                                disabled={anyEditLock}
                                 onClick={() => {
+                                  if (anyEditLock) return;
                                   setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
                                   if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
                                   if (editingStreetSegmentId === segId) setEditingStreetSegmentId(null);
                                 }}
                                 className="btn btn--delete"
-                                style={{...buttonVariants.danger, opacity: editingActive ? 0.5 : 1, cursor: editingActive ? 'not-allowed':'pointer'}}
+                                style={{...buttonVariants.danger, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
                               >Delete</button>
                             )}
                           </div>
