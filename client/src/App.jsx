@@ -58,31 +58,77 @@ export default function App() {
   const [activeTool, setActiveTool] = useState('none');
   // --- React state hooks ---
 
-  // --- Derived constants ---
+  // --- Derived constants (declared after dependent state hooks) ---
+  // (Some are declared later once their dependencies exist.)
   const polygonActive = activeTool === 'polygon';
   const streetsActive = activeTool === 'street';
   // End point for segment selection
   const [endPoint, setEndPoint] = useState(null);
   // Start point for segment selection
   const [startPoint, setStartPoint] = useState(null);
-  // Derived start/end selection mode from active tool
-  const startEndMode = streetsActive;
   // Length (meters) of current highlighted street path (M3 diagnostic / UX)
   const [streetPathLengthM, setStreetPathLengthM] = useState(null);
   // Manual recompute trigger (nonce) & ref helper for external callers (e.g., drag commit)
   const [streetPathNonce, setStreetPathNonce] = useState(0);
   const recomputeStreetPathRef = useRef(null); // will point to () => setStreetPathNonce(n=>n+1)
+  // Persist the currently drawn (unsaved or editing) street path geometry across style switches
+  const [ephemeralStreetPath, setEphemeralStreetPath] = useState(null); // GeoJSON Feature<LineString> | null
   // Saved street segments (M4 slice)
   const [savedStreetSegments, setSavedStreetSegments] = useState([]); // Feature<LineString>[]
   const [selectedStreetSegmentIndex, setSelectedStreetSegmentIndex] = useState(null);
   // Editing an existing saved street segment geometry (declare early so downstream hooks can reference)
   const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
+  // Derived start/end selection mode: active while street tool selected OR re-editing an existing street segment geometry
+  const startEndMode = streetsActive || !!editingStreetSegmentId;
+
+  // Centralized helper to clear the current street geometry edit session with diagnostics.
+  function clearEditingStreetSegment(reason) {
+    // eslint-disable-next-line no-console
+    console.log('[street-edit] clearing editingStreetSegmentId', { reason, at: new Date().toISOString(), stack: (new Error().stack) });
+    setEditingStreetSegmentId(null);
+  }
+
+  // --- Endpoint edit stability refs ---------------------------------------
+  // Track original endpoints when an existing segment edit session begins
+  const initialStartRef = useRef(null);
+  const initialEndRef = useRef(null);
+  // Flags indicating user has intentionally adjusted an endpoint (so auto re-snap shouldn't override)
+  const userAdjustedStartRef = useRef(false);
+  const userAdjustedEndRef = useRef(false);
+  // Debounce timer for recompute after drag end
+  const dragRecomputeTimerRef = useRef(null);
+  // Saved zones & selection (moved earlier to support derived flags)
+  const [savedZones, setSavedZones] = useState([]);
+  const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
+  const [editingSavedIndex, setEditingSavedIndex] = useState(null);
+  // Derived flags for specific edit modes
+  const editingZone = editingSavedIndex != null;
+  const editingStreet = !!editingStreetSegmentId;
+  const editingAny = editingZone || editingStreet;
+  // Only auto-force Off when a STREET edit begins (we still want polygon tool active for vertex editing)
+  const prevEditingStreetRef = useRef(false);
+  useEffect(() => {
+    if (editingStreet && !prevEditingStreetRef.current) {
+      // entering street edit
+      if (activeTool !== 'none') setActiveTool('none');
+    }
+    prevEditingStreetRef.current = editingStreet;
+  }, [editingStreet]);
+  // After finishing any edit (zone or street), ensure tool goes Off once (if it isn't already)
+  const prevEditingAnyRef = useRef(false);
+  useEffect(() => {
+    if (!editingAny && prevEditingAnyRef.current) {
+      // just exited an edit session
+      if (activeTool !== 'none') setActiveTool('none');
+    }
+    prevEditingAnyRef.current = editingAny;
+  }, [editingAny]);
   // Unified selection clearing when tool switches
   useEffect(()=>{
     if (polygonActive) {
       // Clear street selection state when switching to polygon tool
       setSelectedStreetSegmentIndex(null);
-      setEditingStreetSegmentId(null);
+  clearEditingStreetSegment('unified-selection-clear:polygonActive');
     } else if (streetsActive) {
       // Clear polygon selection/editing when switching to street tool
       setSelectedSavedIndex(null);
@@ -154,6 +200,14 @@ export default function App() {
       const feat = savedStreetSegments.find(f=>f.properties?.id===editingStreetSegmentId);
       setEditingStreetName(feat?.properties?.name || "");
       setEditingStreetDescription(feat?.properties?.description || "");
+      // Seed draggable endpoints for edit mode
+      try {
+        const coords = feat?.geometry?.coordinates;
+        if (Array.isArray(coords) && coords.length >= 2) {
+          setStartPoint(coords[0]);
+          setEndPoint(coords[coords.length - 1]);
+        }
+      } catch {}
     } else {
       setEditingStreetName("");
       setEditingStreetDescription("");
@@ -207,14 +261,8 @@ export default function App() {
   // Ref to always have latest drawnCoords inside effects without re-subscribing listeners
   const drawnCoordsRef = useRef(drawnCoords);
   useEffect(() => { drawnCoordsRef.current = drawnCoords; }, [drawnCoords]);
-  // Editing saved zone index state
-  const [editingSavedIndex, setEditingSavedIndex] = useState(null);
   // Drawing mode state
   const [drawMode, setDrawMode] = useState(false);
-  // Selected saved zone index state
-  const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
-  // Saved zones state
-  const [savedZones, setSavedZones] = useState([]);
   // --- Persistence load (zones + street segments) ---
   useEffect(()=>{
     try {
@@ -546,9 +594,14 @@ export default function App() {
         source: 'street-endpoints',
         paint: {
           'circle-radius': 7,
-          'circle-color': '#ff0000',
+          'circle-color': [
+            'case',
+            ['==',['get','role'],'start'], '#00b461',
+            ['==',['get','role'],'end'], '#ffc400',
+            '#ff0000'
+          ],
           'circle-stroke-width': 1.5,
-          'circle-stroke-color': '#fff'
+            'circle-stroke-color': '#fff'
         }
       });
     }
@@ -1327,22 +1380,153 @@ export default function App() {
     });
   }, []);
 
-  // Style switch restore
+  // Style switch restore (multi-stage with diagnostics & robust rehydration)
   useEffect(() => {
     if (!map.current) return;
-    map.current.setStyle(maptilerStyles[basemapStyle]);
+    const m = map.current;
+    const cachedSelectedRoad = selectedRoadSegmentRef.current;
+    const cachedEndpoints = streetEndpointsFCRef.current;
+    // eslint-disable-next-line no-console
+    console.log('[style-switch] initiating', basemapStyle, { hasCachedLine: !!cachedSelectedRoad, endpointCount: cachedEndpoints?.features?.length || 0 });
 
-    // Wait for the new style to finish loading sources/layers
-    map.current.once("styledata", () => {
-      ensureSourcesAndLayers(map.current);
-      refreshMapData(map.current, drawnCoords, useType, savedZones);
-      applySelectedFilter(map.current, selectedSavedIndex);
-      // ensure street layers match current tool
-  const visStreets = activeTool === 'street' ? 'visible' : 'none';
-  ["street-selections-line","street-selections-casing","street-buffer-fill","street-buffer-outline","street-endpoints-layer"]
-      .forEach(id => map.current.getLayer(id) && map.current.setLayoutProperty(id, "visibility", visStreets));
-    });
+    // Orphan old listeners just in case
+    const restoreKey = `__restore_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    function attemptRestore(stage) {
+      // eslint-disable-next-line no-console
+      console.log('[style-switch] attemptRestore', stage);
+      ensureSourcesAndLayers(m);
+      refreshMapData(m, drawnCoords, useType, savedZones);
+      applySelectedFilter(m, selectedSavedIndex);
+      // Keep street layers visible if actively editing a saved street segment even when tool auto-resets Off
+      const visStreets = (activeTool === 'street' || editingStreetSegmentId) ? 'visible' : 'none';
+      ["street-selections-line","street-selections-casing","street-buffer-fill","street-buffer-outline","street-endpoints-layer","selected-road-segment-layer"]
+        .forEach(id => m.getLayer(id) && m.setLayoutProperty(id, "visibility", visStreets));
+      // Restore endpoints
+      try {
+        const epSrc = m.getSource('street-endpoints');
+        if (epSrc && cachedEndpoints) {
+          epSrc.setData(cachedEndpoints);
+        }
+      } catch (e) { console.warn('[style-switch] endpoints restore failed', e); }
+      // Restore selected road line
+      if (cachedSelectedRoad && cachedSelectedRoad.type === 'Feature') {
+        try {
+          if (!m.getSource('selected-road-segment')) {
+            m.addSource('selected-road-segment', { type:'geojson', data: cachedSelectedRoad });
+          } else {
+            m.getSource('selected-road-segment').setData(cachedSelectedRoad);
+          }
+          if (!m.getLayer('selected-road-segment-layer')) {
+            m.addLayer({
+              id:'selected-road-segment-layer',
+              type:'line',
+              source:'selected-road-segment',
+              paint:{
+                'line-color': colorByUse[useType] || '#ff9800',
+                'line-width':6,
+                'line-opacity':0.9,
+                'line-dasharray': editingStreetSegmentId ? [2,2] : [1,0]
+              }
+            });
+          }
+          try { m.setLayoutProperty('selected-road-segment-layer','visibility', visStreets); } catch {}
+          // Move above saved segments for clarity (if reference layer exists). If move fails, attempt to re-add at top.
+          try {
+            if (m.getLayer('saved-street-segments-line')) {
+              m.moveLayer('selected-road-segment-layer', 'saved-street-segments-line');
+            } else {
+              // fallback: remove and re-add to top
+              const featureBackup = cachedSelectedRoad;
+              try { m.removeLayer('selected-road-segment-layer'); } catch {}
+              try {
+                m.addLayer({
+                  id:'selected-road-segment-layer',
+                  type:'line',
+                  source:'selected-road-segment',
+                  paint:{
+                    'line-color': colorByUse[useType] || '#ff9800',
+                    'line-width':6,
+                    'line-opacity':0.9,
+                    'line-dasharray': editingStreetSegmentId ? [2,2] : [1,0]
+                  }
+                });
+              } catch (err) { console.warn('[style-switch] re-add top failed', err); }
+              // ensure data still intact
+              try { m.getSource('selected-road-segment').setData(featureBackup); } catch {}
+            }
+          } catch (e) { console.warn('[style-switch] moveLayer failed', e); }
+        } catch (e) {
+          console.warn('[style-switch] line restore failed', e);
+        }
+      }
+    }
+
+    function finalCheck() {
+      const hasLine = !!m.getLayer('selected-road-segment-layer');
+      const hasEndpoints = !!m.getSource('street-endpoints');
+      // eslint-disable-next-line no-console
+      console.log('[style-switch] finalCheck', { hasLine, hasEndpoints });
+      if (!hasLine && cachedSelectedRoad) {
+        console.warn('[style-switch] forcing recompute fallback');
+        try { recomputeStreetPathRef.current && recomputeStreetPathRef.current(); } catch {}
+      }
+      // If line exists but is invisible due to style paint reset, force paint reapply
+      if (hasLine) {
+        try {
+          m.setPaintProperty('selected-road-segment-layer','line-color', colorByUse[useType] || '#ff9800');
+          m.setPaintProperty('selected-road-segment-layer','line-width', 6);
+          m.setPaintProperty('selected-road-segment-layer','line-opacity', 0.9);
+        } catch {}
+      }
+    }
+
+    // Primary sequence
+    m.setStyle(maptilerStyles[basemapStyle]);
+    m.once('styledata', () => attemptRestore('styledata'));
+    m.once('style.load', () => attemptRestore('style.load'));
+    m.once('idle', () => { attemptRestore('idle'); finalCheck(); });
+
+    return () => {
+      // Cleanup (listeners auto-removed via once, but keep placeholder for symmetry)
+      // eslint-disable-next-line no-console
+      console.log('[style-switch] cleanup', restoreKey);
+    };
   }, [basemapStyle]);
+
+  // Post-style assurance: if basemapStyle changes and we have an ephemeral path but layer missing after short delay, rebuild.
+  useEffect(() => {
+    if (!map.current) return;
+    if (!ephemeralStreetPath) return;
+    const m = map.current;
+    let attempts = 0;
+    const maxAttempts = 5;
+    function tick() {
+      if (!m.getStyle()) return; // style not ready
+      const hasSource = !!m.getSource('selected-road-segment');
+      const hasLayer = !!m.getLayer('selected-road-segment-layer');
+      if (hasLayer) {
+        // ensure visibility & paint
+        try {
+          m.getSource('selected-road-segment').setData(ephemeralStreetPath);
+          m.setLayoutProperty('selected-road-segment-layer','visibility', activeTool === 'street' ? 'visible':'none');
+          m.setPaintProperty('selected-road-segment-layer','line-color', colorByUse[useType] || '#ff9800');
+        } catch {}
+        return; // success
+      }
+      if (!hasSource) {
+        try { m.addSource('selected-road-segment', { type:'geojson', data: ephemeralStreetPath }); } catch {}
+      }
+      if (!hasLayer && hasSource) {
+        try {
+          m.addLayer({ id:'selected-road-segment-layer', type:'line', source:'selected-road-segment', paint:{ 'line-color': colorByUse[useType] || '#ff9800','line-width':6,'line-opacity':0.9 } });
+        } catch {}
+      }
+      attempts++;
+      if (attempts < maxAttempts) setTimeout(tick, 180);
+    }
+    setTimeout(tick, 120);
+  }, [basemapStyle, ephemeralStreetPath, activeTool, useType]);
 
   // Repaint saved zones if the list changes
   useEffect(() => {
@@ -1355,23 +1539,45 @@ export default function App() {
   }, [savedZones]);
 
   // Keep street endpoints source in sync (supports style switches)
+  // Cache the last endpoints FeatureCollection so we can reapply after a style change without requiring a state change
+  const streetEndpointsFCRef = useRef({ type:'FeatureCollection', features: [] });
+  // Simplified endpoint sync: directly reflect startPoint/endPoint, independent of summaries
   useEffect(() => {
     if (!map.current) return;
     const m = map.current;
     const src = m.getSource('street-endpoints');
-    if (!src) return;
-    // Determine which summary is active (editing > street > ephemeral)
-    const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary;
-    if (!ss || !Array.isArray(ss.start) || !Array.isArray(ss.end)) {
-      try { src.setData({ type:'FeatureCollection', features: [] }); } catch {}
+    if (!src) {
+      // Style may still be loading; retry after style.load once
+      m.once('style.load', () => {
+        try {
+          const retry = m.getSource('street-endpoints');
+          if (retry) {
+            // trigger effect again by forcing a micro task (state noop)
+            setTimeout(() => {
+              if (startPoint || endPoint) {
+                const feats = [];
+                if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
+                if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
+                retry.setData({ type:'FeatureCollection', features:feats });
+              }
+            },0);
+          }
+        } catch {}
+      });
       return;
     }
-    const features = [
-      { type:'Feature', geometry:{ type:'Point', coordinates: ss.start }, properties:{ role:'start' } },
-      { type:'Feature', geometry:{ type:'Point', coordinates: ss.end }, properties:{ role:'end' } }
-    ];
-    try { src.setData({ type:'FeatureCollection', features }); } catch {}
-  }, [editingStreetSegmentSummary, streetSegmentSummary, ephemeralStreetPathSummary]);
+    const feats = [];
+    if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
+    if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
+    const fc = { type:'FeatureCollection', features: feats };
+    try { src.setData(fc); streetEndpointsFCRef.current = fc; } catch {}
+    // Visibility: show while in startEndMode even if one point missing; hide otherwise
+    try {
+      if (m.getLayer('street-endpoints-layer')) {
+        m.setLayoutProperty('street-endpoints-layer','visibility', startEndMode ? 'visible':'none');
+      }
+    } catch {}
+  }, [startPoint, endPoint, startEndMode, basemapStyle]);
 
   // Apply highlight when selection changes
   useEffect(() => {
@@ -1397,6 +1603,106 @@ export default function App() {
     map.current.on("click", handleMapClick);
     return () => map.current && map.current.off("click", handleMapClick);
   }, [drawMode]);
+
+  // Re-bind draggable behavior for street endpoints (start/end) after style changes or tool activation
+  useEffect(() => {
+    if (!map.current) return;
+    if (!startEndMode) return;
+    const m = map.current;
+    let dragging = null; // 'start' | 'end'
+    let lastMoveTs = 0;
+    const endpointDraggingRef = endpointDraggingRefGlobal.current;
+    function snapToNetwork(lngLatArr) {
+      try {
+        const roadLayerIds = getRoadLayerIds(m);
+        const featuresRaw = m.queryRenderedFeatures({ layers: roadLayerIds }) || [];
+        const roadNetwork = featuresRaw.flatMap(feat => {
+          if (feat.geometry?.type === 'LineString' && isDrivableRoad(feat.properties)) return [turf.lineString(feat.geometry.coordinates)];
+          if (feat.geometry?.type === 'MultiLineString' && isDrivableRoad(feat.properties)) return feat.geometry.coordinates.map(c => turf.lineString(c));
+          return [];
+        });
+        let best = null; let bestD = Infinity;
+        for (const line of roadNetwork) {
+          try {
+            const snapped = turf.nearestPointOnLine(line, turf.point(lngLatArr), { units:'meters' });
+            const d = snapped?.properties?.dist;
+            if (typeof d === 'number' && d < bestD) { bestD = d; best = snapped.geometry.coordinates; }
+          } catch {}
+        }
+        return best || lngLatArr;
+      } catch { return lngLatArr; }
+    }
+    function onMouseDown(e) {
+      if (!e.features || !e.features.length) return;
+      const f = e.features[0];
+      if (f.layer?.id !== 'street-endpoints-layer') return;
+      const role = f.properties?.role;
+      if (role !== 'start' && role !== 'end') return;
+      dragging = role;
+      endpointDraggingRef.current = true;
+      try { m.getCanvas().style.cursor = 'grabbing'; } catch {}
+      m.dragPan.disable();
+    }
+    function onMouseMove(e) {
+      if (!dragging) return;
+      const lng = e.lngLat.lng, lat = e.lngLat.lat;
+      const now = performance.now();
+      // Throttle expensive snapping while moving; snap every ~80ms
+      if (now - lastMoveTs > 80) {
+        const snapped = snapToNetwork([lng,lat]);
+        if (dragging === 'start') setStartPoint(snapped); else setEndPoint(snapped);
+        lastMoveTs = now;
+      } else {
+        if (dragging === 'start') setStartPoint([lng,lat]); else setEndPoint([lng,lat]);
+      }
+    }
+    function onMouseUp() {
+      if (!dragging) return;
+      dragging = null;
+      endpointDraggingRef.current = false;
+      try { m.getCanvas().style.cursor = ''; } catch {}
+      m.dragPan.enable();
+      // Final snap commit
+      try {
+        if (Array.isArray(startPoint)) setStartPoint(snapToNetwork(startPoint));
+        if (Array.isArray(endPoint)) setEndPoint(snapToNetwork(endPoint));
+      } catch {}
+      // Mark user-adjusted flags if moved meaningfully from initial reference
+      const dist = (a,b)=> (a&&b)? turf.distance(turf.point(a), turf.point(b), { units:'meters' }):0;
+      const MOVE_EPS_M = 0.4; // require noticeable movement
+      try {
+        if (initialStartRef.current && startPoint && dist(initialStartRef.current, startPoint) > MOVE_EPS_M) {
+          userAdjustedStartRef.current = true;
+        }
+        if (initialEndRef.current && endPoint && dist(initialEndRef.current, endPoint) > MOVE_EPS_M) {
+          userAdjustedEndRef.current = true;
+        }
+      } catch {}
+      // Debounce recompute to allow final state to settle
+      if (dragRecomputeTimerRef.current) clearTimeout(dragRecomputeTimerRef.current);
+      dragRecomputeTimerRef.current = setTimeout(() => {
+        try { recomputeStreetPathRef.current && recomputeStreetPathRef.current(); } catch {}
+      }, 120);
+    }
+    // Guard: ensure layer exists first
+    if (m.getLayer('street-endpoints-layer')) {
+      m.on('mousedown','street-endpoints-layer', onMouseDown);
+      m.on('mousemove', onMouseMove);
+      m.on('mouseup', onMouseUp);
+      m.on('mouseleave', onMouseUp);
+    }
+    return () => {
+      if (m.getLayer('street-endpoints-layer')) {
+        try { m.off('mousedown','street-endpoints-layer', onMouseDown); } catch {}
+      }
+      try { m.off('mousemove', onMouseMove); } catch {}
+      try { m.off('mouseup', onMouseUp); } catch {}
+      try { m.off('mouseleave', onMouseUp); } catch {}
+    };
+  }, [startEndMode, basemapStyle]);
+
+  // Ref used to suppress path recompute while dragging
+  const endpointDraggingRefGlobal = useRef({ current: false });
 
   // Click on saved zones to select
   useEffect(() => {
@@ -1499,20 +1805,30 @@ export default function App() {
     }
     // Abort any street editing session when switching to polygon editing
     if (polygonSelected && editingStreetSegmentId) {
-      setEditingStreetSegmentId(null);
+  clearEditingStreetSegment('drawMode sync: switched to polygon while editing street');
     }
     // If switching away from street tool, cleanup points/line
     if (activeTool !== 'street') {
-      setStartPoint(null);
-      setEndPoint(null);
-      if (map.current) {
-        const m = map.current;
-        if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
-        if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
-        if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
-        if (m.getSource('start-end-points')) m.removeSource('start-end-points');
+      // When leaving explicit street tool mode, only clear endpoints if NOT in the middle of editing an existing saved segment.
+      if (!editingStreetSegmentId) {
+        setStartPoint(null);
+        setEndPoint(null);
+        if (map.current) {
+          const m = map.current;
+          if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
+          if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
+          if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
+          if (m.getSource('start-end-points')) m.removeSource('start-end-points');
+        }
+        setStreetPathLengthM(null);
+      } else {
+        // Ensure existing endpoints layer (canonical 'street-endpoints-layer') stays visible while editing
+        try {
+          if (map.current?.getLayer('street-endpoints-layer')) {
+            map.current.setLayoutProperty('street-endpoints-layer','visibility','visible');
+          }
+        } catch {}
       }
-      setStreetPathLengthM(null);
     }
   }, [activeTool]);
 
@@ -1706,29 +2022,61 @@ export default function App() {
         return [lngLat.lng, lngLat.lat];
       }
       console.log('Candidate features from queryRenderedFeatures:', featuresRaw);
+
+      // Helpers for validation
+      const isValidCoord = (c) => Array.isArray(c) && c.length >= 2 && isFinite(c[0]) && isFinite(c[1]);
+      const isValidLineCoords = (arr) => Array.isArray(arr) && arr.length >= 2 && arr.every(isValidCoord);
+      const safeLineString = (coords) => {
+        try { return isValidLineCoords(coords) ? turf.lineString(coords) : null; } catch { return null; }
+      };
+      // Filter out any features with malformed geometries early
+      featuresRaw = featuresRaw.filter(f => {
+        if (!f?.geometry) return false;
+        if (f.geometry.type === 'LineString') return isValidLineCoords(f.geometry.coordinates);
+        if (f.geometry.type === 'MultiLineString') {
+          if (!Array.isArray(f.geometry.coordinates) || !f.geometry.coordinates.length) return false;
+          // At least one valid segment must exist
+            return f.geometry.coordinates.some(isValidLineCoords);
+        }
+        return false; // ignore other geometry types
+      });
     featuresRaw.forEach((f, i) => {
       const isDrivable = isDrivableRoad(f.properties);
       let snappedDist = "N/A";
       if (f.geometry?.type === "LineString") {
-        const pt = turf.point([lngLat.lng, lngLat.lat]);
-        const line = turf.lineString(f.geometry.coordinates);
-        const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-        snappedDist = snapped.properties.dist;
-      } else if (f.geometry?.type === "MultiLineString") {
-        const pt = turf.point([lngLat.lng, lngLat.lat]);
-        let minDist = Infinity;
-        let bestSnapped = null;
-        f.geometry.coordinates.forEach((coords, segIdx) => {
-          const line = turf.lineString(coords);
-          const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-          if (snapped.properties.dist < minDist) {
-            minDist = snapped.properties.dist;
-            bestSnapped = snapped;
+        try {
+          const pt = turf.point([lngLat.lng, lngLat.lat]);
+          const line = safeLineString(f.geometry.coordinates);
+          if (line) {
+            const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+            snappedDist = snapped?.properties?.dist;
           }
-          console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped.properties.dist}`);
-        });
-        if (bestSnapped) {
-          snappedDist = bestSnapped.properties.dist;
+        } catch (e) {
+          console.warn('[getNearestRoadPoint] line snapping error (LineString)', e);
+        }
+      } else if (f.geometry?.type === "MultiLineString") {
+        try {
+          const pt = turf.point([lngLat.lng, lngLat.lat]);
+          let minDist = Infinity;
+          let bestSnapped = null;
+          f.geometry.coordinates.forEach((coords, segIdx) => {
+            if (!isValidLineCoords(coords)) return; // skip invalid segment
+            const line = safeLineString(coords);
+            if (!line) return;
+            try {
+              const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+              if (snapped && isFinite(snapped.properties?.dist) && snapped.properties.dist < minDist) {
+                minDist = snapped.properties.dist;
+                bestSnapped = snapped;
+              }
+              console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped?.properties?.dist}`);
+            } catch {/* ignore individual segment errors */}
+          });
+          if (bestSnapped) {
+            snappedDist = bestSnapped.properties.dist;
+          }
+        } catch (e) {
+          console.warn('[getNearestRoadPoint] line snapping error (MultiLineString)', e);
         }
       }
       console.log(`Feature #${i} layer.id: ${f.layer?.id} isDrivable: ${isDrivable} snapped distance: ${snappedDist} geometry.type: ${f.geometry?.type} properties:`, f.properties);
@@ -1746,19 +2094,26 @@ export default function App() {
       let snapped = null;
       let dist = null;
       if (feat.geometry?.type === "LineString") {
-        const line = turf.lineString(feat.geometry.coordinates);
-        snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-        dist = snapped.properties.dist;
+        const line = safeLineString(feat.geometry.coordinates);
+        if (!line) continue;
+        try {
+          snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+          dist = snapped?.properties?.dist;
+        } catch { continue; }
       } else if (feat.geometry?.type === "MultiLineString") {
         let minDist = Infinity;
         let bestSnapped = null;
         feat.geometry.coordinates.forEach((coords, segIdx) => {
-          const line = turf.lineString(coords);
-          const segSnapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-          if (segSnapped.properties.dist < minDist) {
-            minDist = segSnapped.properties.dist;
-            bestSnapped = segSnapped;
-          }
+          if (!isValidLineCoords(coords)) return;
+          const line = safeLineString(coords);
+          if (!line) return;
+          try {
+            const segSnapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+            if (segSnapped && isFinite(segSnapped.properties?.dist) && segSnapped.properties.dist < minDist) {
+              minDist = segSnapped.properties.dist;
+              bestSnapped = segSnapped;
+            }
+          } catch {/* skip bad segment */}
         });
         snapped = bestSnapped;
         dist = minDist;
@@ -1771,7 +2126,9 @@ export default function App() {
       });
       if (dist !== null && dist < bestDist) {
         bestDist = dist;
-        best = snapped.geometry.coordinates;
+        if (snapped?.geometry?.coordinates && isValidCoord(snapped.geometry.coordinates)) {
+          best = snapped.geometry.coordinates;
+        }
       }
     }
     // Only snap if within 80 meters (TEMPORARY for debugging)
@@ -1815,127 +2172,9 @@ export default function App() {
 
     m.on("click", handleStartEndClick);
     return () => m.off("click", handleStartEndClick);
-  }, [startEndMode, startPoint, endPoint]);
+  }, [startEndMode, startPoint, endPoint, editingStreetSegmentId]);
 
-  // [START/END SEGMENT SELECTION] Visual feedback + extended drag (can lengthen path)
-  useEffect(() => {
-    if (!map.current) return;
-    if (!startEndMode) return;
-    const m = map.current;
-    if (!m.getSource('start-end-points')) {
-      m.addSource('start-end-points', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] }
-      });
-      m.addLayer({
-        id: 'start-end-points-layer',
-        type: 'circle',
-        source: 'start-end-points',
-        paint: {
-          'circle-radius': 8,
-          'circle-color': ['match', ['get', 'type'], 'start', '#28a745', 'end', '#ffc107', '#888'],
-          'circle-stroke-width': 2,
-          'circle-stroke-color': '#fff'
-        }
-      });
-    }
-    function updatePoints(temp) {
-      const s = temp?.start ?? startPoint;
-      const e = temp?.end ?? endPoint;
-      const features = [];
-      if (s) features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: s }, properties: { type: 'start' } });
-      if (e) features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: e }, properties: { type: 'end' } });
-      try { m.getSource('start-end-points').setData({ type: 'FeatureCollection', features }); } catch {}
-    }
-    updatePoints();
-
-    let isDragging = false;
-    let dragType = null; // 'start' | 'end'
-    let pending = null;
-    let lastTs = 0;
-    const original = { start: startPoint, end: endPoint };
-
-    function snapToRoad(lng, lat) {
-      const roadLayerIds = getRoadLayerIds(m);
-      const opts = roadLayerIds.length ? { layers: roadLayerIds } : undefined;
-      const pt = turf.point([lng, lat]);
-      const proj = m.project([lng, lat]);
-      // adaptive radius grows as you drag outward
-      let distPx = 0;
-      if (dragType && original[dragType]) {
-        const op = m.project(original[dragType]);
-        distPx = Math.hypot(op.x - proj.x, op.y - proj.y);
-      }
-      const r = Math.min(320, 90 + distPx * 0.45);
-      let feats = [];
-      try { feats = m.queryRenderedFeatures([[proj.x - r, proj.y - r],[proj.x + r, proj.y + r]], opts); } catch {}
-      const lines = feats
-        .flatMap(explodeToLineStrings)
-        .filter(f => f.geometry?.type === 'LineString' && isDrivableRoad(f.properties));
-      if (!lines.length) return null;
-      let best = null; let bestDist = Infinity;
-      for (const ln of lines) {
-        try {
-          const snapped = turf.nearestPointOnLine(ln, pt, { units: 'meters' });
-          if (snapped && snapped.properties.dist < bestDist) {
-            bestDist = snapped.properties.dist;
-            best = snapped.geometry.coordinates;
-          }
-        } catch {}
-      }
-      if (best && bestDist < 130) return best;
-      return null;
-    }
-
-    function onMouseDown(e) {
-      if (!e.features?.length) return;
-      const f = e.features[0];
-      if (f.layer.id !== 'start-end-points-layer') return;
-      dragType = f.properties?.type;
-      if (!dragType) return;
-      isDragging = true;
-      m.getCanvas().style.cursor = 'grabbing';
-      m.dragPan.disable();
-    }
-    function onMouseMove(e) {
-      if (!isDragging || !dragType) return;
-      const now = performance.now();
-      if (now - lastTs < 33) return; // throttle ~30fps
-      lastTs = now;
-      const snapped = snapToRoad(e.lngLat.lng, e.lngLat.lat);
-      if (snapped) {
-        pending = snapped;
-        if (dragType === 'start') updatePoints({ start: pending }); else updatePoints({ end: pending });
-      }
-    }
-    function onMouseUp() {
-      if (!isDragging) return;
-      isDragging = false;
-      m.getCanvas().style.cursor = '';
-      m.dragPan.enable();
-      if (pending && dragType) {
-        if (dragType === 'start') setStartPoint(pending); else setEndPoint(pending);
-        // If both endpoints exist after this update, request an explicit path recompute
-        setTimeout(() => {
-          const hasBoth = (dragType === 'start' ? pending : startPoint) && (dragType === 'end' ? pending : endPoint);
-          if (hasBoth && recomputeStreetPathRef.current) {
-            recomputeStreetPathRef.current();
-          }
-        }, 0);
-      }
-      pending = null;
-      dragType = null;
-      updatePoints();
-    }
-    m.on('mousedown', 'start-end-points-layer', onMouseDown);
-    m.on('mousemove', onMouseMove);
-    m.on('mouseup', onMouseUp);
-    return () => {
-      m.off('mousedown', 'start-end-points-layer', onMouseDown);
-      m.off('mousemove', onMouseMove);
-      m.off('mouseup', onMouseUp);
-    };
-  }, [startEndMode, startPoint, endPoint]);
+  // (Removed conflicting extended drag effect; unified on primary drag handler elsewhere)
 
   // [START/END SEGMENT SELECTION] Highlight selected road segment and clear on exit
   useEffect(() => {
@@ -1946,27 +2185,19 @@ export default function App() {
 
     // Only remove highlight and start/end points when exiting start/end mode
     if (!startEndMode) {
-      if (m.getLayer('selected-road-segment-layer')) {
-        m.removeLayer('selected-road-segment-layer');
-      }
-      if (m.getLayer('selected-road-segment')) {
-        m.removeLayer('selected-road-segment');
-      }
-      if (m.getSource('selected-road-segment')) {
-        m.removeSource('selected-road-segment');
-      }
-      if (m.getLayer('start-end-points-layer')) {
-        m.removeLayer('start-end-points-layer');
-      }
-      if (m.getSource('start-end-points')) {
-        m.removeSource('start-end-points');
-      }
-  setStreetPathLengthM(null);
+      // Only clear highlighted road path (leave endpoints cleanup to watchdog / earlier effect)
+      if (m.getLayer('selected-road-segment-layer')) { try { m.removeLayer('selected-road-segment-layer'); } catch {} }
+      if (m.getSource('selected-road-segment')) { try { m.removeSource('selected-road-segment'); } catch {} }
+      setStreetPathLengthM(null);
       return;
     }
 
     // Only highlight if both points are set and startEndMode is active
     if (startEndMode && startPoint && endPoint) {
+      // Suppress path rebuild while user is actively dragging an endpoint during edit of existing segment
+      if (editingStreetSegmentId && endpointDraggingRefGlobal.current.current) {
+        return; // skip recompute mid-drag
+      }
       const t0 = performance.now();
       // Always snap both points to nearest road segment using all visible drivable roads
       const roadLayerIds = getRoadLayerIds(m);
@@ -2001,9 +2232,12 @@ export default function App() {
             if (!line || line.geometry?.type !== 'LineString') continue;
             const coords = line.geometry.coordinates;
             if (!Array.isArray(coords) || coords.length < 2) continue;
-            // Basic coordinate sanity (first & last)
-            const first = coords[0];
-            if (!first || first.length < 2 || !isFinite(first[0]) || !isFinite(first[1])) continue;
+            // Validate every coordinate pair to avoid turf errors "coordinates must contain numbers"
+            let valid = true;
+            for (const c of coords) {
+              if (!c || c.length < 2 || !isFinite(c[0]) || !isFinite(c[1])) { valid = false; break; }
+            }
+            if (!valid) continue;
             const snapped = turf.nearestPointOnLine(line, turf.point(point), { units: 'meters' });
             if (!snapped || !snapped.geometry?.coordinates) continue;
             const dist = snapped.properties?.dist;
@@ -2389,13 +2623,13 @@ export default function App() {
       if (finalLine && finalLine.geometry && Array.isArray(finalLine.geometry.coordinates) && finalLine.geometry.coordinates.length >= 2) {
         // Add or update the source safely
         if (!m.getSource('selected-road-segment')) {
-          m.addSource('selected-road-segment', {
-            type: 'geojson',
-            data: finalLine
-          });
+          m.addSource('selected-road-segment', { type: 'geojson', data: finalLine });
         } else {
-          m.getSource('selected-road-segment').setData(finalLine);
+          try { m.getSource('selected-road-segment').setData(finalLine); } catch {}
         }
+        // Cache & persist ephemeral path
+        selectedRoadSegmentRef.current = finalLine;
+        setEphemeralStreetPath(finalLine);
         // Add the layer to render the highlighted line if not present
         const dashArray = editingStreetSegmentId ? [2,2] : [1,0]; // dashed when re-editing, solid otherwise
         if (!m.getLayer('selected-road-segment-layer')) {
@@ -2419,6 +2653,27 @@ export default function App() {
         try {
           const lenM = turf.length(finalLine, { units: 'meters' });
           setStreetPathLengthM(lenM);
+          // Snap visible draggable endpoints onto the finalized path to avoid drift
+          // Only update endpoint state if snapped coordinate differs beyond a tiny tolerance
+          const nearlyEqual = (a, b, eps = 1e-7) => Array.isArray(a) && Array.isArray(b) && Math.abs(a[0]-b[0]) < eps && Math.abs(a[1]-b[1]) < eps;
+          // Only auto-snap endpoints if user has NOT intentionally adjusted that endpoint during an edit session.
+          // This prevents the "jump back" after second edit where trimming rewrites coordinates.
+          if (Array.isArray(startPoint) && (!(editingStreetSegmentId && userAdjustedStartRef.current))) {
+            try {
+              const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
+              if (sSnap?.geometry?.coordinates && !nearlyEqual(startPoint, sSnap.geometry.coordinates)) {
+                setStartPoint(sSnap.geometry.coordinates);
+              }
+            } catch {}
+          }
+          if (Array.isArray(endPoint) && (!(editingStreetSegmentId && userAdjustedEndRef.current))) {
+            try {
+              const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
+              if (eSnap?.geometry?.coordinates && !nearlyEqual(endPoint, eSnap.geometry.coordinates)) {
+                setEndPoint(eSnap.geometry.coordinates);
+              }
+            } catch {}
+          }
         } catch { setStreetPathLengthM(null); }
         const t4 = performance.now();
         const sample = {
@@ -2437,6 +2692,53 @@ export default function App() {
       }
     }
   }, [startEndMode, startPoint, endPoint, useType, streetPathNonce]);
+
+  // Watchdog: if editing an existing street and canonical endpoint layer/source missing (e.g. removed during tool reset), restore them
+  useEffect(() => {
+    if (!map.current) return;
+    if (!editingStreetSegmentId) return; // only matters when editing street geometry
+    if (!startEndMode) return; // startEndMode already broad but guard anyway
+    const m = map.current;
+    const src = m.getSource('street-endpoints');
+    const layerExists = m.getLayer('street-endpoints-layer');
+    if (!src) { try { m.addSource('street-endpoints', { type:'geojson', data:{ type:'FeatureCollection', features:[] } }); } catch {} }
+    if (!layerExists) { try { m.addLayer({ id:'street-endpoints-layer', type:'circle', source:'street-endpoints', paint:{ 'circle-radius':8, 'circle-color':['match',['get','type'],'start','#28a745','end','#ffc107','#888'], 'circle-stroke-width':2, 'circle-stroke-color':'#fff' } }); } catch {} }
+    if ((startPoint || endPoint) && m.getSource('street-endpoints')) {
+      const feats = [];
+      if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
+      if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
+      try { m.getSource('street-endpoints').setData({ type:'FeatureCollection', features:feats }); } catch {}
+    }
+  }, [editingStreetSegmentId, startEndMode, startPoint, endPoint]);
+
+  // Diagnostics: log state of endpoint sources/layers to uncover why markers may be invisible
+  useEffect(() => {
+    if (!map.current) return;
+    if (!(startEndMode || editingStreetSegmentId)) return;
+    const m = map.current;
+    let featureCount = null;
+    try {
+      // eslint-disable-next-line no-underscore-dangle
+      const data = m.getSource('street-endpoints')?._data;
+      featureCount = data?.features?.length ?? 0;
+    } catch {}
+    // eslint-disable-next-line no-console
+    console.groupCollapsed('[endpoint-diagnostics] consolidated tick');
+    // eslint-disable-next-line no-console
+    console.log('mode', { startEndMode, editingStreetSegmentId, streetsActive, activeTool });
+    // eslint-disable-next-line no-console
+    console.log('points state', { startPoint, endPoint });
+    // eslint-disable-next-line no-console
+    console.log('street-endpoints source', { exists: !!m.getSource('street-endpoints'), layerExists: !!m.getLayer('street-endpoints-layer'), featureCount });
+    if (!m.getLayer('street-endpoints-layer')) {
+      // eslint-disable-next-line no-console
+      console.warn('[endpoint-diagnostics] street-endpoints-layer missing');
+    }
+    console.groupEnd();
+  }, [startEndMode, editingStreetSegmentId, startPoint, endPoint, basemapStyle, streetsActive, activeTool]);
+
+  // Ref to cache the selected road segment (ephemeral path) across style switches
+  const selectedRoadSegmentRef = useRef(null);
 
   // Reactive: update selected road segment line color when zone type toggles
   useEffect(() => {
@@ -2528,7 +2830,7 @@ export default function App() {
         geometry: { type: 'LineString', coordinates: [...lineData.geometry.coordinates] },
         properties: { ...f.properties, ...baseProps, id: editingStreetSegmentId, updatedAt: Date.now() }
       } : f));
-      setEditingStreetSegmentId(null);
+  clearEditingStreetSegment('finalizeStreetSelection:saveExisting');
     } else {
       const newFeature = {
         type: 'Feature',
@@ -2550,16 +2852,15 @@ export default function App() {
     setEditingStreetDescription("");
     // Deselect any previously selected street segment so list returns to neutral state
     setSelectedStreetSegmentIndex(null);
-    // Clear summaries related to street selection/edit to avoid showing stale info
-    setStreetSegmentSummary(null);
-    setEditingStreetSegmentSummary(null);
+    // streetSegmentSummary & editingStreetSegmentSummary are derived via useMemo from savedStreetSegments/IDs;
+    // clearing underlying state (selection/edit IDs & ephemeral path state) is sufficient. Removed stale setter calls.
   }
 
   // Cancel an in-progress street geometry edit without saving changes
   function cancelStreetGeometryEdit() {
     if (!editingStreetSegmentId) return;
     // Clear editing flags & temporary metadata
-    setEditingStreetSegmentId(null);
+  clearEditingStreetSegment('cancelStreetGeometryEdit');
     setEditingStreetName("");
     setEditingStreetDescription("");
     // Remove transient path layers
@@ -2902,7 +3203,8 @@ export default function App() {
     const srcId = 'polygon-vertices';
     const layerId = 'polygon-vertices-layer';
   // Show the vertex layer as soon as we enter polygon edit mode; data will populate once coords are available
-  const shouldShow = polygonActive && editingSavedIndex != null;
+  // While editing a saved polygon we always want vertices even though activeTool may be forced Off for other edit types
+  const shouldShow = editingSavedIndex != null; // rely solely on edit state
     console.log('[PolygonEdit] Vertex layer setup effect', { shouldShow, polygonActive, editingSavedIndex });
 
     if (!shouldShow) {
@@ -3096,8 +3398,8 @@ export default function App() {
                   key={btn.key}
                   role="radio"
                   aria-checked={active}
-                  disabled={creationLock}
-                  onClick={() => { if (creationLock) return; setActiveTool(btn.key); }}
+                  disabled={creationLock || editingAny}
+                  onClick={() => { if (creationLock || editingAny) return; setActiveTool(btn.key); }}
                   style={{
                     ...buttonStyle,
                     backgroundColor: active ? '#007bff' : '#e2e6ea',
@@ -3105,8 +3407,8 @@ export default function App() {
                     fontWeight: active ? 600 : 500,
                     padding: '0.4rem 0.65rem',
                     minWidth: 62,
-                    opacity: creationLock ? 0.5 : 1,
-                    cursor: creationLock ? 'not-allowed':'pointer'
+                    opacity: (creationLock || editingAny) ? 0.5 : 1,
+                    cursor: (creationLock || editingAny) ? 'not-allowed':'pointer'
                   }}
                 >{btn.label}</button>
               );
@@ -3121,28 +3423,7 @@ export default function App() {
 
         {/* ✅ Street selection controls now inside the panel */}
         {/* Street metrics shown only when Street tool active */}
-    {streetsActive && (
-      <div className="street-metrics" id="street-metrics-panel" style={{ display: 'grid', gap: '0.25rem', minWidth: 160, opacity: (streetCreationLock || polygonCreationLock) ? 0.4 : 1, pointerEvents: (streetCreationLock || polygonCreationLock) ? 'none':'auto' }}>
-            <div style={labelStyle} className="street-metrics__label">Street metrics</div>
-      {streetPathLengthM != null && (
-              <div className="street-metrics__length" style={{ fontSize: '0.7rem', color: '#444' }}>
-                Length: {streetPathLengthM.toFixed(1)} m
-              </div>
-            )}
-      {/* Dev-only perf metrics */}
-      {import.meta.env.DEV && streetPerfSamples.length > 0 && (() => {
-              const last = streetPerfSamples[streetPerfSamples.length - 1];
-              const avg = streetPerfSamples.reduce((s, p) => s + p.total, 0) / streetPerfSamples.length;
-              return (
-                <div className="street-metrics__perf" style={{ fontSize: '0.65rem', color: '#555', lineHeight: 1.3 }}>
-                  <div>Last: {last.total.toFixed(1)} ms</div>
-                  <div>Avg: {avg.toFixed(1)} ms</div>
-                </div>
-              );
-            })()}
-            {/* Removed dev-only Validate paths button */}
-          </div>
-        )}
+    {/* Street metrics panel removed per requirements */}
       </div>
 
       {/* Bottom-left basemap toggle */}
@@ -3653,6 +3934,11 @@ export default function App() {
                                       setStartPoint(coords[0]);
                                       setEndPoint(coords[coords.length -1]);
                                       setEditingStreetSegmentId(segId);
+                                      // Seed initial refs & reset adjustment flags for this edit session
+                                      initialStartRef.current = coords[0];
+                                      initialEndRef.current = coords[coords.length -1];
+                                      userAdjustedStartRef.current = false;
+                                      userAdjustedEndRef.current = false;
                                       setStreetPathLengthM(f.properties?.lengthM || null);
                                       setActiveTool('street');
                                       if (recomputeStreetPathRef.current) setTimeout(()=>recomputeStreetPathRef.current(),0);
@@ -3674,7 +3960,7 @@ export default function App() {
                                   if (anyEditLock) return;
                                   setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
                                   if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
-                                  if (editingStreetSegmentId === segId) setEditingStreetSegmentId(null);
+                                  if (editingStreetSegmentId === segId) clearEditingStreetSegment('deleteSavedSegment');
                                 }}
                                 className="btn btn--delete"
                                 style={{...buttonVariants.danger, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
