@@ -39,6 +39,9 @@ export default function App() {
     "commercial": "#FF6347",     // tomato
     // Add more use types and colors as needed
   };
+    // Local mutable flags for current drag lifecycle
+    let dragMoved = false; // tracks whether pointer actually moved while dragging
+    let dragStartCoord = null; // starting coordinate of the dragged endpoint (for adjustment heuristics)
   // Map container ref
   const mapContainer = useRef(null);
   // Pending name state
@@ -81,6 +84,16 @@ export default function App() {
   // Derived start/end selection mode: active while street tool selected OR re-editing an existing street segment geometry
   const startEndMode = streetsActive || !!editingStreetSegmentId;
 
+  // Debug wrappers for endpoint state (placed AFTER editingStreetSegmentId to avoid TDZ)
+  const debugSetStartPoint = React.useCallback((val, meta) => {
+    try { console.log('[endpoint-debug] setStartPoint', { meta, val, editingStreetSegmentId, ts: Date.now() }); } catch {}
+    setStartPoint(val);
+  }, [editingStreetSegmentId]);
+  const debugSetEndPoint = React.useCallback((val, meta) => {
+    try { console.log('[endpoint-debug] setEndPoint', { meta, val, editingStreetSegmentId, ts: Date.now() }); } catch {}
+    setEndPoint(val);
+  }, [editingStreetSegmentId]);
+
   // Centralized helper to clear the current street geometry edit session with diagnostics.
   function clearEditingStreetSegment(reason) {
     // eslint-disable-next-line no-console
@@ -97,6 +110,11 @@ export default function App() {
   const userAdjustedEndRef = useRef(false);
   // Debounce timer for recompute after drag end
   const dragRecomputeTimerRef = useRef(null);
+  // Track last dragged endpoint role & adjustment timestamps (debounce snapping overrides)
+  const lastDraggedRoleRef = useRef(null);
+  const lastAdjustTsRef = useRef({ start: 0, end: 0 });
+  // Opt-in recompute flag for street geometry edit mode (prevents automatic path rebuilds)
+  const forceEditRecomputeRef = useRef(false);
   // Saved zones & selection (moved earlier to support derived flags)
   const [savedZones, setSavedZones] = useState([]);
   const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
@@ -194,25 +212,36 @@ export default function App() {
       };
     } catch { return null; }
   }, [editingStreetSegmentId, savedStreetSegments, editingStreetName, editingStreetDescription]);
-  // When entering street geometry edit, seed temporary metadata fields
+  // When entering street geometry edit, seed temporary metadata fields (run once per session)
   useEffect(()=>{
     if (editingStreetSegmentId) {
       const feat = savedStreetSegments.find(f=>f.properties?.id===editingStreetSegmentId);
       setEditingStreetName(feat?.properties?.name || "");
       setEditingStreetDescription(feat?.properties?.description || "");
-      // Seed draggable endpoints for edit mode
+      // Seed draggable endpoints for edit mode only if not already initialized this session
       try {
-        const coords = feat?.geometry?.coordinates;
-        if (Array.isArray(coords) && coords.length >= 2) {
-          setStartPoint(coords[0]);
-          setEndPoint(coords[coords.length - 1]);
+        if (!initialStartRef.current && !initialEndRef.current) {
+          const coords = feat?.geometry?.coordinates;
+          if (Array.isArray(coords) && coords.length >= 2) {
+            initialStartRef.current = coords[0];
+            initialEndRef.current = coords[coords.length - 1];
+            userAdjustedStartRef.current = false;
+            userAdjustedEndRef.current = false;
+            debugSetStartPoint(coords[0], 'seed:enter-edit');
+            debugSetEndPoint(coords[coords.length - 1], 'seed:enter-edit');
+          }
         }
       } catch {}
     } else {
       setEditingStreetName("");
       setEditingStreetDescription("");
+      // Reset entry references on exit
+      initialStartRef.current = null;
+      initialEndRef.current = null;
+      userAdjustedStartRef.current = false;
+      userAdjustedEndRef.current = false;
     }
-  }, [editingStreetSegmentId, savedStreetSegments]);
+  }, [editingStreetSegmentId]);
   // Performance samples for street path build (last N)
   const [streetPerfSamples, setStreetPerfSamples] = useState([]); // each: { total, featureQuery, graphBuild, pathSolve, renderUpdate, ts }
 
@@ -1639,7 +1668,12 @@ export default function App() {
       const role = f.properties?.role;
       if (role !== 'start' && role !== 'end') return;
       dragging = role;
+      lastDraggedRoleRef.current = role;
       endpointDraggingRef.current = true;
+      dragMoved = false;
+      dragStartCoord = role === 'start' ? (startPoint ? [...startPoint] : null) : (endPoint ? [...endPoint] : null);
+      // eslint-disable-next-line no-console
+      console.log('[endpoint-drag] mousedown', { role, dragStartCoord, editingStreetSegmentId, startEndMode });
       try { m.getCanvas().style.cursor = 'grabbing'; } catch {}
       m.dragPan.disable();
     }
@@ -1647,13 +1681,38 @@ export default function App() {
       if (!dragging) return;
       const lng = e.lngLat.lng, lat = e.lngLat.lat;
       const now = performance.now();
-      // Throttle expensive snapping while moving; snap every ~80ms
+      dragMoved = true;
+      // In edit mode: snap to network each (throttled) move for constrained endpoints + live preview
+      // We still avoid auto endpoint reconcile elsewhere; this only adjusts endpoints proactively.
+      // Throttle high-cost recompute (path rebuild) separately from simple snapping.
+      const EDIT_RECOMPUTE_INTERVAL_MS = 260; // minimum time between forced recomputes while dragging
+      if (editingStreetSegmentId) {
+        // Always derive a snapped coordinate (not letting it float off-road)
+        const snapped = snapToNetwork([lng,lat]);
+        // Only update if meaningfully different to reduce redundant state churn
+        try {
+          const prev = dragging === 'start' ? startPoint : endPoint;
+          let shouldUpdate = true;
+          if (Array.isArray(prev)) {
+            const d = turf.distance(turf.point(prev), turf.point(snapped), { units:'meters' });
+            if (d < 0.12) shouldUpdate = false; // ignore micro jitter (<12cm)
+          }
+          if (shouldUpdate) {
+            if (dragging === 'start') debugSetStartPoint(snapped, 'drag:edit-snapped'); else debugSetEndPoint(snapped, 'drag:edit-snapped');
+          }
+        } catch {
+          if (dragging === 'start') debugSetStartPoint(snapped, 'drag:edit-snapped'); else debugSetEndPoint(snapped, 'drag:edit-snapped');
+        }
+        // No path recompute mid-drag in edit mode (prevents jump-back from path trimming); recompute only on mouseup.
+        return;
+      }
+      // Creation mode: throttle snapping (~80ms) while giving raw interim updates
       if (now - lastMoveTs > 80) {
         const snapped = snapToNetwork([lng,lat]);
-        if (dragging === 'start') setStartPoint(snapped); else setEndPoint(snapped);
+        if (dragging === 'start') debugSetStartPoint(snapped, 'drag:throttled'); else debugSetEndPoint(snapped, 'drag:throttled');
         lastMoveTs = now;
       } else {
-        if (dragging === 'start') setStartPoint([lng,lat]); else setEndPoint([lng,lat]);
+        if (dragging === 'start') debugSetStartPoint([lng,lat], 'drag:raw'); else debugSetEndPoint([lng,lat], 'drag:raw');
       }
     }
     function onMouseUp() {
@@ -1662,26 +1721,50 @@ export default function App() {
       endpointDraggingRef.current = false;
       try { m.getCanvas().style.cursor = ''; } catch {}
       m.dragPan.enable();
-      // Final snap commit
+      // Final snap commit (both modes). In edit mode endpoints were already snapped during drag; this ensures final precision.
       try {
-        if (Array.isArray(startPoint)) setStartPoint(snapToNetwork(startPoint));
-        if (Array.isArray(endPoint)) setEndPoint(snapToNetwork(endPoint));
+        if (dragMoved) {
+          if (lastDraggedRoleRef.current === 'start' && Array.isArray(startPoint)) {
+            debugSetStartPoint(snapToNetwork(startPoint), 'drag:mouseup-final-snap');
+          } else if (lastDraggedRoleRef.current === 'end' && Array.isArray(endPoint)) {
+            debugSetEndPoint(snapToNetwork(endPoint), 'drag:mouseup-final-snap');
+          }
+        }
       } catch {}
       // Mark user-adjusted flags if moved meaningfully from initial reference
       const dist = (a,b)=> (a&&b)? turf.distance(turf.point(a), turf.point(b), { units:'meters' }):0;
-      const MOVE_EPS_M = 0.4; // require noticeable movement
+      const MOVE_EPS_M = 0.15; // smaller threshold (~15cm) since small drags along same line are common
       try {
-        if (initialStartRef.current && startPoint && dist(initialStartRef.current, startPoint) > MOVE_EPS_M) {
+        if (dragMoved && lastDraggedRoleRef.current === 'start') {
           userAdjustedStartRef.current = true;
-        }
-        if (initialEndRef.current && endPoint && dist(initialEndRef.current, endPoint) > MOVE_EPS_M) {
+          lastAdjustTsRef.current.start = Date.now();
+        } else if (dragMoved && lastDraggedRoleRef.current === 'end') {
           userAdjustedEndRef.current = true;
+          lastAdjustTsRef.current.end = Date.now();
         }
       } catch {}
+      // Clear last dragged role after processing to avoid accidental future snaps
+      lastDraggedRoleRef.current = null;
+      // eslint-disable-next-line no-console
+      console.log('[endpoint-drag] mouseup', {
+        moved: dragMoved,
+        startPoint, endPoint,
+        userAdjustedStart: userAdjustedStartRef.current,
+        userAdjustedEnd: userAdjustedEndRef.current,
+        initialStart: initialStartRef.current,
+        initialEnd: initialEndRef.current,
+        editingStreetSegmentId
+      });
       // Debounce recompute to allow final state to settle
       if (dragRecomputeTimerRef.current) clearTimeout(dragRecomputeTimerRef.current);
       dragRecomputeTimerRef.current = setTimeout(() => {
-        try { recomputeStreetPathRef.current && recomputeStreetPathRef.current(); } catch {}
+        try {
+          if (editingStreetSegmentId) {
+            // Single intentional recompute after drag ends
+            forceEditRecomputeRef.current = true;
+          }
+          recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+        } catch {}
       }, 120);
     }
     // Guard: ensure layer exists first
@@ -2149,10 +2232,10 @@ export default function App() {
         return;
       }
       if (!startPoint) {
-        setStartPoint(snapped);
+        debugSetStartPoint(snapped, 'click:start');
         console.log('Start point:', JSON.stringify(snapped));
       } else if (!endPoint) {
-        setEndPoint(snapped);
+        debugSetEndPoint(snapped, 'click:end');
         console.log('End point:', JSON.stringify(snapped));
       } else {
         // Clear previous line and points before starting new selection
@@ -2164,8 +2247,8 @@ export default function App() {
 
           if (m.getSource('start-end-points')) m.removeSource('start-end-points');
         }
-        setStartPoint(snapped);
-        setEndPoint(null);
+        debugSetStartPoint(snapped, 'click:reset-new-start');
+        debugSetEndPoint(null, 'click:reset-clear-end');
   console.log('Resetting selection, new start:', JSON.stringify(snapped));
       }
     };
@@ -2194,6 +2277,22 @@ export default function App() {
 
     // Only highlight if both points are set and startEndMode is active
     if (startEndMode && startPoint && endPoint) {
+      // In edit mode suppress automatic recompute unless explicitly forced
+      if (editingStreetSegmentId && !forceEditRecomputeRef.current) {
+        // Suppress unless explicitly forced (periodic drag throttling or mouseup/tidy)
+        return;
+      }
+      // Clear the force flag (single-use) if it was set
+      if (forceEditRecomputeRef.current) forceEditRecomputeRef.current = false;
+      // Dedupe: skip heavy path recompute if inputs unchanged since last successful build
+      const pathInputsKeyRef = (App.__lastPathInputsRef ||= { current: null });
+      const keyObj = { s: startPoint, e: endPoint, use: useType };
+      const key = JSON.stringify(keyObj);
+      if (pathInputsKeyRef.current && pathInputsKeyRef.current.key === key && pathInputsKeyRef.current.nonce === streetPathNonce) {
+        // eslint-disable-next-line no-console
+        console.log('[street-path] skip duplicate recompute', keyObj);
+        return;
+      }
       // Suppress path rebuild while user is actively dragging an endpoint during edit of existing segment
       if (editingStreetSegmentId && endpointDraggingRefGlobal.current.current) {
         return; // skip recompute mid-drag
@@ -2631,7 +2730,7 @@ export default function App() {
         selectedRoadSegmentRef.current = finalLine;
         setEphemeralStreetPath(finalLine);
         // Add the layer to render the highlighted line if not present
-        const dashArray = editingStreetSegmentId ? [2,2] : [1,0]; // dashed when re-editing, solid otherwise
+  const dashArray = editingStreetSegmentId ? [2,2] : [1,0]; // dashed preview while editing
         if (!m.getLayer('selected-road-segment-layer')) {
           m.addLayer({
             id: 'selected-road-segment-layer',
@@ -2653,29 +2752,38 @@ export default function App() {
         try {
           const lenM = turf.length(finalLine, { units: 'meters' });
           setStreetPathLengthM(lenM);
-          // Snap visible draggable endpoints onto the finalized path to avoid drift
-          // Only update endpoint state if snapped coordinate differs beyond a tiny tolerance
-          const nearlyEqual = (a, b, eps = 1e-7) => Array.isArray(a) && Array.isArray(b) && Math.abs(a[0]-b[0]) < eps && Math.abs(a[1]-b[1]) < eps;
-          // Only auto-snap endpoints if user has NOT intentionally adjusted that endpoint during an edit session.
-          // This prevents the "jump back" after second edit where trimming rewrites coordinates.
-          if (Array.isArray(startPoint) && (!(editingStreetSegmentId && userAdjustedStartRef.current))) {
+          // During geometry edit of a saved segment, do NOT auto-adjust endpoints from the path effect
+          // to avoid any jump-back. The user’s drag defines authority; we only update the line.
+          if (!editingStreetSegmentId) {
+            const nearlyEqual = (a, b, eps = 1e-7) => Array.isArray(a) && Array.isArray(b) && Math.abs(a[0]-b[0]) < eps && Math.abs(a[1]-b[1]) < eps;
             try {
-              const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
-              if (sSnap?.geometry?.coordinates && !nearlyEqual(startPoint, sSnap.geometry.coordinates)) {
-                setStartPoint(sSnap.geometry.coordinates);
+              if (Array.isArray(startPoint)) {
+                const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
+                if (sSnap?.geometry?.coordinates && !nearlyEqual(startPoint, sSnap.geometry.coordinates)) {
+                  debugSetStartPoint(sSnap.geometry.coordinates, 'path:snap:start');
+                }
+              }
+              if (Array.isArray(endPoint)) {
+                const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
+                if (eSnap?.geometry?.coordinates && !nearlyEqual(endPoint, eSnap.geometry.coordinates)) {
+                  debugSetEndPoint(eSnap.geometry.coordinates, 'path:snap:end');
+                }
               }
             } catch {}
-          }
-          if (Array.isArray(endPoint) && (!(editingStreetSegmentId && userAdjustedEndRef.current))) {
-            try {
-              const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
-              if (eSnap?.geometry?.coordinates && !nearlyEqual(endPoint, eSnap.geometry.coordinates)) {
-                setEndPoint(eSnap.geometry.coordinates);
-              }
-            } catch {}
+            // eslint-disable-next-line no-console
+            console.log('[street-path] post-path endpoint reconcile', {
+              skippedStartSnap: false,
+              skippedEndSnap: false,
+              startPoint, endPoint
+            });
+          } else {
+            // eslint-disable-next-line no-console
+            console.log('[street-path] post-path endpoint reconcile SKIPPED (editing mode)');
           }
         } catch { setStreetPathLengthM(null); }
         const t4 = performance.now();
+        // Record last successful inputs (store globally on function object to survive re-renders without extra hook)
+        pathInputsKeyRef.current = { key, nonce: streetPathNonce };
         const sample = {
           total: t4 - t0,
             featureQuery: t1 - t0,
@@ -2702,7 +2810,26 @@ export default function App() {
     const src = m.getSource('street-endpoints');
     const layerExists = m.getLayer('street-endpoints-layer');
     if (!src) { try { m.addSource('street-endpoints', { type:'geojson', data:{ type:'FeatureCollection', features:[] } }); } catch {} }
-    if (!layerExists) { try { m.addLayer({ id:'street-endpoints-layer', type:'circle', source:'street-endpoints', paint:{ 'circle-radius':8, 'circle-color':['match',['get','type'],'start','#28a745','end','#ffc107','#888'], 'circle-stroke-width':2, 'circle-stroke-color':'#fff' } }); } catch {} }
+    if (!layerExists) {
+      try {
+        m.addLayer({
+          id:'street-endpoints-layer',
+          type:'circle',
+          source:'street-endpoints',
+          paint:{
+            'circle-radius':7,
+            'circle-color': [
+              'case',
+              ['==',['get','role'],'start'], '#00b461',
+              ['==',['get','role'],'end'], '#ffc400',
+              '#ff0000'
+            ],
+            'circle-stroke-width':1.5,
+            'circle-stroke-color':'#fff'
+          }
+        });
+      } catch {}
+    }
     if ((startPoint || endPoint) && m.getSource('street-endpoints')) {
       const feats = [];
       if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
@@ -2753,6 +2880,81 @@ export default function App() {
   }, [useType, streetsActive]);
 
   // --- Save / finalize helpers -----------------------------------
+
+  // Tidy: snap both endpoints to the current highlighted line and trim the line between them
+  function handleTidyEndpoints() {
+    if (!map.current) return;
+    if (!Array.isArray(startPoint) || !Array.isArray(endPoint)) return;
+    const m = map.current;
+    const getLine = () => {
+      try {
+        const src = m.getSource('selected-road-segment');
+        // @ts-ignore internal _data
+        const data = src?._data;
+        if (data && data.type === 'Feature' && data.geometry?.type === 'LineString') return data;
+      } catch {}
+      return selectedRoadSegmentRef.current;
+    };
+    const tidyWith = (lineData) => {
+      try {
+        const ln = turf.lineString(lineData.geometry.coordinates);
+        const sSnap = turf.nearestPointOnLine(ln, turf.point(startPoint));
+        const eSnap = turf.nearestPointOnLine(ln, turf.point(endPoint));
+        if (!sSnap?.geometry?.coordinates || !eSnap?.geometry?.coordinates) return;
+        const sC = sSnap.geometry.coordinates;
+        const eC = eSnap.geometry.coordinates;
+        // Update endpoints explicitly
+        debugSetStartPoint(sC, 'tidy:start');
+        debugSetEndPoint(eC, 'tidy:end');
+        // Trim the line exactly between snapped endpoints
+        let sliced = turf.lineSlice(sSnap, eSnap, ln);
+        if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+          // reverse fallback
+          sliced = turf.lineSlice(eSnap, sSnap, ln);
+          if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+            const first = sliced.geometry.coordinates[0];
+            const d1 = turf.distance(turf.point(first), sSnap);
+            const d2 = turf.distance(turf.point(first), eSnap);
+            if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+          }
+        }
+        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+          try {
+            if (!m.getSource('selected-road-segment')) {
+              m.addSource('selected-road-segment', { type:'geojson', data: sliced });
+            } else {
+              m.getSource('selected-road-segment').setData(sliced);
+            }
+            selectedRoadSegmentRef.current = sliced;
+            setEphemeralStreetPath(sliced);
+            const lenM = (()=>{ try { return turf.length(sliced, { units:'meters' }); } catch { return null; } })();
+            if (lenM != null) setStreetPathLengthM(lenM);
+            // eslint-disable-next-line no-console
+            console.log('[tidy] applied', { lenM });
+          } catch {}
+        }
+      } catch (e) {
+        console.warn('[tidy] failed', e);
+      }
+    };
+    let line = getLine();
+    if (!line) {
+      // Force a recompute (even in edit mode) then attempt tidy
+      try {
+        forceEditRecomputeRef.current = true;
+        recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+      } catch {}
+      setTimeout(()=>{ line = getLine(); if (line) tidyWith(line); else console.warn('[tidy] no line after forced recompute'); }, 220);
+      return;
+    }
+    // If a line exists but we are editing, we may want to regenerate it to reflect unsnapped drags
+    if (editingStreetSegmentId) {
+      try { forceEditRecomputeRef.current = true; recomputeStreetPathRef.current && recomputeStreetPathRef.current(); } catch {}
+      setTimeout(()=>{ const refreshed = getLine(); tidyWith(refreshed || line); }, 160);
+      return;
+    }
+    tidyWith(line);
+  }
 
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
   const canFinalizeStreets = streetsActive && !!startPoint && !!endPoint;
@@ -3651,6 +3853,9 @@ export default function App() {
                     )}
                     {editingStreetSegmentId && (
                       <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>
+                        <div style={{ display:'flex', gap:'0.5rem', marginBottom:'0.5rem', flexWrap:'wrap' }}>
+                          <button onClick={handleTidyEndpoints} className="btn btn--tidy" style={buttonVariants.info} title="Snap endpoints to the current line and trim line between them">Tidy endpoints to line</button>
+                        </div>
                         <EditForm
                           mode="street"
                           name={editingStreetName}
