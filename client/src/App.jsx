@@ -1685,26 +1685,10 @@ export default function App() {
       // In edit mode: snap to network each (throttled) move for constrained endpoints + live preview
       // We still avoid auto endpoint reconcile elsewhere; this only adjusts endpoints proactively.
       // Throttle high-cost recompute (path rebuild) separately from simple snapping.
-      const EDIT_RECOMPUTE_INTERVAL_MS = 260; // minimum time between forced recomputes while dragging
       if (editingStreetSegmentId) {
-        // Always derive a snapped coordinate (not letting it float off-road)
-        const snapped = snapToNetwork([lng,lat]);
-        // Only update if meaningfully different to reduce redundant state churn
-        try {
-          const prev = dragging === 'start' ? startPoint : endPoint;
-          let shouldUpdate = true;
-          if (Array.isArray(prev)) {
-            const d = turf.distance(turf.point(prev), turf.point(snapped), { units:'meters' });
-            if (d < 0.12) shouldUpdate = false; // ignore micro jitter (<12cm)
-          }
-          if (shouldUpdate) {
-            if (dragging === 'start') debugSetStartPoint(snapped, 'drag:edit-snapped'); else debugSetEndPoint(snapped, 'drag:edit-snapped');
-          }
-        } catch {
-          if (dragging === 'start') debugSetStartPoint(snapped, 'drag:edit-snapped'); else debugSetEndPoint(snapped, 'drag:edit-snapped');
-        }
-        // No path recompute mid-drag in edit mode (prevents jump-back from path trimming); recompute only on mouseup.
-        return;
+        // Edit mode: use raw pointer coordinates only (no snapping) to avoid hidden adjustments and jump-back.
+        if (dragging === 'start') debugSetStartPoint([lng,lat], 'drag:edit-raw'); else debugSetEndPoint([lng,lat], 'drag:edit-raw');
+        return; // recompute deferred until mouseup (with optional manual tidy)
       }
       // Creation mode: throttle snapping (~80ms) while giving raw interim updates
       if (now - lastMoveTs > 80) {
@@ -1721,16 +1705,18 @@ export default function App() {
       endpointDraggingRef.current = false;
       try { m.getCanvas().style.cursor = ''; } catch {}
       m.dragPan.enable();
-      // Final snap commit (both modes). In edit mode endpoints were already snapped during drag; this ensures final precision.
-      try {
-        if (dragMoved) {
-          if (lastDraggedRoleRef.current === 'start' && Array.isArray(startPoint)) {
-            debugSetStartPoint(snapToNetwork(startPoint), 'drag:mouseup-final-snap');
-          } else if (lastDraggedRoleRef.current === 'end' && Array.isArray(endPoint)) {
-            debugSetEndPoint(snapToNetwork(endPoint), 'drag:mouseup-final-snap');
+      // Final snap commit only in creation mode; edit mode leaves raw endpoints until user invokes Tidy.
+      if (!editingStreetSegmentId) {
+        try {
+          if (dragMoved) {
+            if (lastDraggedRoleRef.current === 'start' && Array.isArray(startPoint)) {
+              debugSetStartPoint(snapToNetwork(startPoint), 'drag:mouseup-final-snap');
+            } else if (lastDraggedRoleRef.current === 'end' && Array.isArray(endPoint)) {
+              debugSetEndPoint(snapToNetwork(endPoint), 'drag:mouseup-final-snap');
+            }
           }
-        }
-      } catch {}
+        } catch {}
+      }
       // Mark user-adjusted flags if moved meaningfully from initial reference
       const dist = (a,b)=> (a&&b)? turf.distance(turf.point(a), turf.point(b), { units:'meters' }):0;
       const MOVE_EPS_M = 0.15; // smaller threshold (~15cm) since small drags along same line are common
@@ -2886,74 +2872,102 @@ export default function App() {
     if (!map.current) return;
     if (!Array.isArray(startPoint) || !Array.isArray(endPoint)) return;
     const m = map.current;
-    const getLine = () => {
+    // Helper to update map with new line + endpoints
+    function applyLineAndEndpoints(lineFeature, sCoord, eCoord, meta) {
+      if (!lineFeature) return;
       try {
-        const src = m.getSource('selected-road-segment');
-        // @ts-ignore internal _data
-        const data = src?._data;
-        if (data && data.type === 'Feature' && data.geometry?.type === 'LineString') return data;
-      } catch {}
-      return selectedRoadSegmentRef.current;
-    };
-    const tidyWith = (lineData) => {
+        if (!m.getSource('selected-road-segment')) {
+          m.addSource('selected-road-segment', { type:'geojson', data: lineFeature });
+        } else {
+          m.getSource('selected-road-segment').setData(lineFeature);
+        }
+        selectedRoadSegmentRef.current = lineFeature;
+        setEphemeralStreetPath(lineFeature);
+        const lenM = (()=>{ try { return turf.length(lineFeature, { units:'meters' }); } catch { return null; } })();
+        if (lenM != null) setStreetPathLengthM(lenM);
+        debugSetStartPoint(sCoord, `tidy:start:${meta}`);
+        debugSetEndPoint(eCoord, `tidy:end:${meta}`);
+        // eslint-disable-next-line no-console
+        console.log('[tidy] applied', { meta, lenM });
+      } catch (e) { console.warn('[tidy] apply failed', e); }
+    }
+
+    // Edit mode: do immediate snap + slice independent of recompute timing
+    if (editingStreetSegmentId) {
       try {
-        const ln = turf.lineString(lineData.geometry.coordinates);
-        const sSnap = turf.nearestPointOnLine(ln, turf.point(startPoint));
-        const eSnap = turf.nearestPointOnLine(ln, turf.point(endPoint));
-        if (!sSnap?.geometry?.coordinates || !eSnap?.geometry?.coordinates) return;
-        const sC = sSnap.geometry.coordinates;
-        const eC = eSnap.geometry.coordinates;
-        // Update endpoints explicitly
-        debugSetStartPoint(sC, 'tidy:start');
-        debugSetEndPoint(eC, 'tidy:end');
-        // Trim the line exactly between snapped endpoints
-        let sliced = turf.lineSlice(sSnap, eSnap, ln);
-        if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
-          // reverse fallback
-          sliced = turf.lineSlice(eSnap, sSnap, ln);
+        const roadLayerIds = getRoadLayerIds(m);
+        const featuresRaw = m.queryRenderedFeatures({ layers: roadLayerIds }) || [];
+        const lines = featuresRaw.flatMap(f => {
+          if (!isDrivableRoad(f.properties)) return [];
+          if (f.geometry?.type === 'LineString') return [turf.lineString(f.geometry.coordinates)];
+            if (f.geometry?.type === 'MultiLineString') return f.geometry.coordinates.map(c=>turf.lineString(c));
+          return [];
+        });
+        if (!lines.length) { console.warn('[tidy] no road lines in view'); return; }
+        function nearestSnap(pt) {
+          let best=null,bestLine=null,min=Infinity,bestIdx=null; const target=turf.point(pt);
+          for (const ln of lines) {
+            try {
+              const snap=turf.nearestPointOnLine(ln,target,{units:'meters'});
+              if (snap && snap.properties && typeof snap.properties.dist==='number' && snap.properties.dist < min) {
+                min = snap.properties.dist; best = snap; bestLine = ln; bestIdx = snap.properties.index;
+              }
+            } catch {}
+          }
+          return best? { snap: best, line: bestLine, segIndex: bestIdx }: null;
+        }
+        const s = nearestSnap(startPoint);
+        const e = nearestSnap(endPoint);
+        if (!s || !e) { console.warn('[tidy] failed to snap endpoints'); return; }
+        // If both lie on the same underlying line, attempt precise slice
+        if (s.line && e.line && s.line === e.line) {
+          let sliced = turf.lineSlice(s.snap, e.snap, s.line);
+          if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+            sliced = turf.lineSlice(e.snap, s.snap, s.line);
+            if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+              const first = sliced.geometry.coordinates[0];
+              const d1 = turf.distance(turf.point(first), s.snap);
+              const d2 = turf.distance(turf.point(first), e.snap);
+              if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+            }
+          }
           if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
-            const first = sliced.geometry.coordinates[0];
-            const d1 = turf.distance(turf.point(first), sSnap);
-            const d2 = turf.distance(turf.point(first), eSnap);
-            if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+            applyLineAndEndpoints(sliced, s.snap.geometry.coordinates, e.snap.geometry.coordinates, 'edit-same-line');
+            return;
           }
         }
+        // Fallback: simple straight line between snapped endpoints (gives immediate feedback)
+        const straight = turf.lineString([s.snap.geometry.coordinates, e.snap.geometry.coordinates]);
+        applyLineAndEndpoints(straight, s.snap.geometry.coordinates, e.snap.geometry.coordinates, 'edit-straight-fallback');
+        // Optionally trigger a background full recompute to upgrade path (commented out for now)
+        // forceEditRecomputeRef.current = true; recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+      } catch (e) { console.warn('[tidy] edit-mode failure', e); }
+      return;
+    }
+
+    // Non-edit mode (creation) retains original logic using existing highlighted path
+    try {
+      const src = m.getSource('selected-road-segment');
+      // @ts-ignore
+      const data = src?._data;
+      if (!data || data.type !== 'Feature' || data.geometry?.type !== 'LineString') { console.warn('[tidy] no active line for creation mode'); return; }
+      const ln = turf.lineString(data.geometry.coordinates);
+      const sSnap = turf.nearestPointOnLine(ln, turf.point(startPoint));
+      const eSnap = turf.nearestPointOnLine(ln, turf.point(endPoint));
+      let sliced = turf.lineSlice(sSnap, eSnap, ln);
+      if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+        sliced = turf.lineSlice(eSnap, sSnap, ln);
         if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
-          try {
-            if (!m.getSource('selected-road-segment')) {
-              m.addSource('selected-road-segment', { type:'geojson', data: sliced });
-            } else {
-              m.getSource('selected-road-segment').setData(sliced);
-            }
-            selectedRoadSegmentRef.current = sliced;
-            setEphemeralStreetPath(sliced);
-            const lenM = (()=>{ try { return turf.length(sliced, { units:'meters' }); } catch { return null; } })();
-            if (lenM != null) setStreetPathLengthM(lenM);
-            // eslint-disable-next-line no-console
-            console.log('[tidy] applied', { lenM });
-          } catch {}
+          const first = sliced.geometry.coordinates[0];
+          const d1 = turf.distance(turf.point(first), sSnap);
+          const d2 = turf.distance(turf.point(first), eSnap);
+          if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
         }
-      } catch (e) {
-        console.warn('[tidy] failed', e);
       }
-    };
-    let line = getLine();
-    if (!line) {
-      // Force a recompute (even in edit mode) then attempt tidy
-      try {
-        forceEditRecomputeRef.current = true;
-        recomputeStreetPathRef.current && recomputeStreetPathRef.current();
-      } catch {}
-      setTimeout(()=>{ line = getLine(); if (line) tidyWith(line); else console.warn('[tidy] no line after forced recompute'); }, 220);
-      return;
-    }
-    // If a line exists but we are editing, we may want to regenerate it to reflect unsnapped drags
-    if (editingStreetSegmentId) {
-      try { forceEditRecomputeRef.current = true; recomputeStreetPathRef.current && recomputeStreetPathRef.current(); } catch {}
-      setTimeout(()=>{ const refreshed = getLine(); tidyWith(refreshed || line); }, 160);
-      return;
-    }
-    tidyWith(line);
+      if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+        applyLineAndEndpoints(sliced, sSnap.geometry.coordinates, eSnap.geometry.coordinates, 'creation');
+      }
+    } catch (e) { console.warn('[tidy] creation-mode failure', e); }
   }
 
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
