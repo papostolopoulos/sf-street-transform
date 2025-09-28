@@ -69,6 +69,11 @@ export default function App() {
   const [endPoint, setEndPoint] = useState(null);
   // Start point for segment selection
   const [startPoint, setStartPoint] = useState(null);
+  // Live refs to avoid stale closure values inside map event handlers
+  const startPointRef = useRef(startPoint);
+  const endPointRef = useRef(endPoint);
+  useEffect(() => { startPointRef.current = startPoint; }, [startPoint]);
+  useEffect(() => { endPointRef.current = endPoint; }, [endPoint]);
   // Length (meters) of current highlighted street path (M3 diagnostic / UX)
   const [streetPathLengthM, setStreetPathLengthM] = useState(null);
   // Manual recompute trigger (nonce) & ref helper for external callers (e.g., drag commit)
@@ -81,6 +86,9 @@ export default function App() {
   const [selectedStreetSegmentIndex, setSelectedStreetSegmentIndex] = useState(null);
   // Editing an existing saved street segment geometry (declare early so downstream hooks can reference)
   const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
+  // Live ref for editingStreetSegmentId to avoid stale closure inside map event handlers
+  const editingStreetSegmentIdRef = useRef(editingStreetSegmentId);
+  useEffect(() => { editingStreetSegmentIdRef.current = editingStreetSegmentId; }, [editingStreetSegmentId]);
   // Derived start/end selection mode: active while street tool selected OR re-editing an existing street segment geometry
   const startEndMode = streetsActive || !!editingStreetSegmentId;
 
@@ -113,6 +121,8 @@ export default function App() {
   // Track last dragged endpoint role & adjustment timestamps (debounce snapping overrides)
   const lastDraggedRoleRef = useRef(null);
   const lastAdjustTsRef = useRef({ start: 0, end: 0 });
+  // During edit, ignore soft reconcile for a brief window after mouseup to avoid snap-back
+  const softReconcileHoldMsRef = useRef(450);
   // Opt-in recompute flag for street geometry edit mode (prevents automatic path rebuilds)
   const forceEditRecomputeRef = useRef(false);
   // Saved zones & selection (moved earlier to support derived flags)
@@ -227,11 +237,20 @@ export default function App() {
             initialEndRef.current = coords[coords.length - 1];
             userAdjustedStartRef.current = false;
             userAdjustedEndRef.current = false;
+            // Reset recent-adjust timestamps for a fresh session
+            lastAdjustTsRef.current = { start: 0, end: 0 };
             debugSetStartPoint(coords[0], 'seed:enter-edit');
             debugSetEndPoint(coords[coords.length - 1], 'seed:enter-edit');
+            // Provide immediate length feedback from saved properties while recompute runs
+            try { setStreetPathLengthM(feat?.properties?.lengthM || null); } catch {}
+            try {
+              console.log('[edit-entry] seeded endpoints', { id: editingStreetSegmentId, start: coords[0], end: coords[coords.length - 1], lenM: feat?.properties?.lengthM });
+            } catch {}
           }
         }
-      } catch {}
+      } catch (e) {
+        try { console.warn('[endpoint-mouseup] commit failed in try block', e); } catch {}
+      }
     } else {
       setEditingStreetName("");
       setEditingStreetDescription("");
@@ -240,6 +259,7 @@ export default function App() {
       initialEndRef.current = null;
       userAdjustedStartRef.current = false;
       userAdjustedEndRef.current = false;
+      lastAdjustTsRef.current = { start: 0, end: 0 };
     }
   }, [editingStreetSegmentId]);
   // Performance samples for street path build (last N)
@@ -1575,6 +1595,7 @@ export default function App() {
     if (!map.current) return;
     const m = map.current;
     const src = m.getSource('street-endpoints');
+    const DEBUG_ENDPOINTS_SOURCE = true; // set to false to silence setData logs
     if (!src) {
       // Style may still be loading; retry after style.load once
       m.once('style.load', () => {
@@ -1587,7 +1608,16 @@ export default function App() {
                 const feats = [];
                 if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
                 if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
-                retry.setData({ type:'FeatureCollection', features:feats });
+                const fcRetry = { type:'FeatureCollection', features:feats };
+                retry.setData(fcRetry);
+                if (DEBUG_ENDPOINTS_SOURCE) {
+                  try {
+                    console.log('[street-endpoints] setData (retry after style.load)', {
+                      featureCount: fcRetry.features.length,
+                      features: fcRetry.features.map(f => ({ role: f.properties?.role, coords: f.geometry?.coordinates }))
+                    });
+                  } catch {}
+                }
               }
             },0);
           }
@@ -1599,11 +1629,41 @@ export default function App() {
     if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
     if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
     const fc = { type:'FeatureCollection', features: feats };
-    try { src.setData(fc); streetEndpointsFCRef.current = fc; } catch {}
+    try {
+      src.setData(fc);
+      streetEndpointsFCRef.current = fc;
+      if (DEBUG_ENDPOINTS_SOURCE) {
+        try {
+          console.log('[street-endpoints] setData', {
+            featureCount: fc.features.length,
+            features: fc.features.map(f => ({ role: f.properties?.role, coords: f.geometry?.coordinates }))
+          });
+        } catch {}
+      }
+    } catch {}
     // Visibility: show while in startEndMode even if one point missing; hide otherwise
     try {
       if (m.getLayer('street-endpoints-layer')) {
         m.setLayoutProperty('street-endpoints-layer','visibility', startEndMode ? 'visible':'none');
+        if (DEBUG_ENDPOINTS_SOURCE) {
+          try {
+            // Log layer properties and on-screen positions for debugging
+            const vis = m.getLayoutProperty('street-endpoints-layer','visibility');
+            const radius = m.getPaintProperty('street-endpoints-layer','circle-radius');
+            const color = m.getPaintProperty('street-endpoints-layer','circle-color');
+            const stroke = m.getPaintProperty('street-endpoints-layer','circle-stroke-color');
+            const container = m.getContainer && m.getContainer();
+            const w = container?.clientWidth, h = container?.clientHeight;
+            const screen = (fc.features || []).map(f => {
+              try {
+                const p = m.project(f.geometry?.coordinates);
+                return { role: f.properties?.role, x: Math.round(p.x), y: Math.round(p.y) };
+              } catch { return { role: f.properties?.role, x: null, y: null }; }
+            });
+            console.log('[street-endpoints] layer', { visibility: vis, radius, color, stroke });
+            console.log('[street-endpoints] screenPos', { size: { w, h }, screen });
+          } catch {}
+        }
       }
     } catch {}
   }, [startPoint, endPoint, startEndMode, basemapStyle]);
@@ -1641,7 +1701,8 @@ export default function App() {
     let dragging = null; // 'start' | 'end'
     let lastMoveTs = 0;
     const endpointDraggingRef = endpointDraggingRefGlobal.current;
-    function snapToNetwork(lngLatArr) {
+    const DEBUG_ENDPOINT_SNAP = true; // set true to trace final mouseup snapping decisions
+    function snapToNetwork(lngLatArr, opts) {
       try {
         const roadLayerIds = getRoadLayerIds(m);
         const featuresRaw = m.queryRenderedFeatures({ layers: roadLayerIds }) || [];
@@ -1658,6 +1719,17 @@ export default function App() {
             if (typeof d === 'number' && d < bestD) { bestD = d; best = snapped.geometry.coordinates; }
           } catch {}
         }
+        if (opts?.log && DEBUG_ENDPOINT_SNAP) {
+          try {
+            console.log('[snapToNetwork] final', {
+              phase: opts?.tag || 'unknown',
+              input: lngLatArr,
+              snapped: best || lngLatArr,
+              bestDistM: isFinite(bestD) ? bestD : null,
+              candidates: roadNetwork.length
+            });
+          } catch {}
+        }
         return best || lngLatArr;
       } catch { return lngLatArr; }
     }
@@ -1671,9 +1743,9 @@ export default function App() {
       lastDraggedRoleRef.current = role;
       endpointDraggingRef.current = true;
       dragMoved = false;
-      dragStartCoord = role === 'start' ? (startPoint ? [...startPoint] : null) : (endPoint ? [...endPoint] : null);
+  dragStartCoord = role === 'start' ? (startPointRef.current ? [...startPointRef.current] : null) : (endPointRef.current ? [...endPointRef.current] : null);
       // eslint-disable-next-line no-console
-      console.log('[endpoint-drag] mousedown', { role, dragStartCoord, editingStreetSegmentId, startEndMode });
+  console.log('[endpoint-drag] mousedown', { role, dragStartCoord, editingStreetSegmentId: editingStreetSegmentIdRef.current, startEndMode });
       try { m.getCanvas().style.cursor = 'grabbing'; } catch {}
       m.dragPan.disable();
     }
@@ -1685,10 +1757,20 @@ export default function App() {
       // In edit mode: snap to network each (throttled) move for constrained endpoints + live preview
       // We still avoid auto endpoint reconcile elsewhere; this only adjusts endpoints proactively.
       // Throttle high-cost recompute (path rebuild) separately from simple snapping.
-      if (editingStreetSegmentId) {
-        // Edit mode: use raw pointer coordinates only (no snapping) to avoid hidden adjustments and jump-back.
-        if (dragging === 'start') debugSetStartPoint([lng,lat], 'drag:edit-raw'); else debugSetEndPoint([lng,lat], 'drag:edit-raw');
-        return; // recompute deferred until mouseup (with optional manual tidy)
+  if (editingStreetSegmentIdRef.current) {
+        // Edit mode: snap to road each move and throttle live recompute so the dashed line tracks roads like creation flow
+        const snapped = snapToNetwork([lng,lat]);
+        if (dragging === 'start') debugSetStartPoint(snapped, 'drag:edit-snapped'); else debugSetEndPoint(snapped, 'drag:edit-snapped');
+        // Throttle recompute (~220ms) during drag; allow while dragging if force flag is set
+        const EDIT_RECOMPUTE_MS = 220;
+        if (now - lastMoveTs > EDIT_RECOMPUTE_MS) {
+          try {
+            forceEditRecomputeRef.current = true;
+            recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+          } catch {}
+          lastMoveTs = now;
+        }
+        return;
       }
       // Creation mode: throttle snapping (~80ms) while giving raw interim updates
       if (now - lastMoveTs > 80) {
@@ -1705,21 +1787,48 @@ export default function App() {
       endpointDraggingRef.current = false;
       try { m.getCanvas().style.cursor = ''; } catch {}
       m.dragPan.enable();
-      // Final snap commit only in creation mode; edit mode leaves raw endpoints until user invokes Tidy.
-      if (!editingStreetSegmentId) {
-        try {
-          if (dragMoved) {
-            if (lastDraggedRoleRef.current === 'start' && Array.isArray(startPoint)) {
-              debugSetStartPoint(snapToNetwork(startPoint), 'drag:mouseup-final-snap');
-            } else if (lastDraggedRoleRef.current === 'end' && Array.isArray(endPoint)) {
-              debugSetEndPoint(snapToNetwork(endPoint), 'drag:mouseup-final-snap');
-            }
+      // Final snap commit (both modes) to ensure precise on-road endpoint
+      try {
+        if (dragMoved) {
+          console.log("INSIDE THE if(dragMoved) STATEMENT")
+          // Extra diagnostics: confirm we entered the commit branch on mouseup
+          if (DEBUG_ENDPOINT_SNAP) {
+            try {
+              console.log('[endpoint-mouseup] dragMoved=true', {
+                role: lastDraggedRoleRef.current,
+                startPoint: startPointRef.current,
+                endPoint: endPointRef.current
+              });
+            } catch {}
           }
-        } catch {}
-      }
+          if (lastDraggedRoleRef.current === 'start' && Array.isArray(startPointRef.current)) {
+            const before = [...startPointRef.current];
+            const snapped = snapToNetwork(startPointRef.current, { log: true, tag: 'mouseup-start' });
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-commit] start', { snapped }); } catch {}
+            }
+            debugSetStartPoint(snapped, 'drag:mouseup-final-snap');
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-snap] start mouseup', { before, after: snapped }); } catch {}
+            }
+            lastAdjustTsRef.current.start = Date.now();
+          } else if (lastDraggedRoleRef.current === 'end' && Array.isArray(endPointRef.current)) {
+            const before = [...endPointRef.current];
+            const snapped = snapToNetwork(endPointRef.current, { log: true, tag: 'mouseup-end' });
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-commit] end', { snapped }); } catch {}
+            }
+            debugSetEndPoint(snapped, 'drag:mouseup-final-snap');
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-snap] end mouseup', { before, after: snapped }); } catch {}
+            }
+            lastAdjustTsRef.current.end = Date.now();
+          }
+        }
+      } catch {}
       // Mark user-adjusted flags if moved meaningfully from initial reference
       const dist = (a,b)=> (a&&b)? turf.distance(turf.point(a), turf.point(b), { units:'meters' }):0;
-      const MOVE_EPS_M = 0.15; // smaller threshold (~15cm) since small drags along same line are common
+  const MOVE_EPS_M = 0.15; // smaller threshold (~15cm) since small drags along same line are common
       try {
         if (dragMoved && lastDraggedRoleRef.current === 'start') {
           userAdjustedStartRef.current = true;
@@ -1734,23 +1843,27 @@ export default function App() {
       // eslint-disable-next-line no-console
       console.log('[endpoint-drag] mouseup', {
         moved: dragMoved,
-        startPoint, endPoint,
+        startPoint: startPointRef.current, endPoint: endPointRef.current,
         userAdjustedStart: userAdjustedStartRef.current,
         userAdjustedEnd: userAdjustedEndRef.current,
         initialStart: initialStartRef.current,
         initialEnd: initialEndRef.current,
-        editingStreetSegmentId
+        editingStreetSegmentId: editingStreetSegmentIdRef.current
       });
       // Debounce recompute to allow final state to settle
       if (dragRecomputeTimerRef.current) clearTimeout(dragRecomputeTimerRef.current);
+      try { console.log('[endpoint-drag] schedule recompute after mouseup', { delayMs: 120, editingStreetSegmentId: editingStreetSegmentIdRef.current }); } catch {}
       dragRecomputeTimerRef.current = setTimeout(() => {
         try {
-          if (editingStreetSegmentId) {
+          try { console.log('[endpoint-drag] invoking recomputeStreetPath', { forceEdit: !!editingStreetSegmentIdRef.current }); } catch {}
+          if (editingStreetSegmentIdRef.current) {
             // Single intentional recompute after drag ends
             forceEditRecomputeRef.current = true;
           }
           recomputeStreetPathRef.current && recomputeStreetPathRef.current();
-        } catch {}
+        } catch (e) {
+          try { console.warn('[endpoint-drag] recompute after mouseup failed', e); } catch {}
+        }
       }, 120);
     }
     // Guard: ensure layer exists first
@@ -2069,6 +2182,8 @@ export default function App() {
 
     // Helper: Snap to nearest point on any road (LineString)
     function getNearestRoadPoint(lngLat) {
+      const DEBUG_SNAP = false; // set true to see summary logs
+      const DEBUG_SNAP_VERBOSE = false; // set true to see per-feature/segment diagnostics
       // Use a generous pixel box around the click for candidate roads
       const projected = m.project([lngLat.lng, lngLat.lat]);
       if (!projected || typeof projected.x !== 'number' || typeof projected.y !== 'number') {
@@ -2121,7 +2236,7 @@ export default function App() {
             snappedDist = snapped?.properties?.dist;
           }
         } catch (e) {
-          console.warn('[getNearestRoadPoint] line snapping error (LineString)', e);
+          if (DEBUG_SNAP) console.warn('[getNearestRoadPoint] line snapping error (LineString)', e);
         }
       } else if (f.geometry?.type === "MultiLineString") {
         try {
@@ -2138,19 +2253,21 @@ export default function App() {
                 minDist = snapped.properties.dist;
                 bestSnapped = snapped;
               }
-              console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped?.properties?.dist}`);
+              if (DEBUG_SNAP_VERBOSE) console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped?.properties?.dist}`);
             } catch {/* ignore individual segment errors */}
           });
           if (bestSnapped) {
             snappedDist = bestSnapped.properties.dist;
           }
         } catch (e) {
-          console.warn('[getNearestRoadPoint] line snapping error (MultiLineString)', e);
+          if (DEBUG_SNAP) console.warn('[getNearestRoadPoint] line snapping error (MultiLineString)', e);
         }
       }
-      console.log(`Feature #${i} layer.id: ${f.layer?.id} isDrivable: ${isDrivable} snapped distance: ${snappedDist} geometry.type: ${f.geometry?.type} properties:`, f.properties);
-      if (f.geometry?.type !== "LineString") {
-        console.log(`Feature #${i} full object:`, f);
+      if (DEBUG_SNAP_VERBOSE) {
+        console.log(`Feature #${i} layer.id: ${f.layer?.id} isDrivable: ${isDrivable} snapped distance: ${snappedDist} geometry.type: ${f.geometry?.type} properties:`, f.properties);
+        if (f.geometry?.type !== "LineString") {
+          console.log(`Feature #${i} full object:`, f);
+        }
       }
     });
 
@@ -2200,11 +2317,12 @@ export default function App() {
         }
       }
     }
-    // Only snap if within 80 meters (TEMPORARY for debugging)
+    // Only snap if within 80 meters
     if (best && bestDist <= 80) {
+      if (DEBUG_SNAP) console.log('[getNearestRoadPoint] final snapped distance (meters):', bestDist, 'coord:', best);
       return best;
     } else {
-      console.warn('No drivable road within 30 meters of click:', lngLat);
+      if (DEBUG_SNAP) console.warn('No drivable road within 80 meters of click:', lngLat);
       return null;
     }
     }
@@ -2265,10 +2383,10 @@ export default function App() {
     if (startEndMode && startPoint && endPoint) {
       // In edit mode suppress automatic recompute unless explicitly forced
       if (editingStreetSegmentId && !forceEditRecomputeRef.current) {
-        // Suppress unless explicitly forced (periodic drag throttling or mouseup/tidy)
+        // Suppress unless explicitly forced (periodic drag throttling, mouseup, or tidy)
         return;
       }
-      // Clear the force flag (single-use) if it was set
+      // Clear the force flag (single-use) so subsequent recomputes are suppressed again
       if (forceEditRecomputeRef.current) forceEditRecomputeRef.current = false;
       // Dedupe: skip heavy path recompute if inputs unchanged since last successful build
       const pathInputsKeyRef = (App.__lastPathInputsRef ||= { current: null });
@@ -2279,9 +2397,9 @@ export default function App() {
         console.log('[street-path] skip duplicate recompute', keyObj);
         return;
       }
-      // Suppress path rebuild while user is actively dragging an endpoint during edit of existing segment
-      if (editingStreetSegmentId && endpointDraggingRefGlobal.current.current) {
-        return; // skip recompute mid-drag
+      // Suppress path rebuild while dragging unless we explicitly forced it
+      if (editingStreetSegmentId && endpointDraggingRefGlobal.current.current && !forceEditRecomputeRef.current) {
+        return; // skip recompute mid-drag unless forced
       }
       const t0 = performance.now();
       // Always snap both points to nearest road segment using all visible drivable roads
@@ -2735,38 +2853,56 @@ export default function App() {
             m.setPaintProperty('selected-road-segment-layer','line-dasharray', dashArray);
           } catch {}
         }
-        try {
-          const lenM = turf.length(finalLine, { units: 'meters' });
-          setStreetPathLengthM(lenM);
-          // During geometry edit of a saved segment, do NOT auto-adjust endpoints from the path effect
-          // to avoid any jump-back. The user’s drag defines authority; we only update the line.
-          if (!editingStreetSegmentId) {
+          try {
+            const lenM = turf.length(finalLine, { units: 'meters' });
+            setStreetPathLengthM(lenM);
             const nearlyEqual = (a, b, eps = 1e-7) => Array.isArray(a) && Array.isArray(b) && Math.abs(a[0]-b[0]) < eps && Math.abs(a[1]-b[1]) < eps;
-            try {
-              if (Array.isArray(startPoint)) {
-                const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
-                if (sSnap?.geometry?.coordinates && !nearlyEqual(startPoint, sSnap.geometry.coordinates)) {
-                  debugSetStartPoint(sSnap.geometry.coordinates, 'path:snap:start');
+            if (!editingStreetSegmentId) {
+              try {
+                if (Array.isArray(startPoint)) {
+                  const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
+                  if (sSnap?.geometry?.coordinates && !nearlyEqual(startPoint, sSnap.geometry.coordinates)) {
+                    debugSetStartPoint(sSnap.geometry.coordinates, 'path:snap:start');
+                  }
                 }
-              }
-              if (Array.isArray(endPoint)) {
-                const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
-                if (eSnap?.geometry?.coordinates && !nearlyEqual(endPoint, eSnap.geometry.coordinates)) {
-                  debugSetEndPoint(eSnap.geometry.coordinates, 'path:snap:end');
+                if (Array.isArray(endPoint)) {
+                  const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
+                  if (eSnap?.geometry?.coordinates && !nearlyEqual(endPoint, eSnap.geometry.coordinates)) {
+                    debugSetEndPoint(eSnap.geometry.coordinates, 'path:snap:end');
+                  }
                 }
-              }
-            } catch {}
-            // eslint-disable-next-line no-console
-            console.log('[street-path] post-path endpoint reconcile', {
-              skippedStartSnap: false,
-              skippedEndSnap: false,
-              startPoint, endPoint
-            });
-          } else {
-            // eslint-disable-next-line no-console
-            console.log('[street-path] post-path endpoint reconcile SKIPPED (editing mode)');
-          }
-        } catch { setStreetPathLengthM(null); }
+              } catch {}
+              // eslint-disable-next-line no-console
+              console.log('[street-path] post-path endpoint reconcile', { mode: 'creation', startPoint, endPoint });
+            } else {
+              // Edit mode: soft reconcile endpoints onto the computed path only if visibly off (> 0.4m)
+              try {
+                const isDragging = endpointDraggingRefGlobal.current?.current === true;
+                // Also hold for a short window after a mouseup adjustment to avoid immediate override
+                const nowTs = Date.now();
+                const recentlyAdjusted = (roleTs) => (nowTs - roleTs) < softReconcileHoldMsRef.current;
+                if (!isDragging && !recentlyAdjusted(lastAdjustTsRef.current.start) && !recentlyAdjusted(lastAdjustTsRef.current.end)) {
+                const THRESH_M = 0.4;
+                if (Array.isArray(startPoint)) {
+                  const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
+                  const d = turf.pointToLineDistance(turf.point(startPoint), finalLine, { units: 'meters' });
+                  if (sSnap?.geometry?.coordinates && typeof d === 'number' && d > THRESH_M) {
+                    debugSetStartPoint(sSnap.geometry.coordinates, 'path:edit-soft-reconcile:start');
+                  }
+                }
+                if (Array.isArray(endPoint)) {
+                  const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
+                  const d = turf.pointToLineDistance(turf.point(endPoint), finalLine, { units: 'meters' });
+                  if (eSnap?.geometry?.coordinates && typeof d === 'number' && d > THRESH_M) {
+                    debugSetEndPoint(eSnap.geometry.coordinates, 'path:edit-soft-reconcile:end');
+                  }
+                }
+                }
+              } catch {}
+              // eslint-disable-next-line no-console
+              console.log('[street-path] post-path endpoint reconcile', { mode: 'edit-soft', dragging: endpointDraggingRefGlobal.current?.current === true, startPoint, endPoint });
+            }
+          } catch { setStreetPathLengthM(null); }
         const t4 = performance.now();
         // Record last successful inputs (store globally on function object to survive re-renders without extra hook)
         pathInputsKeyRef.current = { key, nonce: streetPathNonce };
@@ -2828,6 +2964,20 @@ export default function App() {
   useEffect(() => {
     if (!map.current) return;
     if (!(startEndMode || editingStreetSegmentId)) return;
+    // Dedupe: avoid duplicate logs when React StrictMode re-invokes effects or when multiple state updates batch
+    const snapshot = {
+      startEndMode: !!startEndMode,
+      editingStreetSegmentId: editingStreetSegmentId || null,
+      startPoint: Array.isArray(startPoint) ? startPoint : null,
+      endPoint: Array.isArray(endPoint) ? endPoint : null,
+      basemapStyle: basemapStyle || null,
+      streetsActive: !!streetsActive,
+      activeTool: activeTool || null
+    };
+    const snapStr = JSON.stringify(snapshot);
+    App.__diagPrevSnap ||= { current: null };
+    if (App.__diagPrevSnap.current === snapStr) return;
+    App.__diagPrevSnap.current = snapStr;
     const m = map.current;
     let featureCount = null;
     try {
@@ -3014,21 +3164,43 @@ export default function App() {
   function finalizeStreetSelection() {
     if (!map.current) return;
     const m = map.current;
+    // Prefer the freshest in-memory path, then fall back to the map source _data
     const src = m.getSource('selected-road-segment');
-    let lineData = null;
-    try {
-      // MapLibre internal data reference (non-public API but works for local state)
-      // @ts-ignore
-      lineData = src?._data || null;
-    } catch {}
-    if (!lineData || lineData.type !== 'Feature' || lineData.geometry?.type !== 'LineString') {
+    /** @type {import('geojson').Feature | null} */
+    let candidate = null;
+    try { candidate = selectedRoadSegmentRef.current || ephemeralStreetPath || (src && src._data) || null; } catch {}
+    if (!candidate || candidate.type !== 'Feature' || candidate.geometry?.type !== 'LineString' || !Array.isArray(candidate.geometry.coordinates)) {
       return; // nothing to save
     }
-    const lenM = streetPathLengthM || (() => { try { return turf.length(lineData, { units: 'meters' }); } catch { return null; } })();
+    // If we have current endpoints, slice the line exactly between them to avoid saving stale ends
+    let lineToSave = candidate;
+    try {
+      const s = Array.isArray(startPointRef.current) ? startPointRef.current : null;
+      const e = Array.isArray(endPointRef.current) ? endPointRef.current : null;
+      if (s && e) {
+        const sSnap = turf.nearestPointOnLine(candidate, turf.point(s));
+        const eSnap = turf.nearestPointOnLine(candidate, turf.point(e));
+        let sliced = turf.lineSlice(sSnap, eSnap, candidate);
+        if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+          sliced = turf.lineSlice(eSnap, sSnap, candidate);
+          // keep direction start->end if we reversed
+          if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+            const first = sliced.geometry.coordinates[0];
+            const d1 = turf.distance(turf.point(first), turf.point(s));
+            const d2 = turf.distance(turf.point(first), turf.point(e));
+            if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+          }
+        }
+        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+          lineToSave = sliced;
+        }
+      }
+    } catch {}
+    const lenM = streetPathLengthM || (() => { try { return turf.length(lineToSave, { units: 'meters' }); } catch { return null; } })();
     // Collect intersecting/overlapping street names for the line itself
     let streets = [];
     try {
-      const lineFeature = turf.lineString(lineData.geometry.coordinates);
+      const lineFeature = turf.lineString(lineToSave.geometry.coordinates);
       streets = getStreetLineNames(m, lineFeature);
     } catch {}
     const baseProps = {
@@ -3039,18 +3211,37 @@ export default function App() {
       streets,
       createdAt: Date.now()
     };
+    try {
+      console.log('[finalizeStreetSelection]', {
+        source: selectedRoadSegmentRef.current ? 'memory:selectedRoadSegmentRef' : (ephemeralStreetPath ? 'memory:ephemeralStreetPath' : 'mapSource:_data'),
+        coordsCount: lineToSave.geometry?.coordinates?.length,
+        startRef: startPointRef.current,
+        endRef: endPointRef.current,
+        lenM
+      });
+    } catch {}
     if (editingStreetSegmentId) {
-      // Update existing
+      // Update existing with diagnostics of old vs new
+      const old = savedStreetSegments.find(f => f.properties?.id === editingStreetSegmentId);
+      try {
+        const oldStart = old?.geometry?.coordinates?.[0];
+        const oldEnd = old?.geometry?.coordinates?.[old?.geometry?.coordinates?.length - 1];
+        const oldLen = old ? (old.properties?.lengthM ?? (()=>{ try { return turf.length(old,{units:'meters'}) } catch { return null; } })()) : null;
+        const newStart = lineToSave.geometry?.coordinates?.[0];
+        const newEnd = lineToSave.geometry?.coordinates?.[lineToSave.geometry?.coordinates?.length - 1];
+        const newLen = lenM ?? (()=>{ try { return turf.length(lineToSave,{units:'meters'}) } catch { return null; } })();
+        console.log('[finalizeStreetSelection:update-existing]', { id: editingStreetSegmentId, oldStart, oldEnd, oldLen, newStart, newEnd, newLen });
+      } catch {}
       setSavedStreetSegments(prev => prev.map(f => f.properties?.id === editingStreetSegmentId ? {
         type: 'Feature',
-        geometry: { type: 'LineString', coordinates: [...lineData.geometry.coordinates] },
+        geometry: { type: 'LineString', coordinates: [...lineToSave.geometry.coordinates] },
         properties: { ...f.properties, ...baseProps, id: editingStreetSegmentId, updatedAt: Date.now() }
       } : f));
   clearEditingStreetSegment('finalizeStreetSelection:saveExisting');
     } else {
       const newFeature = {
         type: 'Feature',
-        geometry: { type: 'LineString', coordinates: [...lineData.geometry.coordinates] },
+        geometry: { type: 'LineString', coordinates: [...lineToSave.geometry.coordinates] },
         properties: { ...baseProps, id: genId() }
       };
   setSavedStreetSegments(prev => [newFeature, ...prev]);
@@ -4148,25 +4339,17 @@ export default function App() {
                                 onClick={() => {
                                   if (anyEditLock) return;
                                   try {
-                                    const coords = f.geometry?.coordinates;
-                                    if (Array.isArray(coords) && coords.length >= 2) {
-                                      setStartPoint(coords[0]);
-                                      setEndPoint(coords[coords.length -1]);
-                                      setEditingStreetSegmentId(segId);
-                                      // Seed initial refs & reset adjustment flags for this edit session
-                                      initialStartRef.current = coords[0];
-                                      initialEndRef.current = coords[coords.length -1];
-                                      userAdjustedStartRef.current = false;
-                                      userAdjustedEndRef.current = false;
-                                      setStreetPathLengthM(f.properties?.lengthM || null);
-                                      setActiveTool('street');
-                                      if (recomputeStreetPathRef.current) setTimeout(()=>recomputeStreetPathRef.current(),0);
-                                      if (map.current) {
-                                        try {
-                                          const bb = turf.bbox(f);
-                                          map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
-                                        } catch {}
-                                      }
+                                    // Enter street geometry edit mode using the freshest saved geometry.
+                                    // Do NOT seed endpoints from this captured list item; let the
+                                    // useEffect([editingStreetSegmentId]) locate the feature by id
+                                    // in the latest savedStreetSegments and seed start/end + refs there.
+                                    setActiveTool('street');
+                                    setEditingStreetSegmentId(segId);
+                                    if (map.current) {
+                                      try {
+                                        const bb = turf.bbox(f);
+                                        map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                      } catch {}
                                     }
                                   } catch {}
                                 }}
