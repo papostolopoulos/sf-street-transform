@@ -5,6 +5,85 @@ import maplibregl from "maplibre-gl";
 import EditForm from './components/EditForm.jsx';
 import { colorByUse as themeColorByUse } from './theme.js';
 
+// Global debug silencer: set to true to suppress verbose debug logs
+const SILENCE_DEBUG_LOGS = true;
+// Wrap console methods to silence known debug/tagged logs while leaving errors intact
+(() => {
+  if (!SILENCE_DEBUG_LOGS) return;
+  try {
+    const original = {
+      log: console.log.bind(console),
+      warn: console.warn.bind(console),
+      groupCollapsed: console.groupCollapsed ? console.groupCollapsed.bind(console) : (...a)=>console.log(...a),
+    };
+    const TAG_PREFIXES = [
+      '[endpoint-',
+      '[street-',
+      '[snapToNetwork]',
+      '[style-switch]',
+      '[PolygonEdit]',
+      '[validate',
+      '[tidy]',
+      '[finalizeStreetSelection]',
+      '[finalizeStreetSelection:update-existing]',
+      '[street-perf]',
+      '[endpoint-diagnostics]'
+    ];
+    const PLAIN_PREFIXES = [
+      'startEndMode changed:',
+      'getRoadLayerIds:',
+      'Candidate features from queryRenderedFeatures:',
+      'Feature #',
+      'Drivable candidate:',
+      'Resetting selection, new start:',
+      'Start point:',
+      'End point:'
+    ];
+    const shouldSilence = (args) => {
+      const first = String(args?.[0] ?? '');
+      return TAG_PREFIXES.some(p => first.startsWith(p)) ||
+             PLAIN_PREFIXES.some(p => first.startsWith(p));
+    };
+    console.log = (...args) => { if (shouldSilence(args)) return; original.log(...args); };
+    console.groupCollapsed = (...args) => { if (shouldSilence(args)) return; original.groupCollapsed(...args); };
+    console.warn = (...args) => { if (shouldSilence(args)) return; original.warn(...args); };
+  } catch {}
+})();
+
+// Lightweight, toggleable debug logger
+// Enable by adding ?debug=1 to the URL or setting localStorage.setItem('sfst_debug','1')
+const __dbg = (() => {
+  let enabled = false;
+  let tagFilter = null; // optional comma-separated tags in localStorage 'sfst_debug_tags'
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    if (qs.get('debug')) enabled = true;
+  } catch {}
+  try {
+    const ls = localStorage.getItem('sfst_debug');
+    if (ls === '1' || ls === 'true') enabled = true;
+    const tags = localStorage.getItem('sfst_debug_tags');
+    if (tags && typeof tags === 'string') tagFilter = new Set(tags.split(',').map(s => s.trim()).filter(Boolean));
+  } catch {}
+  function ok(tag) {
+    if (!enabled) return false;
+    if (!tagFilter) return true;
+    return tagFilter.has(tag);
+  }
+  return {
+    enabled: () => enabled,
+    log(tag, msg, data) {
+      try { if (ok(tag)) console.log(`[dbg:${tag}] ${msg}`, data ?? ''); } catch {}
+    },
+    time(tag, label) {
+      try { if (ok(tag)) console.time(`[dbg:${tag}] ${label}`); } catch {}
+    },
+    timeEnd(tag, label) {
+      try { if (ok(tag)) console.timeEnd(`[dbg:${tag}] ${label}`); } catch {}
+    }
+  };
+})();
+
 // Simple id generator (not crypto strong but stable enough for local features)
 function genId() {
   return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,9);
@@ -125,6 +204,8 @@ export default function App() {
   const softReconcileHoldMsRef = useRef(450);
   // Opt-in recompute flag for street geometry edit mode (prevents automatic path rebuilds)
   const forceEditRecomputeRef = useRef(false);
+  // Seed flag to avoid reseeding useType after user changes it during an edit session
+  const seededUseTypeOnEntryRef = useRef(false);
   // Saved zones & selection (moved earlier to support derived flags)
   const [savedZones, setSavedZones] = useState([]);
   const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
@@ -274,6 +355,14 @@ export default function App() {
   }
   // Zone type state
   const [useType, setUseType] = useState("mixed-use");
+  // Wrapper with diagnostics to track all useType changes and source context
+  const updateUseType = React.useCallback((next) => {
+    try {
+      // eslint-disable-next-line no-console
+      console.log('[useType] set', { from: useType, to: next, context: (editingStreetSegmentId ? 'street-edit' : (polygonActive ? 'polygon' : 'global')) });
+    } catch {}
+    setUseType(next);
+  }, [useType, editingStreetSegmentId, polygonActive]);
   // Ephemeral summary (unsaved street path) for fresh load first street action (placed after dependent state declarations)
   const ephemeralStreetPathSummary = React.useMemo(()=>{
     if (!streetsActive) return null;
@@ -655,6 +744,28 @@ export default function App() {
       });
     }
 
+    // Edit delta overlay (dashed preview of change length near moved endpoints)
+    if (!mapInstance.getSource('edit-delta')) {
+      mapInstance.addSource('edit-delta', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('edit-delta-layer')) {
+      mapInstance.addLayer({
+        id: 'edit-delta-layer',
+        type: 'line',
+        source: 'edit-delta',
+        paint: {
+          'line-color': '#333',
+          'line-width': 4,
+          'line-opacity': 0.85,
+          'line-dasharray': [2, 2]
+        },
+        layout: { visibility: 'none' }
+      });
+    }
+
     // Saved zones layers
     if (!mapInstance.getLayer("saved-zones-fill")) {
       mapInstance.addLayer({
@@ -744,7 +855,14 @@ export default function App() {
         type: 'line',
         source: 'saved-street-segments',
         paint: {
-          'line-color': ['match', ['get','useType'], 'residential', '#87CEEB', 'commercial', '#FF6347', 'mixed-use', '#FFD700', '#FFD700'],
+          'line-color': [
+            'match', 
+            ['get', 'useType'], 
+            'residential', colorByUse.residential,
+            'commercial', colorByUse.commercial, 
+            'mixed-use', colorByUse['mixed-use'],
+            colorByUse['mixed-use'] // default fallback
+          ],
           'line-width': 5,
           'line-opacity': 0.9
         }
@@ -848,14 +966,39 @@ export default function App() {
     mapInstance.getSource("saved-centroids")?.setData(savedCentroidsFC);
 
     // Saved street segments
+    // Exclude the segment currently being edited so it doesn't double-draw under the ephemeral layer
     const segsFC = {
       type: 'FeatureCollection',
-      features: (savedStreetSegments || []).map((f,i) => ({
-        ...f,
-        properties: { ...(f.properties||{}), __sid: i }
-      }))
+      features: (savedStreetSegments || [])
+        .filter(f => {
+          const fid = f?.properties?.id || f?.id;
+          return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+        })
+        .map((f,i) => ({
+          ...f,
+          properties: { ...(f.properties||{}), __sid: i }
+        }))
     };
     mapInstance.getSource('saved-street-segments')?.setData(segsFC);
+    
+    // Update saved street segments layer color to match colorByUse dynamically
+    if (mapInstance.getLayer('saved-street-segments-line')) {
+      try {
+        const colorExpression = [
+          'match', 
+          ['get', 'useType'], 
+          'residential', colorByUse.residential,
+          'commercial', colorByUse.commercial, 
+          'mixed-use', colorByUse['mixed-use'],
+          colorByUse['mixed-use'] // default fallback
+        ];
+        mapInstance.setPaintProperty('saved-street-segments-line', 'line-color', colorExpression);
+        console.log('[refreshMapData] updated saved street segments colors:', colorExpression);
+      } catch (e) {
+        console.warn('[refreshMapData] failed to update saved street segments colors:', e);
+      }
+    }
+    
     if (mapInstance.getLayer('saved-street-segments-selected')) {
       const filt = typeof selectedStreetSegmentIndex === 'number' ? ['==',['get','__sid'], selectedStreetSegmentIndex] : ['==',['get','__sid'], -999];
       try { mapInstance.setFilter('saved-street-segments-selected', filt); } catch {}
@@ -942,170 +1085,219 @@ export default function App() {
   }
 
   // Merge pieces of the same way/name into one long line
-  // Minimal pathfinding: build graph from visible drivable segments and find shortest path
+  // Robust pathfinding: build graph from visible drivable segments, split at intersections, and find shortest path
   function findShortestRoadPath(mapInstance, startPt, endPt) {
-    // Get all visible drivable road segments
+    __dbg.log('path', 'enter findShortestRoadPath', { startPt, endPt });
     const roadLayerIds = getRoadLayerIds(mapInstance);
     const opts = roadLayerIds.length ? { layers: roadLayerIds } : undefined;
     let featuresRaw = [];
-    try {
-      featuresRaw = mapInstance.queryRenderedFeatures(opts);
-    } catch (err) {
+    try { featuresRaw = mapInstance.queryRenderedFeatures(opts) || []; } catch (err) {
+      __dbg.log('path', 'queryRenderedFeatures failed', { err: String(err) });
       return null;
     }
-    // Get all drivable road segments as LineStrings
-    const segments = featuresRaw.flatMap(explodeToLineStrings).filter(f => isDrivableRoad(f.properties));
-      // ...existing code...
-
-      // Snap start/end to nearest segment
-      function snapToSegment(pt) {
-        let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
-        segments.forEach(f => {
-          let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
-          const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
-          if (snapped.properties.dist < bestDist) {
-            bestDist = snapped.properties.dist;
-            best = snapped.geometry.coordinates;
-            bestSeg = coords;
-            bestIdx = snapped.properties.index;
-          }
-        });
-        return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
-      }
-
-      const startSnap = snapToSegment(startPt);
-      const endSnap = snapToSegment(endPt);
-    // ...existing code...
-    const nodes = new Map(); // key: stringified [lng,lat], value: array of connected nodes
-    const edges = new Map(); // key: nodeA|nodeB, value: segment
-    segments.forEach(seg => {
-      const coords = seg.geometry.coordinates;
-      for (let i = 0; i < coords.length - 1; i++) {
-        const a = coords[i], b = coords[i + 1];
-        const aKey = a.join(","), bKey = b.join(",");
-        if (!nodes.has(aKey)) nodes.set(aKey, []);
-        if (!nodes.has(bKey)) nodes.set(bKey, []);
-        nodes.get(aKey).push(bKey);
-        nodes.get(bKey).push(aKey);
-        edges.set(`${aKey}|${bKey}`, [a, b]);
-        edges.set(`${bKey}|${aKey}`, [b, a]);
-      }
+    // Build network lines from visible drivable segments
+    const lines = featuresRaw.flatMap(f => {
+      if (!isDrivableRoad(f.properties)) return [];
+      if (f.geometry?.type === 'LineString') return [turf.lineString(f.geometry.coordinates, f.properties)];
+      if (f.geometry?.type === 'MultiLineString') return f.geometry.coordinates.map(c => turf.lineString(c, f.properties));
+      return [];
     });
-    // Snap start/end to nearest point on any segment
-    function nearestPointOnSegments(pt) {
-      let minDist = Infinity, best = null, bestSeg = null;
-      for (const seg of segments) {
-        const line = turf.lineString(seg.geometry.coordinates);
-        const snapped = turf.nearestPointOnLine(line, turf.point(pt), { units: "meters" });
-        if (snapped.properties.dist < minDist) {
-          minDist = snapped.properties.dist;
-          best = snapped.geometry.coordinates;
-          bestSeg = seg;
+    __dbg.log('path', 'segments prepared', { totalFeatures: featuresRaw.length, drivableSegments: lines.length });
+
+    if (!lines.length) return null;
+
+    // Helpers
+    const coordKey = (c) => `${c[0].toFixed(6)},${c[1].toFixed(6)}`;
+    const removeUndirectedEdge = (graph, k1, k2) => {
+      if (!graph) return;
+      if (graph.has(k1)) graph.set(k1, (graph.get(k1) || []).filter(e => e.to !== k2));
+      if (graph.has(k2)) graph.set(k2, (graph.get(k2) || []).filter(e => e.to !== k1));
+    };
+    const buildGraph = (ls) => {
+      const g = new Map(); // key -> [{ to, coords }]
+      const ensure = (k) => { if (!g.has(k)) g.set(k, []); };
+      for (const ln of ls) {
+        const cs = ln.geometry.coordinates;
+        for (let i = 0; i < cs.length - 1; i++) {
+          const a = cs[i], b = cs[i + 1];
+          const ka = coordKey(a), kb = coordKey(b);
+          ensure(ka); ensure(kb);
+          g.get(ka).push({ to: kb, coords: [a, b] });
+          g.get(kb).push({ to: ka, coords: [b, a] });
         }
       }
-      return { coord: best, seg: bestSeg };
+      return g;
+    };
+    const nearestSnap = (ls, pt) => {
+      let best = null, bestLine = null, bestIdx = null, minD = Infinity;
+      const target = turf.point(pt);
+      for (const ln of ls) {
+        try {
+          const snap = turf.nearestPointOnLine(ln, target, { units: 'meters' });
+          if (snap && snap.properties && typeof snap.properties.dist === 'number' && snap.properties.dist < minD) {
+            minD = snap.properties.dist;
+            best = snap.geometry.coordinates;
+            bestLine = ln;
+            bestIdx = snap.properties.index ?? null;
+          }
+        } catch {}
+      }
+      __dbg.log('path', 'nearestSnap', { pt, distM: minD });
+      return best ? { coord: best, line: bestLine, segIndex: bestIdx } : null;
+    };
+    const lineLen = (coords) => {
+      try { return turf.length(turf.lineString(coords), { units: 'meters' }); } catch { return Infinity; }
+    };
+
+    // Build base graph
+    const graph = buildGraph(lines);
+    if (!graph || graph.size === 0) return null;
+
+    // Split lines at true intersections and reattach into graph
+    const attachPointOnLine = (g, ln, c) => {
+      try {
+        const snap = turf.nearestPointOnLine(ln, turf.point(c));
+        const idx = Math.min(Math.max(0, snap.properties.index ?? 0), ln.geometry.coordinates.length - 2);
+        const A = ln.geometry.coordinates[idx];
+        const B = ln.geometry.coordinates[idx + 1];
+        const kA = coordKey(A), kB = coordKey(B), kC = coordKey(snap.geometry.coordinates);
+        if (!g.has(kA)) g.set(kA, []);
+        if (!g.has(kB)) g.set(kB, []);
+        if (!g.has(kC)) g.set(kC, []);
+        removeUndirectedEdge(g, kA, kB);
+        g.get(kA).push({ to: kC, coords: [A, snap.geometry.coordinates] });
+        g.get(kC).push({ to: kA, coords: [snap.geometry.coordinates, A] });
+        g.get(kB).push({ to: kC, coords: [B, snap.geometry.coordinates] });
+        g.get(kC).push({ to: kB, coords: [snap.geometry.coordinates, B] });
+        return kC;
+      } catch { return null; }
+    };
+    for (let i = 0; i < lines.length; i++) {
+      for (let j = i + 1; j < lines.length; j++) {
+        try {
+          const ints = turf.lineIntersect(lines[i], lines[j]);
+          if (!ints?.features?.length) continue;
+          for (const f of ints.features) {
+            const c = f.geometry.coordinates;
+            attachPointOnLine(graph, lines[i], c);
+            attachPointOnLine(graph, lines[j], c);
+          }
+        } catch {}
+      }
     }
-    // Helper: Snap to nearest point on any segment
-    function nearestPointOnSegments(pt) {
-      let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
-      segments.forEach(f => {
-        let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
-        const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
-        if (snapped.properties.dist < bestDist) {
-          bestDist = snapped.properties.dist;
-          best = snapped.geometry.coordinates;
-          bestSeg = coords;
-          bestIdx = snapped.properties.index;
+
+    // Snap input points to the network
+    const s = nearestSnap(lines, startPt);
+    const t = nearestSnap(lines, endPt);
+    if (!s || !t) { __dbg.log('path', 'snap failed', { s: !!s, t: !!t }); return null; }
+
+    // Fast path: if both snaps land on the exact same underlying line, slice that line.
+    try {
+      if (s.line && t.line && s.line === t.line) {
+        const sliceA = turf.nearestPointOnLine(s.line, turf.point(s.coord));
+        const sliceB = turf.nearestPointOnLine(s.line, turf.point(t.coord));
+        let sliced = turf.lineSlice(sliceA, sliceB, s.line);
+        if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+          sliced = turf.lineSlice(sliceB, sliceA, s.line);
+          if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+            const first = sliced.geometry.coordinates[0];
+            const d1 = turf.distance(turf.point(first), turf.point(s.coord));
+            const d2 = turf.distance(turf.point(first), turf.point(t.coord));
+            if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+          }
         }
-      });
-      return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
+        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+          __dbg.log('path', 'fast-path same-line slice used', { lenM: (()=>{ try { return turf.length(sliced,{units:'meters'});} catch { return null; } })() });
+          return sliced;
+        }
+      }
+    } catch {}
+
+    // Attach start and end to graph
+    const startK = coordKey(s.coord);
+    const endK = coordKey(t.coord);
+    if (!graph.has(startK)) graph.set(startK, []);
+    if (!graph.has(endK)) graph.set(endK, []);
+    if (s.line && s.segIndex != null) {
+      const cs = s.line.geometry.coordinates;
+      const i = Math.min(Math.max(0, s.segIndex), cs.length - 2);
+      const A = cs[i], B = cs[i + 1];
+      const kA = coordKey(A), kB = coordKey(B);
+      if (!graph.has(kA)) graph.set(kA, []);
+      if (!graph.has(kB)) graph.set(kB, []);
+      removeUndirectedEdge(graph, kA, kB);
+      graph.get(startK).push({ to: kA, coords: [s.coord, A] });
+      graph.get(startK).push({ to: kB, coords: [s.coord, B] });
     }
-    // Only one correct declaration of startSnap and endSnap should exist in this function
-    if (!startSnap.coord || !endSnap.coord) return null;
-    // Insert snapped points as temporary nodes
-    const startKey = startSnap.coord.join(",");
-    const endKey = endSnap.coord.join(",");
-    // Connect snapped start to its segment endpoints
-    if (startSnap.seg) {
-      const coords = startSnap.seg.geometry.coordinates;
-      const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
-      if (!nodes.has(startKey)) nodes.set(startKey, []);
-      nodes.get(startKey).push(aKey);
-      nodes.get(aKey).push(startKey);
-      nodes.get(startKey).push(bKey);
-      nodes.get(bKey).push(startKey);
-      edges.set(`${startKey}|${aKey}`, [startSnap.coord, coords[0]]);
-      edges.set(`${aKey}|${startKey}`, [coords[0], startSnap.coord]);
-      edges.set(`${startKey}|${bKey}`, [startSnap.coord, coords[coords.length - 1]]);
-      edges.set(`${bKey}|${startKey}`, [coords[coords.length - 1], startSnap.coord]);
+    if (t.line && t.segIndex != null) {
+      const cs = t.line.geometry.coordinates;
+      const i = Math.min(Math.max(0, t.segIndex), cs.length - 2);
+      const A = cs[i], B = cs[i + 1];
+      const kA = coordKey(A), kB = coordKey(B);
+      if (!graph.has(kA)) graph.set(kA, []);
+      if (!graph.has(kB)) graph.set(kB, []);
+      removeUndirectedEdge(graph, kA, kB);
+      graph.get(kA).push({ to: endK, coords: [A, t.coord] });
+      graph.get(kB).push({ to: endK, coords: [B, t.coord] });
     }
-    // Connect snapped end to its segment endpoints
-    if (endSnap.seg) {
-      const coords = endSnap.seg.geometry.coordinates;
-      const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
-      if (!nodes.has(endKey)) nodes.set(endKey, []);
-      nodes.get(endKey).push(aKey);
-      nodes.get(aKey).push(endKey);
-      nodes.get(endKey).push(bKey);
-      nodes.get(bKey).push(endKey);
-      edges.set(`${endKey}|${aKey}`, [endSnap.coord, coords[0]]);
-      edges.set(`${aKey}|${endKey}`, [coords[0], endSnap.coord]);
-      edges.set(`${endKey}|${bKey}`, [endSnap.coord, coords[coords.length - 1]]);
-      edges.set(`${bKey}|${endKey}`, [coords[coords.length - 1], endSnap.coord]);
-    }
-    // Dijkstra's algorithm
-    const visited = new Set();
-    const prev = new Map();
+
+    // Dijkstra
     const dist = new Map();
-    for (const key of nodes.keys()) dist.set(key, Infinity);
-    dist.set(startKey, 0);
-    const queue = [startKey];
-    while (queue.length) {
-      queue.sort((a, b) => dist.get(a) - dist.get(b));
-      const cur = queue.shift();
-      if (cur === endKey) break;
-      visited.add(cur);
-      for (const neighbor of nodes.get(cur) || []) {
-        if (visited.has(neighbor)) continue;
-        const seg = edges.get(`${cur}|${neighbor}`);
-        if (!seg) continue;
-        const segLen = turf.length(seg, { units: 'meters' });
-        const alt = dist.get(cur) + segLen;
-        if (alt < dist.get(neighbor)) {
-          dist.set(neighbor, alt);
-          prev.set(neighbor, cur);
-          queue.push(neighbor);
+    const prev = new Map();
+    const visited = new Set();
+    const pq = new Set();
+    for (const k of graph.keys()) dist.set(k, Infinity);
+    dist.set(startK, 0);
+    pq.add(startK);
+    const popMin = () => {
+      let best = null, bestD = Infinity;
+      for (const k of pq) { const d = dist.get(k); if (d < bestD) { bestD = d; best = k; } }
+      if (best != null) pq.delete(best);
+      return best;
+    };
+    while (pq.size) {
+      const u = popMin(); if (u == null) break; if (u === endK) break; if (visited.has(u)) continue; visited.add(u);
+      for (const e of (graph.get(u) || [])) {
+        const v = e.to; if (visited.has(v)) continue;
+        const w = lineLen(e.coords);
+        const alt = (dist.get(u) ?? Infinity) + w;
+        if (alt < (dist.get(v) ?? Infinity)) { dist.set(v, alt); prev.set(v, { u, coords: e.coords }); pq.add(v); }
+      }
+    }
+    __dbg.log('path', 'dijkstra finished', { reached: prev.has(endK), endDist: dist.get(endK) });
+    if (!prev.has(endK)) { __dbg.log('path', 'no path found, returning null'); return null; }
+
+    // Reconstruct and flatten coords
+    const segs = [];
+    let cur = endK;
+    while (prev.has(cur)) { const { u, coords } = prev.get(cur); segs.unshift(coords); cur = u; }
+    const same = (a, b, eps = 1e-7) => Math.abs(a[0] - b[0]) <= eps && Math.abs(a[1] - b[1]) <= eps;
+    const out = [];
+    for (let scoords of segs) {
+      let s0 = scoords[0], s1 = scoords[1];
+      if (out.length) { const last = out[out.length - 1]; if (same(last, s0)) out.push(s1); else if (same(last, s1)) out.push(s0); else { out.push(s0, s1); } } else { out.push(s0, s1); }
+    }
+    if (out.length < 2) return null;
+
+    // Precision slice between true snapped positions
+    let pathLine = turf.lineString(out);
+    try {
+      const sSnapOnPath = turf.nearestPointOnLine(pathLine, turf.point(startPt));
+      const eSnapOnPath = turf.nearestPointOnLine(pathLine, turf.point(endPt));
+      let sliced = turf.lineSlice(sSnapOnPath, eSnapOnPath, pathLine);
+      if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+        sliced = turf.lineSlice(eSnapOnPath, sSnapOnPath, pathLine);
+        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+          const first = sliced.geometry.coordinates[0];
+          const d1 = turf.distance(turf.point(first), turf.point(startPt));
+          const d2 = turf.distance(turf.point(first), turf.point(endPt));
+          if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
         }
       }
-    }
-    // Reconstruct path
-    let path = [];
-    let cur = endKey;
-    while (cur && prev.has(cur)) {
-      const prevKey = prev.get(cur);
-      const seg = edges.get(`${prevKey}|${cur}`);
-      if (seg) path.unshift(seg);
-      cur = prevKey;
-    }
-    // If path is empty, fallback to direct line
-    if (!path.length) {
-      return null;
-    }
-    // Flatten path segments, slicing first/last for exact start/end
-    let coords = [];
-    for (let i = 0; i < path.length; i++) {
-      let segCoords = path[i].geometry.coordinates;
-      // For first segment, snap start
-      if (i === 0) segCoords[0] = startPt;
-      // For last segment, snap end
-      if (i === path.length - 1) segCoords[segCoords.length - 1] = endPt;
-      // Avoid duplicate points between segments
-      if (i > 0 && coords.length && coords[coords.length - 1][0] === segCoords[0][0] && coords[coords.length - 1][1] === segCoords[0][1]) {
-        segCoords = segCoords.slice(1);
-      }
-      coords.push(...segCoords);
-    }
-    return turf.lineString(coords);
+      if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) pathLine = sliced;
+    } catch {}
+    __dbg.log('path', 'path constructed', { vertices: pathLine.geometry.coordinates.length });
+    return pathLine;
   }
 
   // Stitch together all connected drivable roads of the same way/name as baseLine
@@ -1449,8 +1641,31 @@ export default function App() {
       applySelectedFilter(m, selectedSavedIndex);
       // Keep street layers visible if actively editing a saved street segment even when tool auto-resets Off
       const visStreets = (activeTool === 'street' || editingStreetSegmentId) ? 'visible' : 'none';
-      ["street-selections-line","street-selections-casing","street-buffer-fill","street-buffer-outline","street-endpoints-layer","selected-road-segment-layer"]
-        .forEach(id => m.getLayer(id) && m.setLayoutProperty(id, "visibility", visStreets));
+      console.log('[style-switch] setting street layer visibility:', { 
+        visStreets, 
+        activeTool, 
+        editingStreetSegmentId, 
+        stage 
+      });
+      
+      // Handle the ephemeral editing layer separately to avoid interference with color changes
+      const layersToUpdate = ["street-selections-line","street-selections-casing","street-buffer-fill","street-buffer-outline","street-endpoints-layer","edit-delta-layer"];
+      layersToUpdate.forEach(id => {
+        if (m.getLayer(id)) {
+          m.setLayoutProperty(id, "visibility", visStreets);
+          console.log('[style-switch] set visibility for layer:', id, 'to:', visStreets);
+        } else {
+          console.log('[style-switch] layer not found:', id);
+        }
+      });
+      
+      // Special handling for selected-road-segment-layer (ephemeral editing layer)
+      if (m.getLayer('selected-road-segment-layer')) {
+        // Only set visibility, don't reset paint properties that might have been updated for color changes
+        const shouldBeVisible = editingStreetSegmentId || activeTool === 'street' || startEndMode;
+        m.setLayoutProperty('selected-road-segment-layer', 'visibility', shouldBeVisible ? 'visible' : 'none');
+        console.log('[style-switch] set visibility for selected-road-segment-layer to:', shouldBeVisible ? 'visible' : 'none', 'without resetting paint properties');
+      }
       // Restore endpoints
       try {
         const epSrc = m.getSource('street-endpoints');
@@ -1483,8 +1698,11 @@ export default function App() {
           // Move above saved segments for clarity (if reference layer exists). If move fails, attempt to re-add at top.
           try {
             if (m.getLayer('saved-street-segments-line')) {
-              m.moveLayer('selected-road-segment-layer', 'saved-street-segments-line');
+              console.log('INSIDE THE IF STATEMENT FOR MOVING THE LAYER WHEN SWITCHING BASEMAP - [style-switch] moving selected-road-segment-layer above saved-street-segments-line');
+              // Ensure the ephemeral edit layer is always on top during style restore
+              m.moveLayer('selected-road-segment-layer');
             } else {
+              console.log('INSIDE THE ELSE STATEMENT FOR MOVING THE LAYER WHEN SWITCHING BASEMAP - [style-switch] saved-street-segments-line layer not found, re-adding selected-road-segment-layer to top');
               // fallback: remove and re-add to top
               const featureBackup = cachedSelectedRoad;
               try { m.removeLayer('selected-road-segment-layer'); } catch {}
@@ -1515,18 +1733,38 @@ export default function App() {
       const hasLine = !!m.getLayer('selected-road-segment-layer');
       const hasEndpoints = !!m.getSource('street-endpoints');
       // eslint-disable-next-line no-console
-      console.log('[style-switch] finalCheck', { hasLine, hasEndpoints });
+      console.log('[style-switch] finalCheck', { 
+        hasLine, 
+        hasEndpoints, 
+        activeTool, 
+        editingStreetSegmentId, 
+        useType,
+        shouldBeVisible: (activeTool === 'street' || editingStreetSegmentId)
+      });
       if (!hasLine && cachedSelectedRoad) {
         console.warn('[style-switch] forcing recompute fallback');
         try { recomputeStreetPathRef.current && recomputeStreetPathRef.current(); } catch {}
       }
-      // If line exists but is invisible due to style paint reset, force paint reapply
+      // If line exists, only ensure visibility is correct - don't reset paint properties
+      // The updateStreetLineAppearance function will handle color updates separately
       if (hasLine) {
         try {
-          m.setPaintProperty('selected-road-segment-layer','line-color', colorByUse[useType] || '#ff9800');
-          m.setPaintProperty('selected-road-segment-layer','line-width', 6);
-          m.setPaintProperty('selected-road-segment-layer','line-opacity', 0.9);
-        } catch {}
+          const currentVisibility = m.getLayoutProperty('selected-road-segment-layer', 'visibility');
+          const shouldBeVisible = (activeTool === 'street' || editingStreetSegmentId || startEndMode);
+          
+          console.log('[style-switch] finalCheck - current layer properties:', {
+            currentVisibility,
+            targetVisibility: shouldBeVisible ? 'visible' : 'none',
+            skipPaintPropertyReset: true
+          });
+          
+          // Only set visibility, don't reset paint properties that may have been updated for zone type changes
+          m.setLayoutProperty('selected-road-segment-layer','visibility', shouldBeVisible ? 'visible' : 'none');
+          
+          console.log('[style-switch] finalCheck - set visibility only, preserving paint properties');
+        } catch (e) {
+          console.error('[style-switch] finalCheck - error setting visibility:', e);
+        }
       }
     }
 
@@ -1543,10 +1781,10 @@ export default function App() {
     };
   }, [basemapStyle]);
 
-  // Post-style assurance: if basemapStyle changes and we have an ephemeral path but layer missing after short delay, rebuild.
+  // Post-style assurance: only when basemapStyle changes, ensure ephemeral layer/source exist.
+  // Do not toggle visibility or override paint here to avoid racing with normal edit rendering.
   useEffect(() => {
     if (!map.current) return;
-    if (!ephemeralStreetPath) return;
     const m = map.current;
     let attempts = 0;
     const maxAttempts = 5;
@@ -1554,28 +1792,34 @@ export default function App() {
       if (!m.getStyle()) return; // style not ready
       const hasSource = !!m.getSource('selected-road-segment');
       const hasLayer = !!m.getLayer('selected-road-segment-layer');
-      if (hasLayer) {
-        // ensure visibility & paint
-        try {
-          m.getSource('selected-road-segment').setData(ephemeralStreetPath);
-          m.setLayoutProperty('selected-road-segment-layer','visibility', activeTool === 'street' ? 'visible':'none');
-          m.setPaintProperty('selected-road-segment-layer','line-color', colorByUse[useType] || '#ff9800');
-        } catch {}
-        return; // success
+      // Use the freshest available path: prefer ref/state, fall back to source _data if present
+      let pathData = null;
+      try {
+        pathData = selectedRoadSegmentRef.current || ephemeralStreetPath || m.getSource('selected-road-segment')?._data || null;
+      } catch {
+        pathData = selectedRoadSegmentRef.current || ephemeralStreetPath || null;
       }
+      if (!pathData) return; // nothing to restore
+
       if (!hasSource) {
-        try { m.addSource('selected-road-segment', { type:'geojson', data: ephemeralStreetPath }); } catch {}
+        try { m.addSource('selected-road-segment', { type:'geojson', data: pathData }); } catch {}
+      } else {
+        try { m.getSource('selected-road-segment').setData(pathData); } catch {}
       }
-      if (!hasLayer && hasSource) {
+      if (!hasLayer) {
         try {
           m.addLayer({ id:'selected-road-segment-layer', type:'line', source:'selected-road-segment', paint:{ 'line-color': colorByUse[useType] || '#ff9800','line-width':6,'line-opacity':0.9 } });
         } catch {}
       }
+      // Keep ephemeral on top; don't change visibility here
+      try { if (m.getLayer('selected-road-segment-layer')) m.moveLayer('selected-road-segment-layer'); } catch {}
+
+      if (m.getLayer('selected-road-segment-layer')) return; // success
       attempts++;
       if (attempts < maxAttempts) setTimeout(tick, 180);
     }
     setTimeout(tick, 120);
-  }, [basemapStyle, ephemeralStreetPath, activeTool, useType]);
+  }, [basemapStyle]);
 
   // Repaint saved zones if the list changes
   useEffect(() => {
@@ -1594,36 +1838,64 @@ export default function App() {
   useEffect(() => {
     if (!map.current) return;
     const m = map.current;
-    const src = m.getSource('street-endpoints');
-    const DEBUG_ENDPOINTS_SOURCE = true; // set to false to silence setData logs
+    let src = m.getSource('street-endpoints');
+  const DEBUG_ENDPOINTS_SOURCE = false; // set to true to enable endpoint source logs
     if (!src) {
-      // Style may still be loading; retry after style.load once
-      m.once('style.load', () => {
-        try {
-          const retry = m.getSource('street-endpoints');
-          if (retry) {
-            // trigger effect again by forcing a micro task (state noop)
-            setTimeout(() => {
-              if (startPoint || endPoint) {
-                const feats = [];
-                if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
-                if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
-                const fcRetry = { type:'FeatureCollection', features:feats };
-                retry.setData(fcRetry);
-                if (DEBUG_ENDPOINTS_SOURCE) {
-                  try {
-                    console.log('[street-endpoints] setData (retry after style.load)', {
-                      featureCount: fcRetry.features.length,
-                      features: fcRetry.features.map(f => ({ role: f.properties?.role, coords: f.geometry?.coordinates }))
-                    });
-                  } catch {}
-                }
+      // Try to create the source immediately if missing
+      try { m.addSource('street-endpoints', { type:'geojson', data:{ type:'FeatureCollection', features:[] } }); } catch {}
+      src = m.getSource('street-endpoints');
+      if (!src) {
+        // Style may still be loading; retry after style.load once
+        m.once('style.load', () => {
+          try {
+            let retry = m.getSource('street-endpoints');
+            if (!retry) {
+              try { m.addSource('street-endpoints', { type:'geojson', data:{ type:'FeatureCollection', features:[] } }); } catch {}
+              retry = m.getSource('street-endpoints');
+            }
+            if (retry && (startPoint || endPoint)) {
+              const feats = [];
+              if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
+              if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
+              const fcRetry = { type:'FeatureCollection', features:feats };
+              try { retry.setData(fcRetry); } catch {}
+              if (DEBUG_ENDPOINTS_SOURCE) {
+                try {
+                  console.log('[street-endpoints] setData (retry after style.load)', {
+                    featureCount: fcRetry.features.length,
+                    features: fcRetry.features.map(f => ({ role: f.properties?.role, coords: f.geometry?.coordinates }))
+                  });
+                } catch {}
               }
-            },0);
+            }
+          } catch {}
+        });
+        return;
+      }
+    }
+
+    // Ensure the endpoints layer exists during creation/edit modes
+    if (!m.getLayer('street-endpoints-layer')) {
+      try {
+        m.addLayer({
+          id:'street-endpoints-layer',
+          type:'circle',
+          source:'street-endpoints',
+          paint:{
+            'circle-radius':7,
+            'circle-color': [
+              'case',
+              ['==',['get','role'],'start'], '#00b461',
+              ['==',['get','role'],'end'], '#ffc400',
+              '#ff0000'
+            ],
+            'circle-stroke-width':1.5,
+            'circle-stroke-color':'#fff'
           }
-        } catch {}
-      });
-      return;
+        });
+        // Set visibility based on mode
+        try { m.setLayoutProperty('street-endpoints-layer','visibility', startEndMode ? 'visible':'none'); } catch {}
+      } catch {}
     }
     const feats = [];
     if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
@@ -1701,7 +1973,7 @@ export default function App() {
     let dragging = null; // 'start' | 'end'
     let lastMoveTs = 0;
     const endpointDraggingRef = endpointDraggingRefGlobal.current;
-    const DEBUG_ENDPOINT_SNAP = true; // set true to trace final mouseup snapping decisions
+  const DEBUG_ENDPOINT_SNAP = false; // set true to trace final mouseup snapping decisions
     function snapToNetwork(lngLatArr, opts) {
       try {
         const roadLayerIds = getRoadLayerIds(m);
@@ -1739,6 +2011,7 @@ export default function App() {
       if (f.layer?.id !== 'street-endpoints-layer') return;
       const role = f.properties?.role;
       if (role !== 'start' && role !== 'end') return;
+      __dbg.log('drag', 'mousedown on endpoint', { role });
       dragging = role;
       lastDraggedRoleRef.current = role;
       endpointDraggingRef.current = true;
@@ -1754,12 +2027,14 @@ export default function App() {
       const lng = e.lngLat.lng, lat = e.lngLat.lat;
       const now = performance.now();
       dragMoved = true;
+      __dbg.log('drag', 'mousemove', { dragging, lng, lat });
       // In edit mode: snap to network each (throttled) move for constrained endpoints + live preview
       // We still avoid auto endpoint reconcile elsewhere; this only adjusts endpoints proactively.
       // Throttle high-cost recompute (path rebuild) separately from simple snapping.
   if (editingStreetSegmentIdRef.current) {
         // Edit mode: snap to road each move and throttle live recompute so the dashed line tracks roads like creation flow
         const snapped = snapToNetwork([lng,lat]);
+        __dbg.log('drag', 'mousemove snapped (edit)', { dragging, snapped });
         if (dragging === 'start') debugSetStartPoint(snapped, 'drag:edit-snapped'); else debugSetEndPoint(snapped, 'drag:edit-snapped');
         // Throttle recompute (~220ms) during drag; allow while dragging if force flag is set
         const EDIT_RECOMPUTE_MS = 220;
@@ -1767,6 +2042,7 @@ export default function App() {
           try {
             forceEditRecomputeRef.current = true;
             recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+            __dbg.log('drag', 'throttled recompute during edit drag');
           } catch {}
           lastMoveTs = now;
         }
@@ -1775,9 +2051,11 @@ export default function App() {
       // Creation mode: throttle snapping (~80ms) while giving raw interim updates
       if (now - lastMoveTs > 80) {
         const snapped = snapToNetwork([lng,lat]);
+        __dbg.log('drag', 'mousemove snapped (create)', { dragging, snapped });
         if (dragging === 'start') debugSetStartPoint(snapped, 'drag:throttled'); else debugSetEndPoint(snapped, 'drag:throttled');
         lastMoveTs = now;
       } else {
+        __dbg.log('drag', 'mousemove raw (create)', { dragging, lng, lat });
         if (dragging === 'start') debugSetStartPoint([lng,lat], 'drag:raw'); else debugSetEndPoint([lng,lat], 'drag:raw');
       }
     }
@@ -1790,7 +2068,7 @@ export default function App() {
       // Final snap commit (both modes) to ensure precise on-road endpoint
       try {
         if (dragMoved) {
-          console.log("INSIDE THE if(dragMoved) STATEMENT")
+          __dbg.log('drag', 'mouseup commit path', { role: lastDraggedRoleRef.current });
           // Extra diagnostics: confirm we entered the commit branch on mouseup
           if (DEBUG_ENDPOINT_SNAP) {
             try {
@@ -1804,6 +2082,7 @@ export default function App() {
           if (lastDraggedRoleRef.current === 'start' && Array.isArray(startPointRef.current)) {
             const before = [...startPointRef.current];
             const snapped = snapToNetwork(startPointRef.current, { log: true, tag: 'mouseup-start' });
+            __dbg.log('drag', 'mouseup snapped start', { before, after: snapped });
             if (DEBUG_ENDPOINT_SNAP) {
               try { console.log('[endpoint-commit] start', { snapped }); } catch {}
             }
@@ -1815,6 +2094,7 @@ export default function App() {
           } else if (lastDraggedRoleRef.current === 'end' && Array.isArray(endPointRef.current)) {
             const before = [...endPointRef.current];
             const snapped = snapToNetwork(endPointRef.current, { log: true, tag: 'mouseup-end' });
+            __dbg.log('drag', 'mouseup snapped end', { before, after: snapped });
             if (DEBUG_ENDPOINT_SNAP) {
               try { console.log('[endpoint-commit] end', { snapped }); } catch {}
             }
@@ -1861,6 +2141,7 @@ export default function App() {
             forceEditRecomputeRef.current = true;
           }
           recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+          __dbg.log('drag', 'post-mouseup recompute scheduled and invoked');
         } catch (e) {
           try { console.warn('[endpoint-drag] recompute after mouseup failed', e); } catch {}
         }
@@ -2014,22 +2295,11 @@ export default function App() {
     }
   }, [activeTool]);
 
-  // Render updates when coords change
+  // Polygon and zone rendering updates
   useEffect(() => {
     if (!map.current) return;
     refreshMapData(map.current, drawnCoords, useType, savedZones);
-  }, [drawnCoords]);
-
-  // Recolor in-progress polygon immediately when Type changes
-  useEffect(() => {
-    if (!map.current) return;
-    refreshMapData(map.current, drawnCoords, useType, savedZones);
-  }, [useType]);
-
-  useEffect(() => {
-    if (!map.current) return;
-    refreshMapData(map.current, drawnCoords, useType, savedZones);
-  }, [savedStreetSegments, selectedStreetSegmentIndex]);
+  }, [drawnCoords, useType, savedZones]);
 
   // Point drag + delete
   useEffect(() => {
@@ -2161,17 +2431,11 @@ export default function App() {
     }
   }, [selectedSavedIndex, savedZones, drawMode, editingSavedIndex]);
 
-  // Keep street sources in sync initially and after style change
+  // Initial render setup
   useEffect(() => {
     if (!map.current) return;
     refreshMapData(map.current, drawnCoords, useType, savedZones);
   }, []);
-
-  // When width or selection changes, repaint buffer
-  useEffect(() => {
-    if (!map.current) return;
-    refreshMapData(map.current, drawnCoords, useType, savedZones);
-  }, [drawnCoords, useType]);
 
   // [START/END SEGMENT SELECTION] handle clicks
   useEffect(() => {
@@ -2701,8 +2965,8 @@ export default function App() {
         return turf.lineString(out);
       }
 
-  let pathLine = shortestPathOnNetwork(roadNetwork, startSnapped, endSnapped);
-  const t3_preFallback = performance.now();
+      let pathLine = shortestPathOnNetwork(roadNetwork, startSnapped, endSnapped);
+      const t3_preFallback = performance.now();
       // Fallback: if pathLine is null, try to snap to the closest road segment between the snapped points
       if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
         // Improved fallback: slice the closest road segment between the snapped points
@@ -2834,25 +3098,22 @@ export default function App() {
         selectedRoadSegmentRef.current = finalLine;
         setEphemeralStreetPath(finalLine);
         // Add the layer to render the highlighted line if not present
-  const dashArray = editingStreetSegmentId ? [2,2] : [1,0]; // dashed preview while editing
+        console.log('[path-computation] adding/updating selected-road-segment-layer');
         if (!m.getLayer('selected-road-segment-layer')) {
           m.addLayer({
             id: 'selected-road-segment-layer',
             type: 'line',
             source: 'selected-road-segment',
             paint: {
-              'line-color': colorByUse[useType] || '#ff9800',
+              'line-color': '#ff9800', // temporary default, will be updated by styling function
               'line-width': 6,
               'line-opacity': 0.9,
-              'line-dasharray': dashArray
+              'line-dasharray': [1, 0] // temporary default, will be updated by styling function
             }
           });
-        } else {
-          try {
-            m.setPaintProperty('selected-road-segment-layer','line-color', colorByUse[useType] || '#ff9800');
-            m.setPaintProperty('selected-road-segment-layer','line-dasharray', dashArray);
-          } catch {}
         }
+        // Apply proper styling (color and dash pattern) via master renderer
+        // The master renderer will handle styling automatically via ephemeralStreetPath state
           try {
             const lenM = turf.length(finalLine, { units: 'meters' });
             setStreetPathLengthM(lenM);
@@ -2921,7 +3182,7 @@ export default function App() {
         console.log('[street-perf]', sample);
       }
     }
-  }, [startEndMode, startPoint, endPoint, useType, streetPathNonce]);
+  }, [startEndMode, startPoint, endPoint, streetPathNonce]);
 
   // Watchdog: if editing an existing street and canonical endpoint layer/source missing (e.g. removed during tool reset), restore them
   useEffect(() => {
@@ -3003,122 +3264,305 @@ export default function App() {
   // Ref to cache the selected road segment (ephemeral path) across style switches
   const selectedRoadSegmentRef = useRef(null);
 
-  // Reactive: update selected road segment line color when zone type toggles
+  // Centralized function to calculate street appearance properties
+  const calculateStreetAppearance = React.useCallback((currentUseType, isEditing = false) => {
+    return {
+      color: colorByUse[currentUseType] || '#ff9800',
+      dashArray: [1, 0], // solid for all modes as requested
+      opacity: 0.9,
+      // Slightly wider during edit so it stands out above saved lines
+      width: isEditing ? 7 : 6
+    };
+  }, [colorByUse]);
+
+  // Consolidated rendering function for all street segments using refreshMapData consistently
+  const renderAllStreetSegments = React.useCallback((mapInstance, segments, editingId, currentUseType, ephemeralPath) => {
+    if (!mapInstance) return;
+    
+    console.log('[renderAllStreetSegments] rendering', {
+      savedSegments: segments?.length || 0,
+      editingId,
+      hasEphemeral: !!ephemeralPath,
+      currentUseType
+    });
+
+    // Always use refreshMapData for consistency with polygon workflow
+    refreshMapData(mapInstance, drawnCoords, currentUseType, savedZones);
+
+    // Handle ephemeral editing layer with immediate color update
+    if (ephemeralPath && ephemeralPath.geometry?.coordinates?.length >= 2) {
+      const appearance = calculateStreetAppearance(currentUseType, !!editingId);
+      
+      console.log('[renderAllStreetSegments] updating ephemeral layer with appearance:', appearance);
+      
+      // Add or update ephemeral source
+      if (!mapInstance.getSource('selected-road-segment')) {
+        mapInstance.addSource('selected-road-segment', { 
+          type: 'geojson', 
+          data: ephemeralPath 
+        });
+      } else {
+        try {
+          mapInstance.getSource('selected-road-segment').setData(ephemeralPath);
+        } catch (e) {
+          console.warn('[renderAllStreetSegments] failed to update ephemeral source:', e);
+        }
+      }
+
+      // Add or update ephemeral layer with correct styling
+      if (!mapInstance.getLayer('selected-road-segment-layer')) {
+        mapInstance.addLayer({
+          id: 'selected-road-segment-layer',
+          type: 'line',
+          source: 'selected-road-segment',
+          paint: {
+            'line-color': appearance.color,
+            'line-width': appearance.width,
+            'line-opacity': appearance.opacity,
+            'line-dasharray': appearance.dashArray
+          }
+        });
+        
+      } else {
+        // Force update ALL paint properties to ensure color changes are applied
+        try {
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-color', appearance.color);
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-dasharray', appearance.dashArray);
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-width', appearance.width);
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-opacity', appearance.opacity);
+          mapInstance.setLayoutProperty('selected-road-segment-layer', 'visibility', 'visible');
+          
+          console.log('[renderAllStreetSegments] force-updated ephemeral layer paint properties:', {
+            color: appearance.color,
+            dash: appearance.dashArray,
+            width: appearance.width,
+            opacity: appearance.opacity
+          });
+        } catch (e) {
+          console.warn('[renderAllStreetSegments] failed to update ephemeral layer:', e);
+        }
+      }
+
+      // Always ensure the ephemeral layer is on top so color changes are visible immediately
+      try {
+        if (mapInstance.getLayer('selected-road-segment-layer')) {
+          console.log('IF STATEMENT FOR THE EPHEMERAL LAYER [renderAllStreetSegments] moving ephemeral layer to top');
+          mapInstance.moveLayer('selected-road-segment-layer');
+        }
+      } catch (e) {
+        console.log('[renderAllStreetSegments] reorder (to top) failed:', e?.message || e);
+      }
+    } else {
+      // Hide ephemeral layer when no path
+      try {
+        if (mapInstance.getLayer('selected-road-segment-layer')) {
+          mapInstance.setLayoutProperty('selected-road-segment-layer', 'visibility', 'none');
+          console.log('[renderAllStreetSegments] hid ephemeral layer - no path');
+        }
+      } catch (e) {
+        console.warn('[renderAllStreetSegments] failed to hide ephemeral layer:', e);
+      }
+    }
+  }, [calculateStreetAppearance, refreshMapData, drawnCoords, savedZones]);
+
+  // Master rendering coordinator - handles all visual updates in one place
   useEffect(() => {
     if (!map.current) return;
-    if (!streetsActive) return; // only relevant in street tool
+    
+    console.log('[useEffect:master-renderer] triggered', {
+      useType,
+      editingStreetSegmentId,
+      hasEphemeralPath: !!ephemeralStreetPath,
+      savedStreetSegments: savedStreetSegments?.length || 0
+    });
+    
+    // Debounce to prevent rapid successive updates
+    const timer = setTimeout(() => {
+      renderAllStreetSegments(
+        map.current,
+        savedStreetSegments,
+        editingStreetSegmentId,
+        useType,
+        ephemeralStreetPath
+      );
+    }, 5);
+    
+    return () => clearTimeout(timer);
+  }, [useType, editingStreetSegmentId, ephemeralStreetPath, savedStreetSegments, renderAllStreetSegments]);
+
+  // Track previous editingStreetSegmentId to detect post-save transitions
+  const prevEditingStreetSegmentIdRef = useRef(editingStreetSegmentId);
+  
+  // Simplified post-save cleanup - only remove ephemeral layers, don't trigger refreshMapData
+  useEffect(() => {
+    const wasEditing = prevEditingStreetSegmentIdRef.current;
+    const isEditing = editingStreetSegmentId;
+    
+    console.log('[useEffect:post-save-cleanup] editingStreetSegmentId changed:', { 
+      from: wasEditing, 
+      to: isEditing,
+      isExitingEditMode: wasEditing && !isEditing
+    });
+    
+    // Only clean up ephemeral layers when exiting edit mode
+    if (wasEditing && !isEditing && map.current) {
+      console.log('[useEffect:post-save-cleanup] cleaning up ephemeral layers after save');
+      
+      // Clear ephemeral path state first
+      setEphemeralStreetPath(null);
+      
+      // Remove ephemeral layers
+      try {
+        const m = map.current;
+        if (m.getLayer('selected-road-segment-layer')) {
+          m.removeLayer('selected-road-segment-layer');
+        }
+        if (m.getSource('selected-road-segment')) {
+          m.removeSource('selected-road-segment');
+        }
+      } catch (e) {
+        console.warn('[useEffect:post-save-cleanup] error cleaning ephemeral layers:', e);
+      }
+      
+      // The master renderer will handle rebuilding saved segments automatically
+    }
+    
+    prevEditingStreetSegmentIdRef.current = isEditing;
+  }, [editingStreetSegmentId]);
+
+  // Initialize ephemeral layer when entering edit mode - simplified (seed type only once per session)
+  useEffect(() => {
+    if (!map.current || !editingStreetSegmentId) return;
+    
+    const m = map.current;
+    const feat = (savedStreetSegments || []).find(f => 
+      f.properties?.id === editingStreetSegmentId || f.id === editingStreetSegmentId
+    );
+    
+    if (!feat || feat.geometry?.type !== 'LineString') return;
+    
+    console.log('[useEffect:init-edit-geometry] setting up ephemeral layer for editing', editingStreetSegmentId);
+    
+    try {
+      const lineFeature = turf.lineString(feat.geometry.coordinates);
+      
+      // Set ephemeral path state - this will trigger the master renderer
+      setEphemeralStreetPath(lineFeature);
+      selectedRoadSegmentRef.current = lineFeature;
+
+      // Seed the current type from the feature under edit so color starts consistent,
+      // but only once when entering edit mode (avoid overriding user changes).
+      if (!seededUseTypeOnEntryRef.current) {
+        const featType = feat.properties?.useType;
+        if (featType && featType !== useType) {
+          try {
+            // eslint-disable-next-line no-console
+            console.log('[edit-entry] seed useType from feature', { from: useType, to: featType, id: editingStreetSegmentId });
+          } catch {}
+          setUseType(featType);
+        }
+        seededUseTypeOnEntryRef.current = true;
+      }
+      
+    } catch (e) {
+      console.warn('[useEffect:init-edit-geometry] error setting up edit geometry:', e);
+    }
+  }, [editingStreetSegmentId, savedStreetSegments]);
+
+  // Reset seed flag when exiting street edit mode
+  useEffect(() => {
+    if (!editingStreetSegmentId) {
+      seededUseTypeOnEntryRef.current = false;
+    }
+  }, [editingStreetSegmentId]);
+
+  // Guard: when type changes during street edit, ensure the ephemeral layer color updates immediately
+  useEffect(() => {
+    if (!map.current) return;
+    if (!editingStreetSegmentId) return;
     const m = map.current;
     if (m.getLayer('selected-road-segment-layer')) {
       try {
         m.setPaintProperty('selected-road-segment-layer', 'line-color', colorByUse[useType] || '#ff9800');
+        // eslint-disable-next-line no-console
+        console.log('[useType] applied to ephemeral layer', { useType, color: colorByUse[useType] || '#ff9800' });
       } catch {}
     }
-  }, [useType, streetsActive]);
+  }, [useType, editingStreetSegmentId, colorByUse]);
 
-  // --- Save / finalize helpers -----------------------------------
-
-  // Tidy: snap both endpoints to the current highlighted line and trim the line between them
-  function handleTidyEndpoints() {
+  // Edit preview: dashed delta showing extension/reduction from original endpoints (follow road network)
+  useEffect(() => {
     if (!map.current) return;
-    if (!Array.isArray(startPoint) || !Array.isArray(endPoint)) return;
     const m = map.current;
-    // Helper to update map with new line + endpoints
-    function applyLineAndEndpoints(lineFeature, sCoord, eCoord, meta) {
-      if (!lineFeature) return;
-      try {
-        if (!m.getSource('selected-road-segment')) {
-          m.addSource('selected-road-segment', { type:'geojson', data: lineFeature });
-        } else {
-          m.getSource('selected-road-segment').setData(lineFeature);
-        }
-        selectedRoadSegmentRef.current = lineFeature;
-        setEphemeralStreetPath(lineFeature);
-        const lenM = (()=>{ try { return turf.length(lineFeature, { units:'meters' }); } catch { return null; } })();
-        if (lenM != null) setStreetPathLengthM(lenM);
-        debugSetStartPoint(sCoord, `tidy:start:${meta}`);
-        debugSetEndPoint(eCoord, `tidy:end:${meta}`);
-        // eslint-disable-next-line no-console
-        console.log('[tidy] applied', { meta, lenM });
-      } catch (e) { console.warn('[tidy] apply failed', e); }
-    }
+    const visible = !!editingStreetSegmentId && startEndMode;
+    const src = m.getSource('edit-delta');
+    const layerExists = m.getLayer('edit-delta-layer');
+    __dbg.log('delta', 'effect enter', { visible, layerExists: !!layerExists, hasSource: !!src, editingStreetSegmentId, startEndMode });
+    if (!src || !layerExists) return; // created by ensureSourcesAndLayers
 
-    // Edit mode: do immediate snap + slice independent of recompute timing
-    if (editingStreetSegmentId) {
-      try {
-        const roadLayerIds = getRoadLayerIds(m);
-        const featuresRaw = m.queryRenderedFeatures({ layers: roadLayerIds }) || [];
-        const lines = featuresRaw.flatMap(f => {
-          if (!isDrivableRoad(f.properties)) return [];
-          if (f.geometry?.type === 'LineString') return [turf.lineString(f.geometry.coordinates)];
-            if (f.geometry?.type === 'MultiLineString') return f.geometry.coordinates.map(c=>turf.lineString(c));
-          return [];
-        });
-        if (!lines.length) { console.warn('[tidy] no road lines in view'); return; }
-        function nearestSnap(pt) {
-          let best=null,bestLine=null,min=Infinity,bestIdx=null; const target=turf.point(pt);
-          for (const ln of lines) {
-            try {
-              const snap=turf.nearestPointOnLine(ln,target,{units:'meters'});
-              if (snap && snap.properties && typeof snap.properties.dist==='number' && snap.properties.dist < min) {
-                min = snap.properties.dist; best = snap; bestLine = ln; bestIdx = snap.properties.index;
-              }
-            } catch {}
-          }
-          return best? { snap: best, line: bestLine, segIndex: bestIdx }: null;
-        }
-        const s = nearestSnap(startPoint);
-        const e = nearestSnap(endPoint);
-        if (!s || !e) { console.warn('[tidy] failed to snap endpoints'); return; }
-        // If both lie on the same underlying line, attempt precise slice
-        if (s.line && e.line && s.line === e.line) {
-          let sliced = turf.lineSlice(s.snap, e.snap, s.line);
-          if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
-            sliced = turf.lineSlice(e.snap, s.snap, s.line);
-            if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
-              const first = sliced.geometry.coordinates[0];
-              const d1 = turf.distance(turf.point(first), s.snap);
-              const d2 = turf.distance(turf.point(first), e.snap);
-              if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
-            }
-          }
-          if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
-            applyLineAndEndpoints(sliced, s.snap.geometry.coordinates, e.snap.geometry.coordinates, 'edit-same-line');
-            return;
-          }
-        }
-        // Fallback: simple straight line between snapped endpoints (gives immediate feedback)
-        const straight = turf.lineString([s.snap.geometry.coordinates, e.snap.geometry.coordinates]);
-        applyLineAndEndpoints(straight, s.snap.geometry.coordinates, e.snap.geometry.coordinates, 'edit-straight-fallback');
-        // Optionally trigger a background full recompute to upgrade path (commented out for now)
-        // forceEditRecomputeRef.current = true; recomputeStreetPathRef.current && recomputeStreetPathRef.current();
-      } catch (e) { console.warn('[tidy] edit-mode failure', e); }
+    if (!visible) {
+      __dbg.log('delta', 'not visible, hiding layer and clearing data');
+      try { m.setLayoutProperty('edit-delta-layer','visibility','none'); } catch {}
+      try { src.setData({ type:'FeatureCollection', features: [] }); } catch {}
       return;
     }
 
-    // Non-edit mode (creation) retains original logic using existing highlighted path
-    try {
-      const src = m.getSource('selected-road-segment');
-      // @ts-ignore
-      const data = src?._data;
-      if (!data || data.type !== 'Feature' || data.geometry?.type !== 'LineString') { console.warn('[tidy] no active line for creation mode'); return; }
-      const ln = turf.lineString(data.geometry.coordinates);
-      const sSnap = turf.nearestPointOnLine(ln, turf.point(startPoint));
-      const eSnap = turf.nearestPointOnLine(ln, turf.point(endPoint));
-      let sliced = turf.lineSlice(sSnap, eSnap, ln);
-      if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
-        sliced = turf.lineSlice(eSnap, sSnap, ln);
-        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
-          const first = sliced.geometry.coordinates[0];
-          const d1 = turf.distance(turf.point(first), sSnap);
-          const d2 = turf.distance(turf.point(first), eSnap);
-          if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
-        }
-      }
-      if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
-        applyLineAndEndpoints(sliced, sSnap.geometry.coordinates, eSnap.geometry.coordinates, 'creation');
-      }
-    } catch (e) { console.warn('[tidy] creation-mode failure', e); }
-  }
+    // Need original endpoints for the segment under edit
+    const feat = (savedStreetSegments || []).find(f => f.id === editingStreetSegmentId || f.properties?.id === editingStreetSegmentId);
+    __dbg.log('delta', 'found feature for edit', { found: !!feat, type: feat?.geometry?.type, id: editingStreetSegmentId });
+    if (!feat || feat.geometry?.type !== 'LineString') {
+      __dbg.log('delta', 'feature missing or not LineString, hiding');
+      try { m.setLayoutProperty('edit-delta-layer','visibility','none'); } catch {}
+      try { src.setData({ type:'FeatureCollection', features: [] }); } catch {}
+      return;
+    }
+
+    const coords = feat.geometry.coordinates || [];
+    if (coords.length < 2) {
+      try { m.setLayoutProperty('edit-delta-layer','visibility','none'); } catch {}
+      try { src.setData({ type:'FeatureCollection', features: [] }); } catch {}
+      return;
+    }
+
+    const origStart = coords[0];
+    const origEnd = coords[coords.length - 1];
+    const curStart = Array.isArray(startPointRef.current) ? startPointRef.current : null;
+    const curEnd = Array.isArray(endPointRef.current) ? endPointRef.current : null;
+  __dbg.log('delta', 'endpoints', { origStart, origEnd, curStart, curEnd });
+
+    // Lightweight throttle to avoid heavy recompute on every tiny drag
+    const now = performance.now();
+    const last = (App.__deltaLastTs ||= { current: 0 }).current;
+    if (now - last < 90) return; // ~11 fps
+    App.__deltaLastTs.current = now;
+
+    const features = [];
+    function safePath(a, b) {
+      try {
+        const ln = findShortestRoadPath(m, a, b);
+        if (ln && ln.geometry?.type === 'LineString' && ln.geometry.coordinates?.length >= 2) return ln;
+        __dbg.log('delta', 'safePath: no path from solver, falling back to straight line', { a, b });
+      } catch {}
+      // Fallback: straight line if pathfinder unavailable
+      return turf.lineString([a, b]);
+    }
+
+    if (curStart && (curStart[0] !== origStart[0] || curStart[1] !== origStart[1])) {
+      const p = safePath(origStart, curStart);
+      features.push({ type:'Feature', geometry:p.geometry, properties:{ role:'start-delta' } });
+    }
+    if (curEnd && (curEnd[0] !== origEnd[0] || curEnd[1] !== origEnd[1])) {
+      const p = safePath(origEnd, curEnd);
+      features.push({ type:'Feature', geometry:p.geometry, properties:{ role:'end-delta' } });
+    }
+
+    const fc = { type:'FeatureCollection', features };
+    __dbg.log('delta', 'setData', { featureCount: features.length, roles: features.map(f => f.properties?.role) });
+    try { src.setData(fc); } catch {}
+    try { m.setLayoutProperty('edit-delta-layer','visibility', features.length ? 'visible':'none'); } catch {}
+  }, [editingStreetSegmentId, startEndMode, startPoint, endPoint, savedStreetSegments]);
+
+  // --- Save / finalize helpers -----------------------------------
 
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
   const canFinalizeStreets = streetsActive && !!startPoint && !!endPoint;
@@ -3246,9 +3690,10 @@ export default function App() {
       };
   setSavedStreetSegments(prev => [newFeature, ...prev]);
     }
-    // Clear ephemeral selection layers
+    // Clear ephemeral selection layers immediately without delay
     if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
     if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
+    setEphemeralStreetPath(null); // This will trigger master renderer to rebuild saved segments
     if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
     if (m.getSource('start-end-points')) m.removeSource('start-end-points');
     setStartPoint(null);
@@ -4058,9 +4503,6 @@ export default function App() {
                     )}
                     {editingStreetSegmentId && (
                       <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>
-                        <div style={{ display:'flex', gap:'0.5rem', marginBottom:'0.5rem', flexWrap:'wrap' }}>
-                          <button onClick={handleTidyEndpoints} className="btn btn--tidy" style={buttonVariants.info} title="Snap endpoints to the current line and trim line between them">Tidy endpoints to line</button>
-                        </div>
                         <EditForm
                           mode="street"
                           name={editingStreetName}
@@ -4068,7 +4510,7 @@ export default function App() {
                           useType={useType}
                           onNameChange={setEditingStreetName}
                           onDescriptionChange={setEditingStreetDescription}
-                          onTypeChange={setUseType}
+                          onTypeChange={updateUseType}
                           onCancel={cancelStreetGeometryEdit}
                           onSave={finalizeStreetSelection}
                           savingLabel="Save changes"
@@ -4127,7 +4569,7 @@ export default function App() {
                         useType={useType}
                         onNameChange={setPendingName}
                         onDescriptionChange={setPendingDescription}
-                        onTypeChange={setUseType}
+                        onTypeChange={updateUseType}
                         onCancel={handleCancelSave}
                         onSave={saveZone}
                         savingLabel={editingSavedIndex != null ? 'Save changes' : 'Save'}
@@ -4148,7 +4590,7 @@ export default function App() {
                     <div style={{ display:'flex', alignItems:'center', gap:'0.5rem', flexWrap:'wrap' }}>
                       <span style={{ fontSize:'0.75rem', fontWeight:600 }}>Type:</span>
                       {['mixed-use','residential','commercial'].map(t => (
-                        <button key={t} id={`street-type-${t}`} name="streetType" onClick={()=>setUseType(t)} title={t} aria-label={`Set type ${t}`} style={{ width: 28, height: 28, borderRadius: 6, border: useType === t ? '2px solid #222' : '1px solid #bbb', background: colorByUse[t], cursor: 'pointer', boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none' }} />
+                        <button key={t} id={`street-type-${t}`} name="streetType" onClick={()=>updateUseType(t)} title={t} aria-label={`Set type ${t}`} style={{ width: 28, height: 28, borderRadius: 6, border: useType === t ? '2px solid #222' : '1px solid #bbb', background: colorByUse[t], cursor: 'pointer', boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none' }} />
                       ))}
                     </div>
                     <div style={{ display:'flex', gap:'0.5rem', flexWrap:'wrap', marginTop:'0.25rem' }}>
