@@ -2,6 +2,92 @@ const MAPTILER_KEY = "DyVFUZmyKdCywxRTVU9B";
 import React, { useState, useRef, useEffect } from "react";
 import * as turf from "@turf/turf";
 import maplibregl from "maplibre-gl";
+import EditForm from './components/EditForm.jsx';
+import { colorByUse as themeColorByUse } from './theme.js';
+
+// Global debug silencer: set to true to suppress verbose debug logs
+const SILENCE_DEBUG_LOGS = true;
+// Wrap console methods to silence known debug/tagged logs while leaving errors intact
+(() => {
+  if (!SILENCE_DEBUG_LOGS) return;
+  try {
+    const original = {
+      log: console.log.bind(console),
+      warn: console.warn.bind(console),
+      groupCollapsed: console.groupCollapsed ? console.groupCollapsed.bind(console) : (...a)=>console.log(...a),
+    };
+    const TAG_PREFIXES = [
+      '[endpoint-',
+      '[street-',
+      '[snapToNetwork]',
+      '[style-switch]',
+      '[PolygonEdit]',
+      '[validate',
+      '[tidy]',
+      '[finalizeStreetSelection]',
+      '[finalizeStreetSelection:update-existing]',
+      '[street-perf]',
+      '[endpoint-diagnostics]'
+    ];
+    const PLAIN_PREFIXES = [
+      'startEndMode changed:',
+      'getRoadLayerIds:',
+      'Candidate features from queryRenderedFeatures:',
+      'Feature #',
+      'Drivable candidate:',
+      'Resetting selection, new start:',
+      'Start point:',
+      'End point:'
+    ];
+    const shouldSilence = (args) => {
+      const first = String(args?.[0] ?? '');
+      return TAG_PREFIXES.some(p => first.startsWith(p)) ||
+             PLAIN_PREFIXES.some(p => first.startsWith(p));
+    };
+    console.log = (...args) => { if (shouldSilence(args)) return; original.log(...args); };
+    console.groupCollapsed = (...args) => { if (shouldSilence(args)) return; original.groupCollapsed(...args); };
+    console.warn = (...args) => { if (shouldSilence(args)) return; original.warn(...args); };
+  } catch {}
+})();
+
+// Lightweight, toggleable debug logger
+// Enable by adding ?debug=1 to the URL or setting localStorage.setItem('sfst_debug','1')
+const __dbg = (() => {
+  let enabled = false;
+  let tagFilter = null; // optional comma-separated tags in localStorage 'sfst_debug_tags'
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    if (qs.get('debug')) enabled = true;
+  } catch {}
+  try {
+    const ls = localStorage.getItem('sfst_debug');
+    if (ls === '1' || ls === 'true') enabled = true;
+    const tags = localStorage.getItem('sfst_debug_tags');
+    if (tags && typeof tags === 'string') tagFilter = new Set(tags.split(',').map(s => s.trim()).filter(Boolean));
+  } catch {}
+  function ok(tag) {
+    if (!enabled) return false;
+    if (!tagFilter) return true;
+    return tagFilter.has(tag);
+  }
+  return {
+    enabled: () => enabled,
+    log(tag, msg, data) {
+      try { if (ok(tag)) console.log(`[dbg:${tag}] ${msg}`, data ?? ''); } catch {}
+    },
+    time(tag, label) {
+      try { if (ok(tag)) console.time(`[dbg:${tag}] ${label}`); } catch {}
+    },
+    timeEnd(tag, label) {
+      try { if (ok(tag)) console.timeEnd(`[dbg:${tag}] ${label}`); } catch {}
+    }
+  };
+})();
+
+// Simple id generator (not crypto strong but stable enough for local features)
+function genId() {
+  return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,9);
+}
 // Utility: Explode GeoJSON features to array of LineStrings
 function explodeToLineStrings(feature) {
 
@@ -19,15 +105,11 @@ function explodeToLineStrings(feature) {
       }));
     }
     return [];
-  }
-  return [];
 }
 
+}
 
 export default function App() {
-  // Show save panel state
-  const [showSavePanel, setShowSavePanel] = useState(false);
-  // Map instance ref
   const map = useRef(null);
   // Use type to color mapping
   const colorByUse = {
@@ -36,12 +118,20 @@ export default function App() {
     "commercial": "#FF6347",     // tomato
     // Add more use types and colors as needed
   };
+    // Local mutable flags for current drag lifecycle
+    let dragMoved = false; // tracks whether pointer actually moved while dragging
+    let dragStartCoord = null; // starting coordinate of the dragged endpoint (for adjustment heuristics)
   // Map container ref
   const mapContainer = useRef(null);
   // Pending name state
   const [pendingName, setPendingName] = useState("");
   // Pending description (used in save panel)
   const [pendingDescription, setPendingDescription] = useState("");
+  const [pendingStreetName, setPendingStreetName] = useState("");
+  const [pendingStreetDescription, setPendingStreetDescription] = useState("");
+  // Street editing metadata (mirrors zone name/description editing UX)
+  const [editingStreetName, setEditingStreetName] = useState("");
+  const [editingStreetDescription, setEditingStreetDescription] = useState("");
   // Summary context state
   const [summaryContext, setSummaryContext] = useState(null);
   // Zone summary state
@@ -50,17 +140,209 @@ export default function App() {
   const [activeTool, setActiveTool] = useState('none');
   // --- React state hooks ---
 
-  // --- Derived constants ---
+  // --- Derived constants (declared after dependent state hooks) ---
+  // (Some are declared later once their dependencies exist.)
   const polygonActive = activeTool === 'polygon';
   const streetsActive = activeTool === 'street';
   // End point for segment selection
   const [endPoint, setEndPoint] = useState(null);
   // Start point for segment selection
   const [startPoint, setStartPoint] = useState(null);
-  // Derived start/end selection mode from active tool
-  const startEndMode = streetsActive;
+  // Live refs to avoid stale closure values inside map event handlers
+  const startPointRef = useRef(startPoint);
+  const endPointRef = useRef(endPoint);
+  useEffect(() => { startPointRef.current = startPoint; }, [startPoint]);
+  useEffect(() => { endPointRef.current = endPoint; }, [endPoint]);
   // Length (meters) of current highlighted street path (M3 diagnostic / UX)
   const [streetPathLengthM, setStreetPathLengthM] = useState(null);
+  // Manual recompute trigger (nonce) & ref helper for external callers (e.g., drag commit)
+  const [streetPathNonce, setStreetPathNonce] = useState(0);
+  const recomputeStreetPathRef = useRef(null); // will point to () => setStreetPathNonce(n=>n+1)
+  // Persist the currently drawn (unsaved or editing) street path geometry across style switches
+  const [ephemeralStreetPath, setEphemeralStreetPath] = useState(null); // GeoJSON Feature<LineString> | null
+  // Saved street segments (M4 slice)
+  const [savedStreetSegments, setSavedStreetSegments] = useState([]); // Feature<LineString>[]
+  const [selectedStreetSegmentIndex, setSelectedStreetSegmentIndex] = useState(null);
+  // Editing an existing saved street segment geometry (declare early so downstream hooks can reference)
+  const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
+  // Live ref for editingStreetSegmentId to avoid stale closure inside map event handlers
+  const editingStreetSegmentIdRef = useRef(editingStreetSegmentId);
+  useEffect(() => { editingStreetSegmentIdRef.current = editingStreetSegmentId; }, [editingStreetSegmentId]);
+  // Derived start/end selection mode: active while street tool selected OR re-editing an existing street segment geometry
+  const startEndMode = streetsActive || !!editingStreetSegmentId;
+
+  // Debug wrappers for endpoint state (placed AFTER editingStreetSegmentId to avoid TDZ)
+  const debugSetStartPoint = React.useCallback((val, meta) => {
+    try { console.log('[endpoint-debug] setStartPoint', { meta, val, editingStreetSegmentId, ts: Date.now() }); } catch {}
+    setStartPoint(val);
+  }, [editingStreetSegmentId]);
+  const debugSetEndPoint = React.useCallback((val, meta) => {
+    try { console.log('[endpoint-debug] setEndPoint', { meta, val, editingStreetSegmentId, ts: Date.now() }); } catch {}
+    setEndPoint(val);
+  }, [editingStreetSegmentId]);
+
+  // Centralized helper to clear the current street geometry edit session with diagnostics.
+  function clearEditingStreetSegment(reason) {
+    // eslint-disable-next-line no-console
+    console.log('[street-edit] clearing editingStreetSegmentId', { reason, at: new Date().toISOString(), stack: (new Error().stack) });
+    setEditingStreetSegmentId(null);
+  }
+
+  // --- Endpoint edit stability refs ---------------------------------------
+  // Track original endpoints when an existing segment edit session begins
+  const initialStartRef = useRef(null);
+  const initialEndRef = useRef(null);
+  // Flags indicating user has intentionally adjusted an endpoint (so auto re-snap shouldn't override)
+  const userAdjustedStartRef = useRef(false);
+  const userAdjustedEndRef = useRef(false);
+  // Debounce timer for recompute after drag end
+  const dragRecomputeTimerRef = useRef(null);
+  // Track last dragged endpoint role & adjustment timestamps (debounce snapping overrides)
+  const lastDraggedRoleRef = useRef(null);
+  const lastAdjustTsRef = useRef({ start: 0, end: 0 });
+  // During edit, ignore soft reconcile for a brief window after mouseup to avoid snap-back
+  const softReconcileHoldMsRef = useRef(450);
+  // Opt-in recompute flag for street geometry edit mode (prevents automatic path rebuilds)
+  const forceEditRecomputeRef = useRef(false);
+  // Seed flag to avoid reseeding useType after user changes it during an edit session
+  const seededUseTypeOnEntryRef = useRef(false);
+  // Saved zones & selection (moved earlier to support derived flags)
+  const [savedZones, setSavedZones] = useState([]);
+  const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
+  const [editingSavedIndex, setEditingSavedIndex] = useState(null);
+  // Derived flags for specific edit modes
+  const editingZone = editingSavedIndex != null;
+  const editingStreet = !!editingStreetSegmentId;
+  const editingAny = editingZone || editingStreet;
+  // Only auto-force Off when a STREET edit begins (we still want polygon tool active for vertex editing)
+  const prevEditingStreetRef = useRef(false);
+  useEffect(() => {
+    if (editingStreet && !prevEditingStreetRef.current) {
+      // entering street edit
+      if (activeTool !== 'none') setActiveTool('none');
+    }
+    prevEditingStreetRef.current = editingStreet;
+  }, [editingStreet]);
+  // After finishing any edit (zone or street), ensure tool goes Off once (if it isn't already)
+  const prevEditingAnyRef = useRef(false);
+  useEffect(() => {
+    if (!editingAny && prevEditingAnyRef.current) {
+      // just exited an edit session
+      if (activeTool !== 'none') setActiveTool('none');
+    }
+    prevEditingAnyRef.current = editingAny;
+  }, [editingAny]);
+  // Unified selection clearing when tool switches
+  useEffect(()=>{
+    if (polygonActive) {
+      // Clear street selection state when switching to polygon tool
+      setSelectedStreetSegmentIndex(null);
+  clearEditingStreetSegment('unified-selection-clear:polygonActive');
+    } else if (streetsActive) {
+      // Clear polygon selection/editing when switching to street tool
+      setSelectedSavedIndex(null);
+      setEditingSavedIndex(null);
+    }
+  }, [polygonActive, streetsActive]);
+
+  // Derive currently selected saved street segment
+  const selectedStreetSegment = (typeof selectedStreetSegmentIndex === 'number' && selectedStreetSegmentIndex >=0) ? savedStreetSegments[selectedStreetSegmentIndex] : null;
+
+  // Build a lightweight street segment summary similar to zone summary
+  const streetSegmentSummary = React.useMemo(()=>{
+    if (!selectedStreetSegment) return null;
+    try {
+      const coords = selectedStreetSegment.geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) return null;
+      const lenM = selectedStreetSegment.properties?.lengthM ?? (()=>{ try { return turf.length(selectedStreetSegment,{units:'meters'}) } catch { return null; } })();
+      const start = coords[0];
+      const end = coords[coords.length-1];
+      // If the saved feature lacks precomputed streets, attempt to compute now
+      let streetsNames = selectedStreetSegment.properties?.streets || [];
+      if ((!streetsNames || streetsNames.length === 0) && map.current) {
+        try { streetsNames = getStreetLineNames(map.current, turf.lineString(coords)); } catch {}
+      }
+      return {
+        id: selectedStreetSegment.properties?.id,
+        name: selectedStreetSegment.properties?.name,
+        useType: selectedStreetSegment.properties?.useType,
+        lengthM: lenM,
+        start,
+        end,
+        streets: streetsNames
+      };
+    } catch { return null; }
+  }, [selectedStreetSegment]);
+  // Editing street segment summary (reuse feature even if not selected)
+  const editingStreetSegmentSummary = React.useMemo(()=>{
+    if (!editingStreetSegmentId) return null;
+    const feat = savedStreetSegments.find(f=>f.properties?.id===editingStreetSegmentId);
+    if (!feat) return null;
+    try {
+      const coords = feat.geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) return null;
+      const lenM = feat.properties?.lengthM ?? (()=>{ try { return turf.length(feat,{units:'meters'}) } catch { return null; } })();
+      let streetsNames = feat.properties?.streets || [];
+      if ((!streetsNames || streetsNames.length === 0) && map.current) {
+        try { streetsNames = getStreetLineNames(map.current, turf.lineString(coords)); } catch {}
+      }
+      const centroid = (()=>{ try { const c = turf.center(feat).geometry.coordinates; return c;} catch { return null; }})();
+      const start = coords[0];
+      const end = coords[coords.length - 1];
+      return {
+        id: feat.properties?.id,
+        name: editingStreetName || feat.properties?.name,
+        description: editingStreetDescription || feat.properties?.description,
+        useType: feat.properties?.useType,
+        lengthM: lenM,
+        lengthFt: (lenM != null) ? lenM * 3.28084 : null,
+        centroid,
+        start,
+        end,
+        streets: streetsNames
+      };
+    } catch { return null; }
+  }, [editingStreetSegmentId, savedStreetSegments, editingStreetName, editingStreetDescription]);
+  // When entering street geometry edit, seed temporary metadata fields (run once per session)
+  useEffect(()=>{
+    if (editingStreetSegmentId) {
+      const feat = savedStreetSegments.find(f=>f.properties?.id===editingStreetSegmentId);
+      setEditingStreetName(feat?.properties?.name || "");
+      setEditingStreetDescription(feat?.properties?.description || "");
+      // Seed draggable endpoints for edit mode only if not already initialized this session
+      try {
+        if (!initialStartRef.current && !initialEndRef.current) {
+          const coords = feat?.geometry?.coordinates;
+          if (Array.isArray(coords) && coords.length >= 2) {
+            initialStartRef.current = coords[0];
+            initialEndRef.current = coords[coords.length - 1];
+            userAdjustedStartRef.current = false;
+            userAdjustedEndRef.current = false;
+            // Reset recent-adjust timestamps for a fresh session
+            lastAdjustTsRef.current = { start: 0, end: 0 };
+            debugSetStartPoint(coords[0], 'seed:enter-edit');
+            debugSetEndPoint(coords[coords.length - 1], 'seed:enter-edit');
+            // Provide immediate length feedback from saved properties while recompute runs
+            try { setStreetPathLengthM(feat?.properties?.lengthM || null); } catch {}
+            try {
+              console.log('[edit-entry] seeded endpoints', { id: editingStreetSegmentId, start: coords[0], end: coords[coords.length - 1], lenM: feat?.properties?.lengthM });
+            } catch {}
+          }
+        }
+      } catch (e) {
+        try { console.warn('[endpoint-mouseup] commit failed in try block', e); } catch {}
+      }
+    } else {
+      setEditingStreetName("");
+      setEditingStreetDescription("");
+      // Reset entry references on exit
+      initialStartRef.current = null;
+      initialEndRef.current = null;
+      userAdjustedStartRef.current = false;
+      userAdjustedEndRef.current = false;
+      lastAdjustTsRef.current = { start: 0, end: 0 };
+    }
+  }, [editingStreetSegmentId]);
   // Performance samples for street path build (last N)
   const [streetPerfSamples, setStreetPerfSamples] = useState([]); // each: { total, featureQuery, graphBuild, pathSolve, renderUpdate, ts }
 
@@ -73,20 +355,88 @@ export default function App() {
   }
   // Zone type state
   const [useType, setUseType] = useState("mixed-use");
+  // Wrapper with diagnostics to track all useType changes and source context
+  const updateUseType = React.useCallback((next) => {
+    try {
+      // eslint-disable-next-line no-console
+      console.log('[useType] set', { from: useType, to: next, context: (editingStreetSegmentId ? 'street-edit' : (polygonActive ? 'polygon' : 'global')) });
+    } catch {}
+    setUseType(next);
+  }, [useType, editingStreetSegmentId, polygonActive]);
+  // Ephemeral summary (unsaved street path) for fresh load first street action (placed after dependent state declarations)
+  const ephemeralStreetPathSummary = React.useMemo(()=>{
+    if (!streetsActive) return null;
+    if (!startPoint || !endPoint) return null;
+    if (streetPathLengthM == null) return null;
+    if (editingStreetSegmentId) return null; // editing existing feature handled via saved summary
+    if (selectedStreetSegment) return null; // saved selection takes precedence
+    // Try to derive the street names for the in-progress path
+    let streetsNames = [];
+    try {
+      if (map.current) {
+        const src = map.current.getSource('selected-road-segment');
+        // @ts-ignore internal _data
+        const data = src?._data;
+        if (data?.geometry?.type === 'LineString') {
+          const ln = turf.lineString(data.geometry.coordinates);
+          streetsNames = getStreetLineNames(map.current, ln);
+        }
+      }
+    } catch {}
+    return {
+      id: null,
+      name: pendingStreetName.trim() || 'Unsaved Segment',
+      useType,
+      lengthM: streetPathLengthM,
+      start: startPoint,
+      end: endPoint,
+      streets: streetsNames,
+      transient: true
+    };
+  }, [streetsActive, startPoint, endPoint, streetPathLengthM, useType, selectedStreetSegment, editingStreetSegmentId, pendingStreetName]);
   // Drawn coordinates state
   const [drawnCoords, setDrawnCoords] = useState([]);
-  // Editing saved zone index state
-  const [editingSavedIndex, setEditingSavedIndex] = useState(null);
+  // Ref to always have latest drawnCoords inside effects without re-subscribing listeners
+  const drawnCoordsRef = useRef(drawnCoords);
+  useEffect(() => { drawnCoordsRef.current = drawnCoords; }, [drawnCoords]);
   // Drawing mode state
   const [drawMode, setDrawMode] = useState(false);
-  // Selected saved zone index state
-  const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
-  // Saved zones state
-  const [savedZones, setSavedZones] = useState([]);
+  // --- Persistence load (zones + street segments) ---
+  useEffect(()=>{
+    try {
+      const zRaw = localStorage.getItem('sfst_savedZones_v1');
+      if (zRaw) {
+        const arr = JSON.parse(zRaw);
+        if (Array.isArray(arr)) {
+          const sanitized = arr.filter(f => f && f.geometry && f.geometry.type === 'Polygon' && Array.isArray(f.geometry.coordinates));
+          setSavedZones(sanitized);
+        }
+      }
+    } catch {}
+    try {
+      const sRaw = localStorage.getItem('sfst_savedStreetSegments_v1');
+      if (sRaw) {
+        const arr = JSON.parse(sRaw);
+        if (Array.isArray(arr)) {
+          const sanitized = arr.filter(f => f && f.geometry && f.geometry.type === 'LineString' && Array.isArray(f.geometry.coordinates) && f.geometry.coordinates.length >= 2);
+          setSavedStreetSegments(sanitized);
+        }
+      }
+    } catch {}
+  }, []);
+  // Persist on change
+  useEffect(()=>{
+    try { localStorage.setItem('sfst_savedZones_v1', JSON.stringify(savedZones)); } catch {}
+  }, [savedZones]);
+  useEffect(()=>{
+    try { localStorage.setItem('sfst_savedStreetSegments_v1', JSON.stringify(savedStreetSegments)); } catch {}
+  }, [savedStreetSegments]);
   // Basemap style state
   const [basemapStyle, setBasemapStyle] = useState("streets");
   // Help box visibility for drawing instructions
   const [showHelpBox, setShowHelpBox] = useState(true);
+  // Whether the zone save form panel is visible while drawing/editing a zone
+  const [showSavePanel, setShowSavePanel] = useState(false);
   // Sidebar visibility & width (was referenced but not defined)
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(380);
@@ -194,7 +544,6 @@ export default function App() {
           break;
         }
       }
-      if (!name && feat.properties?.class) name = feat.properties.class;
       if (!name) continue;
 
       const g = feat.geometry?.type;
@@ -219,6 +568,38 @@ export default function App() {
     }
 
     return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }
+
+  // Street line intersecting/overlapping names (used for segment summary)
+  function getStreetLineNames(mapInstance, lineFeature) {
+    if (!mapInstance) return [];
+    const layerIds = getRoadLayerIds(mapInstance);
+    const [minLng, minLat, maxLng, maxLat] = turf.bbox(lineFeature);
+    const p1 = mapInstance.project([minLng, minLat]);
+    const p2 = mapInstance.project([maxLng, maxLat]);
+    const pad = 12;
+    const minX = Math.min(p1.x, p2.x) - pad;
+    const minY = Math.min(p1.y, p2.y) - pad;
+    const maxX = Math.max(p1.x, p2.x) + pad;
+    const maxY = Math.max(p1.y, p2.y) + pad;
+    const pixelBox = [ [minX, minY], [maxX, maxY] ];
+    const options = layerIds.length ? { layers: layerIds } : undefined;
+    let candidates = mapInstance.queryRenderedFeatures(pixelBox, options);
+    if (!candidates || candidates.length === 0) candidates = mapInstance.queryRenderedFeatures(options);
+    const names = new Set();
+    const nameKeys = ['name','name_en','name:en','name:latin','street','ref'];
+    for (const feat of candidates) {
+      let nm=null; for (const k of nameKeys) { if (feat.properties?.[k]) { nm=feat.properties[k]; break; } }
+      if (!nm) continue;
+      const g = feat.geometry?.type;
+      if (g==='LineString' || g==='MultiLineString') {
+        const asTurf = g==='LineString' ? turf.lineString(feat.geometry.coordinates) : turf.multiLineString(feat.geometry.coordinates);
+        try { if (turf.booleanIntersects(asTurf, lineFeature)) names.add(nm); } catch {}
+      } else if (g==='Point') {
+        try { const pt = turf.point(feat.geometry.coordinates); if (turf.booleanPointInPolygon(pt, turf.buffer(lineFeature, 0.0005))) names.add(nm); } catch {}
+      }
+    }
+    return Array.from(names).sort((a,b)=>a.localeCompare(b));
   }
 
   // Ensure sources and layers exist after load/style switch
@@ -259,6 +640,14 @@ export default function App() {
       mapInstance.addSource("drawn-points", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
+      });
+    }
+
+    // Source for street segment edit/view endpoints
+    if (!mapInstance.getSource('street-endpoints')) {
+      mapInstance.addSource('street-endpoints', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
       });
     }
 
@@ -313,9 +702,9 @@ export default function App() {
         type: "circle",
         source: "centroids",
         paint: {
-          "circle-radius": 5,
-          "circle-color": "#111",
-          "circle-stroke-width": 2,
+          "circle-radius": 8,
+          "circle-color": "#ff0000",
+          "circle-stroke-width": 1.5,
           "circle-stroke-color": "#fff",
         },
       });
@@ -327,11 +716,53 @@ export default function App() {
         type: "circle",
         source: "drawn-points",
         paint: {
-          "circle-radius": 7,
+          "circle-radius": 8,
           "circle-color": "#ff0000",
           "circle-stroke-width": 1.5,
           "circle-stroke-color": "#fff",
         },
+      });
+    }
+
+    // Street endpoints layer (start/end markers for current or editing segment)
+    if (!mapInstance.getLayer('street-endpoints-layer')) {
+      mapInstance.addLayer({
+        id: 'street-endpoints-layer',
+        type: 'circle',
+        source: 'street-endpoints',
+        paint: {
+          'circle-radius': 7,
+          'circle-color': [
+            'case',
+            ['==',['get','role'],'start'], '#00b461',
+            ['==',['get','role'],'end'], '#ffc400',
+            '#ff0000'
+          ],
+          'circle-stroke-width': 1.5,
+            'circle-stroke-color': '#fff'
+        }
+      });
+    }
+
+    // Edit delta overlay (dashed preview of change length near moved endpoints)
+    if (!mapInstance.getSource('edit-delta')) {
+      mapInstance.addSource('edit-delta', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('edit-delta-layer')) {
+      mapInstance.addLayer({
+        id: 'edit-delta-layer',
+        type: 'line',
+        source: 'edit-delta',
+        paint: {
+          'line-color': '#333',
+          'line-width': 4,
+          'line-opacity': 0.85,
+          'line-dasharray': [2, 2]
+        },
+        layout: { visibility: 'none' }
       });
     }
 
@@ -396,6 +827,58 @@ export default function App() {
         source: "saved-zones",
         paint: { "line-color": "#000", "line-width": 3 },
         filter: ["==", ["get", "__sid"], -999],
+      });
+    }
+
+    // Saved street segments
+    if (!mapInstance.getSource('saved-street-segments')) {
+      mapInstance.addSource('saved-street-segments', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('saved-street-segments-casing')) {
+      mapInstance.addLayer({
+        id: 'saved-street-segments-casing',
+        type: 'line',
+        source: 'saved-street-segments',
+        paint: {
+          'line-color': '#111',
+          'line-width': 8,
+          'line-opacity': 0.25
+        }
+      });
+    }
+    if (!mapInstance.getLayer('saved-street-segments-line')) {
+      mapInstance.addLayer({
+        id: 'saved-street-segments-line',
+        type: 'line',
+        source: 'saved-street-segments',
+        paint: {
+          'line-color': [
+            'match', 
+            ['get', 'useType'], 
+            'residential', colorByUse.residential,
+            'commercial', colorByUse.commercial, 
+            'mixed-use', colorByUse['mixed-use'],
+            colorByUse['mixed-use'] // default fallback
+          ],
+          'line-width': 5,
+          'line-opacity': 0.9
+        }
+      });
+    }
+    if (!mapInstance.getLayer('saved-street-segments-selected')) {
+      mapInstance.addLayer({
+        id: 'saved-street-segments-selected',
+        type: 'line',
+        source: 'saved-street-segments',
+        filter: ['==',['get','__sid'], -999],
+        paint: {
+          'line-color': '#222',
+          'line-width': 9,
+          'line-opacity': 0.35
+        }
       });
     }
   }
@@ -481,6 +964,45 @@ export default function App() {
     mapInstance.getSource("drawn-points")?.setData(pointsFC);
     mapInstance.getSource("saved-zones")?.setData(savedZonesFC);
     mapInstance.getSource("saved-centroids")?.setData(savedCentroidsFC);
+
+    // Saved street segments
+    // Exclude the segment currently being edited so it doesn't double-draw under the ephemeral layer
+    const segsFC = {
+      type: 'FeatureCollection',
+      features: (savedStreetSegments || [])
+        .filter(f => {
+          const fid = f?.properties?.id || f?.id;
+          return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+        })
+        .map((f,i) => ({
+          ...f,
+          properties: { ...(f.properties||{}), __sid: i }
+        }))
+    };
+    mapInstance.getSource('saved-street-segments')?.setData(segsFC);
+    
+    // Update saved street segments layer color to match colorByUse dynamically
+    if (mapInstance.getLayer('saved-street-segments-line')) {
+      try {
+        const colorExpression = [
+          'match', 
+          ['get', 'useType'], 
+          'residential', colorByUse.residential,
+          'commercial', colorByUse.commercial, 
+          'mixed-use', colorByUse['mixed-use'],
+          colorByUse['mixed-use'] // default fallback
+        ];
+        mapInstance.setPaintProperty('saved-street-segments-line', 'line-color', colorExpression);
+        console.log('[refreshMapData] updated saved street segments colors:', colorExpression);
+      } catch (e) {
+        console.warn('[refreshMapData] failed to update saved street segments colors:', e);
+      }
+    }
+    
+    if (mapInstance.getLayer('saved-street-segments-selected')) {
+      const filt = typeof selectedStreetSegmentIndex === 'number' ? ['==',['get','__sid'], selectedStreetSegmentIndex] : ['==',['get','__sid'], -999];
+      try { mapInstance.setFilter('saved-street-segments-selected', filt); } catch {}
+    }
   }
 
   // Build a zone summary from any Feature<Polygon>
@@ -563,170 +1085,219 @@ export default function App() {
   }
 
   // Merge pieces of the same way/name into one long line
-  // Minimal pathfinding: build graph from visible drivable segments and find shortest path
+  // Robust pathfinding: build graph from visible drivable segments, split at intersections, and find shortest path
   function findShortestRoadPath(mapInstance, startPt, endPt) {
-    // Get all visible drivable road segments
+    __dbg.log('path', 'enter findShortestRoadPath', { startPt, endPt });
     const roadLayerIds = getRoadLayerIds(mapInstance);
     const opts = roadLayerIds.length ? { layers: roadLayerIds } : undefined;
     let featuresRaw = [];
-    try {
-      featuresRaw = mapInstance.queryRenderedFeatures(opts);
-    } catch (err) {
+    try { featuresRaw = mapInstance.queryRenderedFeatures(opts) || []; } catch (err) {
+      __dbg.log('path', 'queryRenderedFeatures failed', { err: String(err) });
       return null;
     }
-    // Get all drivable road segments as LineStrings
-    const segments = featuresRaw.flatMap(explodeToLineStrings).filter(f => isDrivableRoad(f.properties));
-      // ...existing code...
-
-      // Snap start/end to nearest segment
-      function snapToSegment(pt) {
-        let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
-        segments.forEach(f => {
-          let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
-          const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
-          if (snapped.properties.dist < bestDist) {
-            bestDist = snapped.properties.dist;
-            best = snapped.geometry.coordinates;
-            bestSeg = coords;
-            bestIdx = snapped.properties.index;
-          }
-        });
-        return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
-      }
-
-      const startSnap = snapToSegment(startPt);
-      const endSnap = snapToSegment(endPt);
-    // ...existing code...
-    const nodes = new Map(); // key: stringified [lng,lat], value: array of connected nodes
-    const edges = new Map(); // key: nodeA|nodeB, value: segment
-    segments.forEach(seg => {
-      const coords = seg.geometry.coordinates;
-      for (let i = 0; i < coords.length - 1; i++) {
-        const a = coords[i], b = coords[i + 1];
-        const aKey = a.join(","), bKey = b.join(",");
-        if (!nodes.has(aKey)) nodes.set(aKey, []);
-        if (!nodes.has(bKey)) nodes.set(bKey, []);
-        nodes.get(aKey).push(bKey);
-        nodes.get(bKey).push(aKey);
-        edges.set(`${aKey}|${bKey}`, [a, b]);
-        edges.set(`${bKey}|${aKey}`, [b, a]);
-      }
+    // Build network lines from visible drivable segments
+    const lines = featuresRaw.flatMap(f => {
+      if (!isDrivableRoad(f.properties)) return [];
+      if (f.geometry?.type === 'LineString') return [turf.lineString(f.geometry.coordinates, f.properties)];
+      if (f.geometry?.type === 'MultiLineString') return f.geometry.coordinates.map(c => turf.lineString(c, f.properties));
+      return [];
     });
-    // Snap start/end to nearest point on any segment
-    function nearestPointOnSegments(pt) {
-      let minDist = Infinity, best = null, bestSeg = null;
-      for (const seg of segments) {
-        const line = turf.lineString(seg.geometry.coordinates);
-        const snapped = turf.nearestPointOnLine(line, turf.point(pt), { units: "meters" });
-        if (snapped.properties.dist < minDist) {
-          minDist = snapped.properties.dist;
-          best = snapped.geometry.coordinates;
-          bestSeg = seg;
+    __dbg.log('path', 'segments prepared', { totalFeatures: featuresRaw.length, drivableSegments: lines.length });
+
+    if (!lines.length) return null;
+
+    // Helpers
+    const coordKey = (c) => `${c[0].toFixed(6)},${c[1].toFixed(6)}`;
+    const removeUndirectedEdge = (graph, k1, k2) => {
+      if (!graph) return;
+      if (graph.has(k1)) graph.set(k1, (graph.get(k1) || []).filter(e => e.to !== k2));
+      if (graph.has(k2)) graph.set(k2, (graph.get(k2) || []).filter(e => e.to !== k1));
+    };
+    const buildGraph = (ls) => {
+      const g = new Map(); // key -> [{ to, coords }]
+      const ensure = (k) => { if (!g.has(k)) g.set(k, []); };
+      for (const ln of ls) {
+        const cs = ln.geometry.coordinates;
+        for (let i = 0; i < cs.length - 1; i++) {
+          const a = cs[i], b = cs[i + 1];
+          const ka = coordKey(a), kb = coordKey(b);
+          ensure(ka); ensure(kb);
+          g.get(ka).push({ to: kb, coords: [a, b] });
+          g.get(kb).push({ to: ka, coords: [b, a] });
         }
       }
-      return { coord: best, seg: bestSeg };
+      return g;
+    };
+    const nearestSnap = (ls, pt) => {
+      let best = null, bestLine = null, bestIdx = null, minD = Infinity;
+      const target = turf.point(pt);
+      for (const ln of ls) {
+        try {
+          const snap = turf.nearestPointOnLine(ln, target, { units: 'meters' });
+          if (snap && snap.properties && typeof snap.properties.dist === 'number' && snap.properties.dist < minD) {
+            minD = snap.properties.dist;
+            best = snap.geometry.coordinates;
+            bestLine = ln;
+            bestIdx = snap.properties.index ?? null;
+          }
+        } catch {}
+      }
+      __dbg.log('path', 'nearestSnap', { pt, distM: minD });
+      return best ? { coord: best, line: bestLine, segIndex: bestIdx } : null;
+    };
+    const lineLen = (coords) => {
+      try { return turf.length(turf.lineString(coords), { units: 'meters' }); } catch { return Infinity; }
+    };
+
+    // Build base graph
+    const graph = buildGraph(lines);
+    if (!graph || graph.size === 0) return null;
+
+    // Split lines at true intersections and reattach into graph
+    const attachPointOnLine = (g, ln, c) => {
+      try {
+        const snap = turf.nearestPointOnLine(ln, turf.point(c));
+        const idx = Math.min(Math.max(0, snap.properties.index ?? 0), ln.geometry.coordinates.length - 2);
+        const A = ln.geometry.coordinates[idx];
+        const B = ln.geometry.coordinates[idx + 1];
+        const kA = coordKey(A), kB = coordKey(B), kC = coordKey(snap.geometry.coordinates);
+        if (!g.has(kA)) g.set(kA, []);
+        if (!g.has(kB)) g.set(kB, []);
+        if (!g.has(kC)) g.set(kC, []);
+        removeUndirectedEdge(g, kA, kB);
+        g.get(kA).push({ to: kC, coords: [A, snap.geometry.coordinates] });
+        g.get(kC).push({ to: kA, coords: [snap.geometry.coordinates, A] });
+        g.get(kB).push({ to: kC, coords: [B, snap.geometry.coordinates] });
+        g.get(kC).push({ to: kB, coords: [snap.geometry.coordinates, B] });
+        return kC;
+      } catch { return null; }
+    };
+    for (let i = 0; i < lines.length; i++) {
+      for (let j = i + 1; j < lines.length; j++) {
+        try {
+          const ints = turf.lineIntersect(lines[i], lines[j]);
+          if (!ints?.features?.length) continue;
+          for (const f of ints.features) {
+            const c = f.geometry.coordinates;
+            attachPointOnLine(graph, lines[i], c);
+            attachPointOnLine(graph, lines[j], c);
+          }
+        } catch {}
+      }
     }
-    // Helper: Snap to nearest point on any segment
-    function nearestPointOnSegments(pt) {
-      let best = null, bestDist = Infinity, bestSeg = null, bestIdx = null;
-      segments.forEach(f => {
-        let coords = f.geometry.type === "LineString" ? f.geometry.coordinates : [].concat(...f.geometry.coordinates);
-        const snapped = turf.nearestPointOnLine(turf.lineString(coords), turf.point(pt), {units: "meters"});
-        if (snapped.properties.dist < bestDist) {
-          bestDist = snapped.properties.dist;
-          best = snapped.geometry.coordinates;
-          bestSeg = coords;
-          bestIdx = snapped.properties.index;
+
+    // Snap input points to the network
+    const s = nearestSnap(lines, startPt);
+    const t = nearestSnap(lines, endPt);
+    if (!s || !t) { __dbg.log('path', 'snap failed', { s: !!s, t: !!t }); return null; }
+
+    // Fast path: if both snaps land on the exact same underlying line, slice that line.
+    try {
+      if (s.line && t.line && s.line === t.line) {
+        const sliceA = turf.nearestPointOnLine(s.line, turf.point(s.coord));
+        const sliceB = turf.nearestPointOnLine(s.line, turf.point(t.coord));
+        let sliced = turf.lineSlice(sliceA, sliceB, s.line);
+        if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+          sliced = turf.lineSlice(sliceB, sliceA, s.line);
+          if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+            const first = sliced.geometry.coordinates[0];
+            const d1 = turf.distance(turf.point(first), turf.point(s.coord));
+            const d2 = turf.distance(turf.point(first), turf.point(t.coord));
+            if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+          }
         }
-      });
-      return best ? { point: best, seg: bestSeg, idx: bestIdx } : null;
+        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+          __dbg.log('path', 'fast-path same-line slice used', { lenM: (()=>{ try { return turf.length(sliced,{units:'meters'});} catch { return null; } })() });
+          return sliced;
+        }
+      }
+    } catch {}
+
+    // Attach start and end to graph
+    const startK = coordKey(s.coord);
+    const endK = coordKey(t.coord);
+    if (!graph.has(startK)) graph.set(startK, []);
+    if (!graph.has(endK)) graph.set(endK, []);
+    if (s.line && s.segIndex != null) {
+      const cs = s.line.geometry.coordinates;
+      const i = Math.min(Math.max(0, s.segIndex), cs.length - 2);
+      const A = cs[i], B = cs[i + 1];
+      const kA = coordKey(A), kB = coordKey(B);
+      if (!graph.has(kA)) graph.set(kA, []);
+      if (!graph.has(kB)) graph.set(kB, []);
+      removeUndirectedEdge(graph, kA, kB);
+      graph.get(startK).push({ to: kA, coords: [s.coord, A] });
+      graph.get(startK).push({ to: kB, coords: [s.coord, B] });
     }
-    // Only one correct declaration of startSnap and endSnap should exist in this function
-    if (!startSnap.coord || !endSnap.coord) return null;
-    // Insert snapped points as temporary nodes
-    const startKey = startSnap.coord.join(",");
-    const endKey = endSnap.coord.join(",");
-    // Connect snapped start to its segment endpoints
-    if (startSnap.seg) {
-      const coords = startSnap.seg.geometry.coordinates;
-      const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
-      if (!nodes.has(startKey)) nodes.set(startKey, []);
-      nodes.get(startKey).push(aKey);
-      nodes.get(aKey).push(startKey);
-      nodes.get(startKey).push(bKey);
-      nodes.get(bKey).push(startKey);
-      edges.set(`${startKey}|${aKey}`, [startSnap.coord, coords[0]]);
-      edges.set(`${aKey}|${startKey}`, [coords[0], startSnap.coord]);
-      edges.set(`${startKey}|${bKey}`, [startSnap.coord, coords[coords.length - 1]]);
-      edges.set(`${bKey}|${startKey}`, [coords[coords.length - 1], startSnap.coord]);
+    if (t.line && t.segIndex != null) {
+      const cs = t.line.geometry.coordinates;
+      const i = Math.min(Math.max(0, t.segIndex), cs.length - 2);
+      const A = cs[i], B = cs[i + 1];
+      const kA = coordKey(A), kB = coordKey(B);
+      if (!graph.has(kA)) graph.set(kA, []);
+      if (!graph.has(kB)) graph.set(kB, []);
+      removeUndirectedEdge(graph, kA, kB);
+      graph.get(kA).push({ to: endK, coords: [A, t.coord] });
+      graph.get(kB).push({ to: endK, coords: [B, t.coord] });
     }
-    // Connect snapped end to its segment endpoints
-    if (endSnap.seg) {
-      const coords = endSnap.seg.geometry.coordinates;
-      const aKey = coords[0].join(","), bKey = coords[coords.length - 1].join(",");
-      if (!nodes.has(endKey)) nodes.set(endKey, []);
-      nodes.get(endKey).push(aKey);
-      nodes.get(aKey).push(endKey);
-      nodes.get(endKey).push(bKey);
-      nodes.get(bKey).push(endKey);
-      edges.set(`${endKey}|${aKey}`, [endSnap.coord, coords[0]]);
-      edges.set(`${aKey}|${endKey}`, [coords[0], endSnap.coord]);
-      edges.set(`${endKey}|${bKey}`, [endSnap.coord, coords[coords.length - 1]]);
-      edges.set(`${bKey}|${endKey}`, [coords[coords.length - 1], endSnap.coord]);
-    }
-    // Dijkstra's algorithm
-    const visited = new Set();
-    const prev = new Map();
+
+    // Dijkstra
     const dist = new Map();
-    for (const key of nodes.keys()) dist.set(key, Infinity);
-    dist.set(startKey, 0);
-    const queue = [startKey];
-    while (queue.length) {
-      queue.sort((a, b) => dist.get(a) - dist.get(b));
-      const cur = queue.shift();
-      if (cur === endKey) break;
-      visited.add(cur);
-      for (const neighbor of nodes.get(cur) || []) {
-        if (visited.has(neighbor)) continue;
-        const seg = edges.get(`${cur}|${neighbor}`);
-        if (!seg) continue;
-        const segLen = turf.length(seg, { units: 'meters' });
-        const alt = dist.get(cur) + segLen;
-        if (alt < dist.get(neighbor)) {
-          dist.set(neighbor, alt);
-          prev.set(neighbor, cur);
-          queue.push(neighbor);
+    const prev = new Map();
+    const visited = new Set();
+    const pq = new Set();
+    for (const k of graph.keys()) dist.set(k, Infinity);
+    dist.set(startK, 0);
+    pq.add(startK);
+    const popMin = () => {
+      let best = null, bestD = Infinity;
+      for (const k of pq) { const d = dist.get(k); if (d < bestD) { bestD = d; best = k; } }
+      if (best != null) pq.delete(best);
+      return best;
+    };
+    while (pq.size) {
+      const u = popMin(); if (u == null) break; if (u === endK) break; if (visited.has(u)) continue; visited.add(u);
+      for (const e of (graph.get(u) || [])) {
+        const v = e.to; if (visited.has(v)) continue;
+        const w = lineLen(e.coords);
+        const alt = (dist.get(u) ?? Infinity) + w;
+        if (alt < (dist.get(v) ?? Infinity)) { dist.set(v, alt); prev.set(v, { u, coords: e.coords }); pq.add(v); }
+      }
+    }
+    __dbg.log('path', 'dijkstra finished', { reached: prev.has(endK), endDist: dist.get(endK) });
+    if (!prev.has(endK)) { __dbg.log('path', 'no path found, returning null'); return null; }
+
+    // Reconstruct and flatten coords
+    const segs = [];
+    let cur = endK;
+    while (prev.has(cur)) { const { u, coords } = prev.get(cur); segs.unshift(coords); cur = u; }
+    const same = (a, b, eps = 1e-7) => Math.abs(a[0] - b[0]) <= eps && Math.abs(a[1] - b[1]) <= eps;
+    const out = [];
+    for (let scoords of segs) {
+      let s0 = scoords[0], s1 = scoords[1];
+      if (out.length) { const last = out[out.length - 1]; if (same(last, s0)) out.push(s1); else if (same(last, s1)) out.push(s0); else { out.push(s0, s1); } } else { out.push(s0, s1); }
+    }
+    if (out.length < 2) return null;
+
+    // Precision slice between true snapped positions
+    let pathLine = turf.lineString(out);
+    try {
+      const sSnapOnPath = turf.nearestPointOnLine(pathLine, turf.point(startPt));
+      const eSnapOnPath = turf.nearestPointOnLine(pathLine, turf.point(endPt));
+      let sliced = turf.lineSlice(sSnapOnPath, eSnapOnPath, pathLine);
+      if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+        sliced = turf.lineSlice(eSnapOnPath, sSnapOnPath, pathLine);
+        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+          const first = sliced.geometry.coordinates[0];
+          const d1 = turf.distance(turf.point(first), turf.point(startPt));
+          const d2 = turf.distance(turf.point(first), turf.point(endPt));
+          if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
         }
       }
-    }
-    // Reconstruct path
-    let path = [];
-    let cur = endKey;
-    while (cur && prev.has(cur)) {
-      const prevKey = prev.get(cur);
-      const seg = edges.get(`${prevKey}|${cur}`);
-      if (seg) path.unshift(seg);
-      cur = prevKey;
-    }
-    // If path is empty, fallback to direct line
-    if (!path.length) {
-      return null;
-    }
-    // Flatten path segments, slicing first/last for exact start/end
-    let coords = [];
-    for (let i = 0; i < path.length; i++) {
-      let segCoords = path[i].geometry.coordinates;
-      // For first segment, snap start
-      if (i === 0) segCoords[0] = startPt;
-      // For last segment, snap end
-      if (i === path.length - 1) segCoords[segCoords.length - 1] = endPt;
-      // Avoid duplicate points between segments
-      if (i > 0 && coords.length && coords[coords.length - 1][0] === segCoords[0][0] && coords[coords.length - 1][1] === segCoords[0][1]) {
-        segCoords = segCoords.slice(1);
-      }
-      coords.push(...segCoords);
-    }
-    return turf.lineString(coords);
+      if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) pathLine = sliced;
+    } catch {}
+    __dbg.log('path', 'path constructed', { vertices: pathLine.geometry.coordinates.length });
+    return pathLine;
   }
 
   // Stitch together all connected drivable roads of the same way/name as baseLine
@@ -1050,21 +1621,204 @@ export default function App() {
     });
   }, []);
 
-  // Style switch restore
+  // Style switch restore (multi-stage with diagnostics & robust rehydration)
   useEffect(() => {
     if (!map.current) return;
-    map.current.setStyle(maptilerStyles[basemapStyle]);
+    const m = map.current;
+    const cachedSelectedRoad = selectedRoadSegmentRef.current;
+    const cachedEndpoints = streetEndpointsFCRef.current;
+    // eslint-disable-next-line no-console
+    console.log('[style-switch] initiating', basemapStyle, { hasCachedLine: !!cachedSelectedRoad, endpointCount: cachedEndpoints?.features?.length || 0 });
 
-    // Wait for the new style to finish loading sources/layers
-    map.current.once("styledata", () => {
-      ensureSourcesAndLayers(map.current);
-      refreshMapData(map.current, drawnCoords, useType, savedZones);
-      applySelectedFilter(map.current, selectedSavedIndex);
-      // ensure street layers match current tool
-  const visStreets = activeTool === 'street' ? 'visible' : 'none';
-      ["street-selections-line","street-selections-casing","street-buffer-fill","street-buffer-outline"]
-      .forEach(id => map.current.getLayer(id) && map.current.setLayoutProperty(id, "visibility", visStreets));
-    });
+    // Orphan old listeners just in case
+    const restoreKey = `__restore_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    function attemptRestore(stage) {
+      // eslint-disable-next-line no-console
+      console.log('[style-switch] attemptRestore', stage);
+      ensureSourcesAndLayers(m);
+      refreshMapData(m, drawnCoords, useType, savedZones);
+      applySelectedFilter(m, selectedSavedIndex);
+      // Keep street layers visible if actively editing a saved street segment even when tool auto-resets Off
+      const visStreets = (activeTool === 'street' || editingStreetSegmentId) ? 'visible' : 'none';
+      console.log('[style-switch] setting street layer visibility:', { 
+        visStreets, 
+        activeTool, 
+        editingStreetSegmentId, 
+        stage 
+      });
+      
+      // Handle the ephemeral editing layer separately to avoid interference with color changes
+      const layersToUpdate = ["street-selections-line","street-selections-casing","street-buffer-fill","street-buffer-outline","street-endpoints-layer","edit-delta-layer"];
+      layersToUpdate.forEach(id => {
+        if (m.getLayer(id)) {
+          m.setLayoutProperty(id, "visibility", visStreets);
+          console.log('[style-switch] set visibility for layer:', id, 'to:', visStreets);
+        } else {
+          console.log('[style-switch] layer not found:', id);
+        }
+      });
+      
+      // Special handling for selected-road-segment-layer (ephemeral editing layer)
+      if (m.getLayer('selected-road-segment-layer')) {
+        // Only set visibility, don't reset paint properties that might have been updated for color changes
+        const shouldBeVisible = editingStreetSegmentId || activeTool === 'street' || startEndMode;
+        m.setLayoutProperty('selected-road-segment-layer', 'visibility', shouldBeVisible ? 'visible' : 'none');
+        console.log('[style-switch] set visibility for selected-road-segment-layer to:', shouldBeVisible ? 'visible' : 'none', 'without resetting paint properties');
+      }
+      // Restore endpoints
+      try {
+        const epSrc = m.getSource('street-endpoints');
+        if (epSrc && cachedEndpoints) {
+          epSrc.setData(cachedEndpoints);
+        }
+      } catch (e) { console.warn('[style-switch] endpoints restore failed', e); }
+      // Restore selected road line
+      if (cachedSelectedRoad && cachedSelectedRoad.type === 'Feature') {
+        try {
+          if (!m.getSource('selected-road-segment')) {
+            m.addSource('selected-road-segment', { type:'geojson', data: cachedSelectedRoad });
+          } else {
+            m.getSource('selected-road-segment').setData(cachedSelectedRoad);
+          }
+          if (!m.getLayer('selected-road-segment-layer')) {
+            m.addLayer({
+              id:'selected-road-segment-layer',
+              type:'line',
+              source:'selected-road-segment',
+              paint:{
+                'line-color': colorByUse[useType] || '#ff9800',
+                'line-width':6,
+                'line-opacity':0.9,
+                'line-dasharray': editingStreetSegmentId ? [2,2] : [1,0]
+              }
+            });
+          }
+          try { m.setLayoutProperty('selected-road-segment-layer','visibility', visStreets); } catch {}
+          // Move above saved segments for clarity (if reference layer exists). If move fails, attempt to re-add at top.
+          try {
+            if (m.getLayer('saved-street-segments-line')) {
+              console.log('INSIDE THE IF STATEMENT FOR MOVING THE LAYER WHEN SWITCHING BASEMAP - [style-switch] moving selected-road-segment-layer above saved-street-segments-line');
+              // Ensure the ephemeral edit layer is always on top during style restore
+              m.moveLayer('selected-road-segment-layer');
+            } else {
+              console.log('INSIDE THE ELSE STATEMENT FOR MOVING THE LAYER WHEN SWITCHING BASEMAP - [style-switch] saved-street-segments-line layer not found, re-adding selected-road-segment-layer to top');
+              // fallback: remove and re-add to top
+              const featureBackup = cachedSelectedRoad;
+              try { m.removeLayer('selected-road-segment-layer'); } catch {}
+              try {
+                m.addLayer({
+                  id:'selected-road-segment-layer',
+                  type:'line',
+                  source:'selected-road-segment',
+                  paint:{
+                    'line-color': colorByUse[useType] || '#ff9800',
+                    'line-width':6,
+                    'line-opacity':0.9,
+                    'line-dasharray': editingStreetSegmentId ? [2,2] : [1,0]
+                  }
+                });
+              } catch (err) { console.warn('[style-switch] re-add top failed', err); }
+              // ensure data still intact
+              try { m.getSource('selected-road-segment').setData(featureBackup); } catch {}
+            }
+          } catch (e) { console.warn('[style-switch] moveLayer failed', e); }
+        } catch (e) {
+          console.warn('[style-switch] line restore failed', e);
+        }
+      }
+    }
+
+    function finalCheck() {
+      const hasLine = !!m.getLayer('selected-road-segment-layer');
+      const hasEndpoints = !!m.getSource('street-endpoints');
+      // eslint-disable-next-line no-console
+      console.log('[style-switch] finalCheck', { 
+        hasLine, 
+        hasEndpoints, 
+        activeTool, 
+        editingStreetSegmentId, 
+        useType,
+        shouldBeVisible: (activeTool === 'street' || editingStreetSegmentId)
+      });
+      if (!hasLine && cachedSelectedRoad) {
+        console.warn('[style-switch] forcing recompute fallback');
+        try { recomputeStreetPathRef.current && recomputeStreetPathRef.current(); } catch {}
+      }
+      // If line exists, only ensure visibility is correct - don't reset paint properties
+      // The updateStreetLineAppearance function will handle color updates separately
+      if (hasLine) {
+        try {
+          const currentVisibility = m.getLayoutProperty('selected-road-segment-layer', 'visibility');
+          const shouldBeVisible = (activeTool === 'street' || editingStreetSegmentId || startEndMode);
+          
+          console.log('[style-switch] finalCheck - current layer properties:', {
+            currentVisibility,
+            targetVisibility: shouldBeVisible ? 'visible' : 'none',
+            skipPaintPropertyReset: true
+          });
+          
+          // Only set visibility, don't reset paint properties that may have been updated for zone type changes
+          m.setLayoutProperty('selected-road-segment-layer','visibility', shouldBeVisible ? 'visible' : 'none');
+          
+          console.log('[style-switch] finalCheck - set visibility only, preserving paint properties');
+        } catch (e) {
+          console.error('[style-switch] finalCheck - error setting visibility:', e);
+        }
+      }
+    }
+
+    // Primary sequence
+    m.setStyle(maptilerStyles[basemapStyle]);
+    m.once('styledata', () => attemptRestore('styledata'));
+    m.once('style.load', () => attemptRestore('style.load'));
+    m.once('idle', () => { attemptRestore('idle'); finalCheck(); });
+
+    return () => {
+      // Cleanup (listeners auto-removed via once, but keep placeholder for symmetry)
+      // eslint-disable-next-line no-console
+      console.log('[style-switch] cleanup', restoreKey);
+    };
+  }, [basemapStyle]);
+
+  // Post-style assurance: only when basemapStyle changes, ensure ephemeral layer/source exist.
+  // Do not toggle visibility or override paint here to avoid racing with normal edit rendering.
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    let attempts = 0;
+    const maxAttempts = 5;
+    function tick() {
+      if (!m.getStyle()) return; // style not ready
+      const hasSource = !!m.getSource('selected-road-segment');
+      const hasLayer = !!m.getLayer('selected-road-segment-layer');
+      // Use the freshest available path: prefer ref/state, fall back to source _data if present
+      let pathData = null;
+      try {
+        pathData = selectedRoadSegmentRef.current || ephemeralStreetPath || m.getSource('selected-road-segment')?._data || null;
+      } catch {
+        pathData = selectedRoadSegmentRef.current || ephemeralStreetPath || null;
+      }
+      if (!pathData) return; // nothing to restore
+
+      if (!hasSource) {
+        try { m.addSource('selected-road-segment', { type:'geojson', data: pathData }); } catch {}
+      } else {
+        try { m.getSource('selected-road-segment').setData(pathData); } catch {}
+      }
+      if (!hasLayer) {
+        try {
+          m.addLayer({ id:'selected-road-segment-layer', type:'line', source:'selected-road-segment', paint:{ 'line-color': colorByUse[useType] || '#ff9800','line-width':6,'line-opacity':0.9 } });
+        } catch {}
+      }
+      // Keep ephemeral on top; don't change visibility here
+      try { if (m.getLayer('selected-road-segment-layer')) m.moveLayer('selected-road-segment-layer'); } catch {}
+
+      if (m.getLayer('selected-road-segment-layer')) return; // success
+      attempts++;
+      if (attempts < maxAttempts) setTimeout(tick, 180);
+    }
+    setTimeout(tick, 120);
   }, [basemapStyle]);
 
   // Repaint saved zones if the list changes
@@ -1076,6 +1830,115 @@ export default function App() {
       idx != null && idx < savedZones.length ? idx : null
     );
   }, [savedZones]);
+
+  // Keep street endpoints source in sync (supports style switches)
+  // Cache the last endpoints FeatureCollection so we can reapply after a style change without requiring a state change
+  const streetEndpointsFCRef = useRef({ type:'FeatureCollection', features: [] });
+  // Simplified endpoint sync: directly reflect startPoint/endPoint, independent of summaries
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    let src = m.getSource('street-endpoints');
+  const DEBUG_ENDPOINTS_SOURCE = false; // set to true to enable endpoint source logs
+    if (!src) {
+      // Try to create the source immediately if missing
+      try { m.addSource('street-endpoints', { type:'geojson', data:{ type:'FeatureCollection', features:[] } }); } catch {}
+      src = m.getSource('street-endpoints');
+      if (!src) {
+        // Style may still be loading; retry after style.load once
+        m.once('style.load', () => {
+          try {
+            let retry = m.getSource('street-endpoints');
+            if (!retry) {
+              try { m.addSource('street-endpoints', { type:'geojson', data:{ type:'FeatureCollection', features:[] } }); } catch {}
+              retry = m.getSource('street-endpoints');
+            }
+            if (retry && (startPoint || endPoint)) {
+              const feats = [];
+              if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
+              if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
+              const fcRetry = { type:'FeatureCollection', features:feats };
+              try { retry.setData(fcRetry); } catch {}
+              if (DEBUG_ENDPOINTS_SOURCE) {
+                try {
+                  console.log('[street-endpoints] setData (retry after style.load)', {
+                    featureCount: fcRetry.features.length,
+                    features: fcRetry.features.map(f => ({ role: f.properties?.role, coords: f.geometry?.coordinates }))
+                  });
+                } catch {}
+              }
+            }
+          } catch {}
+        });
+        return;
+      }
+    }
+
+    // Ensure the endpoints layer exists during creation/edit modes
+    if (!m.getLayer('street-endpoints-layer')) {
+      try {
+        m.addLayer({
+          id:'street-endpoints-layer',
+          type:'circle',
+          source:'street-endpoints',
+          paint:{
+            'circle-radius':7,
+            'circle-color': [
+              'case',
+              ['==',['get','role'],'start'], '#00b461',
+              ['==',['get','role'],'end'], '#ffc400',
+              '#ff0000'
+            ],
+            'circle-stroke-width':1.5,
+            'circle-stroke-color':'#fff'
+          }
+        });
+        // Set visibility based on mode
+        try { m.setLayoutProperty('street-endpoints-layer','visibility', startEndMode ? 'visible':'none'); } catch {}
+      } catch {}
+    }
+    const feats = [];
+    if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
+    if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
+    const fc = { type:'FeatureCollection', features: feats };
+    try {
+      src.setData(fc);
+      streetEndpointsFCRef.current = fc;
+      if (DEBUG_ENDPOINTS_SOURCE) {
+        try {
+          console.log('[street-endpoints] setData', {
+            featureCount: fc.features.length,
+            features: fc.features.map(f => ({ role: f.properties?.role, coords: f.geometry?.coordinates }))
+          });
+        } catch {}
+      }
+    } catch {}
+    // Visibility: show while in startEndMode even if one point missing; hide otherwise
+    try {
+      if (m.getLayer('street-endpoints-layer')) {
+        m.setLayoutProperty('street-endpoints-layer','visibility', startEndMode ? 'visible':'none');
+        if (DEBUG_ENDPOINTS_SOURCE) {
+          try {
+            // Log layer properties and on-screen positions for debugging
+            const vis = m.getLayoutProperty('street-endpoints-layer','visibility');
+            const radius = m.getPaintProperty('street-endpoints-layer','circle-radius');
+            const color = m.getPaintProperty('street-endpoints-layer','circle-color');
+            const stroke = m.getPaintProperty('street-endpoints-layer','circle-stroke-color');
+            const container = m.getContainer && m.getContainer();
+            const w = container?.clientWidth, h = container?.clientHeight;
+            const screen = (fc.features || []).map(f => {
+              try {
+                const p = m.project(f.geometry?.coordinates);
+                return { role: f.properties?.role, x: Math.round(p.x), y: Math.round(p.y) };
+              } catch { return { role: f.properties?.role, x: null, y: null }; }
+            });
+            console.log('[street-endpoints] layer', { visibility: vis, radius, color, stroke });
+            console.log('[street-endpoints] screenPos', { size: { w, h }, screen });
+          } catch {}
+        }
+      }
+    } catch {}
+  }, [startPoint, endPoint, startEndMode, basemapStyle]);
 
   // Apply highlight when selection changes
   useEffect(() => {
@@ -1101,6 +1964,208 @@ export default function App() {
     map.current.on("click", handleMapClick);
     return () => map.current && map.current.off("click", handleMapClick);
   }, [drawMode]);
+
+  // Re-bind draggable behavior for street endpoints (start/end) after style changes or tool activation
+  useEffect(() => {
+    if (!map.current) return;
+    if (!startEndMode) return;
+    const m = map.current;
+    let dragging = null; // 'start' | 'end'
+    let lastMoveTs = 0;
+    const endpointDraggingRef = endpointDraggingRefGlobal.current;
+  const DEBUG_ENDPOINT_SNAP = false; // set true to trace final mouseup snapping decisions
+    function snapToNetwork(lngLatArr, opts) {
+      try {
+        const roadLayerIds = getRoadLayerIds(m);
+        const featuresRaw = m.queryRenderedFeatures({ layers: roadLayerIds }) || [];
+        const roadNetwork = featuresRaw.flatMap(feat => {
+          if (feat.geometry?.type === 'LineString' && isDrivableRoad(feat.properties)) return [turf.lineString(feat.geometry.coordinates)];
+          if (feat.geometry?.type === 'MultiLineString' && isDrivableRoad(feat.properties)) return feat.geometry.coordinates.map(c => turf.lineString(c));
+          return [];
+        });
+        let best = null; let bestD = Infinity;
+        for (const line of roadNetwork) {
+          try {
+            const snapped = turf.nearestPointOnLine(line, turf.point(lngLatArr), { units:'meters' });
+            const d = snapped?.properties?.dist;
+            if (typeof d === 'number' && d < bestD) { bestD = d; best = snapped.geometry.coordinates; }
+          } catch {}
+        }
+        if (opts?.log && DEBUG_ENDPOINT_SNAP) {
+          try {
+            console.log('[snapToNetwork] final', {
+              phase: opts?.tag || 'unknown',
+              input: lngLatArr,
+              snapped: best || lngLatArr,
+              bestDistM: isFinite(bestD) ? bestD : null,
+              candidates: roadNetwork.length
+            });
+          } catch {}
+        }
+        return best || lngLatArr;
+      } catch { return lngLatArr; }
+    }
+    function onMouseDown(e) {
+      if (!e.features || !e.features.length) return;
+      const f = e.features[0];
+      if (f.layer?.id !== 'street-endpoints-layer') return;
+      const role = f.properties?.role;
+      if (role !== 'start' && role !== 'end') return;
+      __dbg.log('drag', 'mousedown on endpoint', { role });
+      dragging = role;
+      lastDraggedRoleRef.current = role;
+      endpointDraggingRef.current = true;
+      dragMoved = false;
+  dragStartCoord = role === 'start' ? (startPointRef.current ? [...startPointRef.current] : null) : (endPointRef.current ? [...endPointRef.current] : null);
+      // eslint-disable-next-line no-console
+  console.log('[endpoint-drag] mousedown', { role, dragStartCoord, editingStreetSegmentId: editingStreetSegmentIdRef.current, startEndMode });
+      try { m.getCanvas().style.cursor = 'grabbing'; } catch {}
+      m.dragPan.disable();
+    }
+    function onMouseMove(e) {
+      if (!dragging) return;
+      const lng = e.lngLat.lng, lat = e.lngLat.lat;
+      const now = performance.now();
+      dragMoved = true;
+      __dbg.log('drag', 'mousemove', { dragging, lng, lat });
+      // In edit mode: snap to network each (throttled) move for constrained endpoints + live preview
+      // We still avoid auto endpoint reconcile elsewhere; this only adjusts endpoints proactively.
+      // Throttle high-cost recompute (path rebuild) separately from simple snapping.
+  if (editingStreetSegmentIdRef.current) {
+        // Edit mode: snap to road each move and throttle live recompute so the dashed line tracks roads like creation flow
+        const snapped = snapToNetwork([lng,lat]);
+        __dbg.log('drag', 'mousemove snapped (edit)', { dragging, snapped });
+        if (dragging === 'start') debugSetStartPoint(snapped, 'drag:edit-snapped'); else debugSetEndPoint(snapped, 'drag:edit-snapped');
+        // Throttle recompute (~220ms) during drag; allow while dragging if force flag is set
+        const EDIT_RECOMPUTE_MS = 220;
+        if (now - lastMoveTs > EDIT_RECOMPUTE_MS) {
+          try {
+            forceEditRecomputeRef.current = true;
+            recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+            __dbg.log('drag', 'throttled recompute during edit drag');
+          } catch {}
+          lastMoveTs = now;
+        }
+        return;
+      }
+      // Creation mode: throttle snapping (~80ms) while giving raw interim updates
+      if (now - lastMoveTs > 80) {
+        const snapped = snapToNetwork([lng,lat]);
+        __dbg.log('drag', 'mousemove snapped (create)', { dragging, snapped });
+        if (dragging === 'start') debugSetStartPoint(snapped, 'drag:throttled'); else debugSetEndPoint(snapped, 'drag:throttled');
+        lastMoveTs = now;
+      } else {
+        __dbg.log('drag', 'mousemove raw (create)', { dragging, lng, lat });
+        if (dragging === 'start') debugSetStartPoint([lng,lat], 'drag:raw'); else debugSetEndPoint([lng,lat], 'drag:raw');
+      }
+    }
+    function onMouseUp() {
+      if (!dragging) return;
+      dragging = null;
+      endpointDraggingRef.current = false;
+      try { m.getCanvas().style.cursor = ''; } catch {}
+      m.dragPan.enable();
+      // Final snap commit (both modes) to ensure precise on-road endpoint
+      try {
+        if (dragMoved) {
+          __dbg.log('drag', 'mouseup commit path', { role: lastDraggedRoleRef.current });
+          // Extra diagnostics: confirm we entered the commit branch on mouseup
+          if (DEBUG_ENDPOINT_SNAP) {
+            try {
+              console.log('[endpoint-mouseup] dragMoved=true', {
+                role: lastDraggedRoleRef.current,
+                startPoint: startPointRef.current,
+                endPoint: endPointRef.current
+              });
+            } catch {}
+          }
+          if (lastDraggedRoleRef.current === 'start' && Array.isArray(startPointRef.current)) {
+            const before = [...startPointRef.current];
+            const snapped = snapToNetwork(startPointRef.current, { log: true, tag: 'mouseup-start' });
+            __dbg.log('drag', 'mouseup snapped start', { before, after: snapped });
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-commit] start', { snapped }); } catch {}
+            }
+            debugSetStartPoint(snapped, 'drag:mouseup-final-snap');
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-snap] start mouseup', { before, after: snapped }); } catch {}
+            }
+            lastAdjustTsRef.current.start = Date.now();
+          } else if (lastDraggedRoleRef.current === 'end' && Array.isArray(endPointRef.current)) {
+            const before = [...endPointRef.current];
+            const snapped = snapToNetwork(endPointRef.current, { log: true, tag: 'mouseup-end' });
+            __dbg.log('drag', 'mouseup snapped end', { before, after: snapped });
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-commit] end', { snapped }); } catch {}
+            }
+            debugSetEndPoint(snapped, 'drag:mouseup-final-snap');
+            if (DEBUG_ENDPOINT_SNAP) {
+              try { console.log('[endpoint-snap] end mouseup', { before, after: snapped }); } catch {}
+            }
+            lastAdjustTsRef.current.end = Date.now();
+          }
+        }
+      } catch {}
+      // Mark user-adjusted flags if moved meaningfully from initial reference
+      const dist = (a,b)=> (a&&b)? turf.distance(turf.point(a), turf.point(b), { units:'meters' }):0;
+  const MOVE_EPS_M = 0.15; // smaller threshold (~15cm) since small drags along same line are common
+      try {
+        if (dragMoved && lastDraggedRoleRef.current === 'start') {
+          userAdjustedStartRef.current = true;
+          lastAdjustTsRef.current.start = Date.now();
+        } else if (dragMoved && lastDraggedRoleRef.current === 'end') {
+          userAdjustedEndRef.current = true;
+          lastAdjustTsRef.current.end = Date.now();
+        }
+      } catch {}
+      // Clear last dragged role after processing to avoid accidental future snaps
+      lastDraggedRoleRef.current = null;
+      // eslint-disable-next-line no-console
+      console.log('[endpoint-drag] mouseup', {
+        moved: dragMoved,
+        startPoint: startPointRef.current, endPoint: endPointRef.current,
+        userAdjustedStart: userAdjustedStartRef.current,
+        userAdjustedEnd: userAdjustedEndRef.current,
+        initialStart: initialStartRef.current,
+        initialEnd: initialEndRef.current,
+        editingStreetSegmentId: editingStreetSegmentIdRef.current
+      });
+      // Debounce recompute to allow final state to settle
+      if (dragRecomputeTimerRef.current) clearTimeout(dragRecomputeTimerRef.current);
+      try { console.log('[endpoint-drag] schedule recompute after mouseup', { delayMs: 120, editingStreetSegmentId: editingStreetSegmentIdRef.current }); } catch {}
+      dragRecomputeTimerRef.current = setTimeout(() => {
+        try {
+          try { console.log('[endpoint-drag] invoking recomputeStreetPath', { forceEdit: !!editingStreetSegmentIdRef.current }); } catch {}
+          if (editingStreetSegmentIdRef.current) {
+            // Single intentional recompute after drag ends
+            forceEditRecomputeRef.current = true;
+          }
+          recomputeStreetPathRef.current && recomputeStreetPathRef.current();
+          __dbg.log('drag', 'post-mouseup recompute scheduled and invoked');
+        } catch (e) {
+          try { console.warn('[endpoint-drag] recompute after mouseup failed', e); } catch {}
+        }
+      }, 120);
+    }
+    // Guard: ensure layer exists first
+    if (m.getLayer('street-endpoints-layer')) {
+      m.on('mousedown','street-endpoints-layer', onMouseDown);
+      m.on('mousemove', onMouseMove);
+      m.on('mouseup', onMouseUp);
+      m.on('mouseleave', onMouseUp);
+    }
+    return () => {
+      if (m.getLayer('street-endpoints-layer')) {
+        try { m.off('mousedown','street-endpoints-layer', onMouseDown); } catch {}
+      }
+      try { m.off('mousemove', onMouseMove); } catch {}
+      try { m.off('mouseup', onMouseUp); } catch {}
+      try { m.off('mouseleave', onMouseUp); } catch {}
+    };
+  }, [startEndMode, basemapStyle]);
+
+  // Ref used to suppress path recompute while dragging
+  const endpointDraggingRefGlobal = useRef({ current: false });
 
   // Click on saved zones to select
   useEffect(() => {
@@ -1128,6 +2193,47 @@ export default function App() {
       m.off("click", "saved-zones-fill", onClickSaved);
     };
   }, [savedZones, editingSavedIndex, basemapStyle]);
+
+  // Click on saved street segments to select & fly
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const handler = (e) => {
+      // Ignore while editing a different street geometry (editingStreetSegmentId) or in polygon draw mode
+      if (editingStreetSegmentId) return;
+      if (drawMode) return;
+      const f = e.features?.[0];
+      if (!f) return;
+      const sid = f.properties?.__sid;
+      if (typeof sid === 'number') {
+        setSelectedStreetSegmentIndex(sid);
+        // Update map filter for selected styling
+        try {
+          const filt = ['==', ['get','__sid'], sid];
+          m.setFilter('saved-street-segments-selected', filt);
+        } catch {}
+        // Fly to bounds of the segment
+        const seg = savedStreetSegments[sid];
+        if (seg?.geometry?.type === 'LineString') {
+          try {
+            const lineBbox = turf.bbox(seg);
+            m.fitBounds([[lineBbox[0], lineBbox[1]],[lineBbox[2], lineBbox[3]]], { padding: getMapPadding(), duration: 650 });
+          } catch {}
+        }
+        // Ensure sidebar is visible when selecting via map
+        setSidebarVisible(true);
+      }
+    };
+
+    // Prefer clicking the main line layer (not the casing) for selection
+    m.on('click', 'saved-street-segments-line', handler);
+    // As a fallback also allow casing clicks (larger hit target)
+    m.on('click', 'saved-street-segments-casing', handler);
+    return () => {
+      m.off('click', 'saved-street-segments-line', handler);
+      m.off('click', 'saved-street-segments-casing', handler);
+    };
+  }, [savedStreetSegments, editingStreetSegmentId, drawMode, basemapStyle]);
 
   // Enter/exit draw mode housekeeping
   useEffect(() => {
@@ -1160,32 +2266,40 @@ export default function App() {
       setEditingSavedIndex(null);
       setSummaryContext(null);
     }
+    // Abort any street editing session when switching to polygon editing
+    if (polygonSelected && editingStreetSegmentId) {
+  clearEditingStreetSegment('drawMode sync: switched to polygon while editing street');
+    }
     // If switching away from street tool, cleanup points/line
     if (activeTool !== 'street') {
-      setStartPoint(null);
-      setEndPoint(null);
-      if (map.current) {
-        const m = map.current;
-        if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
-        if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
-        if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
-        if (m.getSource('start-end-points')) m.removeSource('start-end-points');
+      // When leaving explicit street tool mode, only clear endpoints if NOT in the middle of editing an existing saved segment.
+      if (!editingStreetSegmentId) {
+        setStartPoint(null);
+        setEndPoint(null);
+        if (map.current) {
+          const m = map.current;
+          if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
+          if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
+          if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
+          if (m.getSource('start-end-points')) m.removeSource('start-end-points');
+        }
+        setStreetPathLengthM(null);
+      } else {
+        // Ensure existing endpoints layer (canonical 'street-endpoints-layer') stays visible while editing
+        try {
+          if (map.current?.getLayer('street-endpoints-layer')) {
+            map.current.setLayoutProperty('street-endpoints-layer','visibility','visible');
+          }
+        } catch {}
       }
-      setStreetPathLengthM(null);
     }
   }, [activeTool]);
 
-  // Render updates when coords change
+  // Polygon and zone rendering updates
   useEffect(() => {
     if (!map.current) return;
     refreshMapData(map.current, drawnCoords, useType, savedZones);
-  }, [drawnCoords]);
-
-  // Recolor in-progress polygon immediately when Type changes
-  useEffect(() => {
-    if (!map.current) return;
-    refreshMapData(map.current, drawnCoords, useType, savedZones);
-  }, [useType]);
+  }, [drawnCoords, useType, savedZones]);
 
   // Point drag + delete
   useEffect(() => {
@@ -1317,17 +2431,11 @@ export default function App() {
     }
   }, [selectedSavedIndex, savedZones, drawMode, editingSavedIndex]);
 
-  // Keep street sources in sync initially and after style change
+  // Initial render setup
   useEffect(() => {
     if (!map.current) return;
     refreshMapData(map.current, drawnCoords, useType, savedZones);
   }, []);
-
-  // When width or selection changes, repaint buffer
-  useEffect(() => {
-    if (!map.current) return;
-    refreshMapData(map.current, drawnCoords, useType, savedZones);
-  }, [drawnCoords, useType]);
 
   // [START/END SEGMENT SELECTION] handle clicks
   useEffect(() => {
@@ -1338,6 +2446,8 @@ export default function App() {
 
     // Helper: Snap to nearest point on any road (LineString)
     function getNearestRoadPoint(lngLat) {
+      const DEBUG_SNAP = false; // set true to see summary logs
+      const DEBUG_SNAP_VERBOSE = false; // set true to see per-feature/segment diagnostics
       // Use a generous pixel box around the click for candidate roads
       const projected = m.project([lngLat.lng, lngLat.lat]);
       if (!projected || typeof projected.x !== 'number' || typeof projected.y !== 'number') {
@@ -1360,34 +2470,68 @@ export default function App() {
         return [lngLat.lng, lngLat.lat];
       }
       console.log('Candidate features from queryRenderedFeatures:', featuresRaw);
+
+      // Helpers for validation
+      const isValidCoord = (c) => Array.isArray(c) && c.length >= 2 && isFinite(c[0]) && isFinite(c[1]);
+      const isValidLineCoords = (arr) => Array.isArray(arr) && arr.length >= 2 && arr.every(isValidCoord);
+      const safeLineString = (coords) => {
+        try { return isValidLineCoords(coords) ? turf.lineString(coords) : null; } catch { return null; }
+      };
+      // Filter out any features with malformed geometries early
+      featuresRaw = featuresRaw.filter(f => {
+        if (!f?.geometry) return false;
+        if (f.geometry.type === 'LineString') return isValidLineCoords(f.geometry.coordinates);
+        if (f.geometry.type === 'MultiLineString') {
+          if (!Array.isArray(f.geometry.coordinates) || !f.geometry.coordinates.length) return false;
+          // At least one valid segment must exist
+            return f.geometry.coordinates.some(isValidLineCoords);
+        }
+        return false; // ignore other geometry types
+      });
     featuresRaw.forEach((f, i) => {
       const isDrivable = isDrivableRoad(f.properties);
       let snappedDist = "N/A";
       if (f.geometry?.type === "LineString") {
-        const pt = turf.point([lngLat.lng, lngLat.lat]);
-        const line = turf.lineString(f.geometry.coordinates);
-        const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-        snappedDist = snapped.properties.dist;
-      } else if (f.geometry?.type === "MultiLineString") {
-        const pt = turf.point([lngLat.lng, lngLat.lat]);
-        let minDist = Infinity;
-        let bestSnapped = null;
-        f.geometry.coordinates.forEach((coords, segIdx) => {
-          const line = turf.lineString(coords);
-          const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-          if (snapped.properties.dist < minDist) {
-            minDist = snapped.properties.dist;
-            bestSnapped = snapped;
+        try {
+          const pt = turf.point([lngLat.lng, lngLat.lat]);
+          const line = safeLineString(f.geometry.coordinates);
+          if (line) {
+            const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+            snappedDist = snapped?.properties?.dist;
           }
-          console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped.properties.dist}`);
-        });
-        if (bestSnapped) {
-          snappedDist = bestSnapped.properties.dist;
+        } catch (e) {
+          if (DEBUG_SNAP) console.warn('[getNearestRoadPoint] line snapping error (LineString)', e);
+        }
+      } else if (f.geometry?.type === "MultiLineString") {
+        try {
+          const pt = turf.point([lngLat.lng, lngLat.lat]);
+          let minDist = Infinity;
+          let bestSnapped = null;
+          f.geometry.coordinates.forEach((coords, segIdx) => {
+            if (!isValidLineCoords(coords)) return; // skip invalid segment
+            const line = safeLineString(coords);
+            if (!line) return;
+            try {
+              const snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+              if (snapped && isFinite(snapped.properties?.dist) && snapped.properties.dist < minDist) {
+                minDist = snapped.properties.dist;
+                bestSnapped = snapped;
+              }
+              if (DEBUG_SNAP_VERBOSE) console.log(`Feature #${i} segment #${segIdx} snapped distance: ${snapped?.properties?.dist}`);
+            } catch {/* ignore individual segment errors */}
+          });
+          if (bestSnapped) {
+            snappedDist = bestSnapped.properties.dist;
+          }
+        } catch (e) {
+          if (DEBUG_SNAP) console.warn('[getNearestRoadPoint] line snapping error (MultiLineString)', e);
         }
       }
-      console.log(`Feature #${i} layer.id: ${f.layer?.id} isDrivable: ${isDrivable} snapped distance: ${snappedDist} geometry.type: ${f.geometry?.type} properties:`, f.properties);
-      if (f.geometry?.type !== "LineString") {
-        console.log(`Feature #${i} full object:`, f);
+      if (DEBUG_SNAP_VERBOSE) {
+        console.log(`Feature #${i} layer.id: ${f.layer?.id} isDrivable: ${isDrivable} snapped distance: ${snappedDist} geometry.type: ${f.geometry?.type} properties:`, f.properties);
+        if (f.geometry?.type !== "LineString") {
+          console.log(`Feature #${i} full object:`, f);
+        }
       }
     });
 
@@ -1400,19 +2544,26 @@ export default function App() {
       let snapped = null;
       let dist = null;
       if (feat.geometry?.type === "LineString") {
-        const line = turf.lineString(feat.geometry.coordinates);
-        snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-        dist = snapped.properties.dist;
+        const line = safeLineString(feat.geometry.coordinates);
+        if (!line) continue;
+        try {
+          snapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+          dist = snapped?.properties?.dist;
+        } catch { continue; }
       } else if (feat.geometry?.type === "MultiLineString") {
         let minDist = Infinity;
         let bestSnapped = null;
         feat.geometry.coordinates.forEach((coords, segIdx) => {
-          const line = turf.lineString(coords);
-          const segSnapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
-          if (segSnapped.properties.dist < minDist) {
-            minDist = segSnapped.properties.dist;
-            bestSnapped = segSnapped;
-          }
+          if (!isValidLineCoords(coords)) return;
+          const line = safeLineString(coords);
+          if (!line) return;
+          try {
+            const segSnapped = turf.nearestPointOnLine(line, pt, { units: 'meters' });
+            if (segSnapped && isFinite(segSnapped.properties?.dist) && segSnapped.properties.dist < minDist) {
+              minDist = segSnapped.properties.dist;
+              bestSnapped = segSnapped;
+            }
+          } catch {/* skip bad segment */}
         });
         snapped = bestSnapped;
         dist = minDist;
@@ -1425,14 +2576,17 @@ export default function App() {
       });
       if (dist !== null && dist < bestDist) {
         bestDist = dist;
-        best = snapped.geometry.coordinates;
+        if (snapped?.geometry?.coordinates && isValidCoord(snapped.geometry.coordinates)) {
+          best = snapped.geometry.coordinates;
+        }
       }
     }
-    // Only snap if within 80 meters (TEMPORARY for debugging)
+    // Only snap if within 80 meters
     if (best && bestDist <= 80) {
+      if (DEBUG_SNAP) console.log('[getNearestRoadPoint] final snapped distance (meters):', bestDist, 'coord:', best);
       return best;
     } else {
-      console.warn('No drivable road within 30 meters of click:', lngLat);
+      if (DEBUG_SNAP) console.warn('No drivable road within 80 meters of click:', lngLat);
       return null;
     }
     }
@@ -1446,10 +2600,10 @@ export default function App() {
         return;
       }
       if (!startPoint) {
-        setStartPoint(snapped);
+        debugSetStartPoint(snapped, 'click:start');
         console.log('Start point:', JSON.stringify(snapped));
       } else if (!endPoint) {
-        setEndPoint(snapped);
+        debugSetEndPoint(snapped, 'click:end');
         console.log('End point:', JSON.stringify(snapped));
       } else {
         // Clear previous line and points before starting new selection
@@ -1458,130 +2612,59 @@ export default function App() {
           if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
           if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
           if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
+
           if (m.getSource('start-end-points')) m.removeSource('start-end-points');
         }
-        setStartPoint(snapped);
-        setEndPoint(null);
+        debugSetStartPoint(snapped, 'click:reset-new-start');
+        debugSetEndPoint(null, 'click:reset-clear-end');
   console.log('Resetting selection, new start:', JSON.stringify(snapped));
       }
     };
 
     m.on("click", handleStartEndClick);
     return () => m.off("click", handleStartEndClick);
-  }, [startEndMode, startPoint, endPoint]);
+  }, [startEndMode, startPoint, endPoint, editingStreetSegmentId]);
 
-  // [START/END SEGMENT SELECTION] Visual feedback for selected points and drag-to-stretch
-  useEffect(() => {
-    if (!map.current) return;
-    if (!startEndMode) return;
-    const m = map.current;
-    if (!m.getSource('start-end-points')) {
-      m.addSource('start-end-points', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] }
-      });
-      m.addLayer({
-        id: 'start-end-points-layer',
-        type: 'circle',
-        source: 'start-end-points',
-        paint: {
-          'circle-radius': 8,
-          'circle-color': ['match', ['get', 'type'], 'start', '#28a745', 'end', '#ffc107', '#888'],
-          'circle-stroke-width': 2,
-          'circle-stroke-color': '#fff'
-        }
-      });
-    }
-    const features = [];
-    if (startPoint) {
-      features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: startPoint }, properties: { type: 'start' } });
-    }
-    if (endPoint) {
-      features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: endPoint }, properties: { type: 'end' } });
-    }
-    m.getSource('start-end-points').setData({ type: 'FeatureCollection', features });
-
-    // Drag-to-stretch logic
-    let isDragging = false;
-    let dragType = null;
-
-    function onMouseDown(e) {
-      if (!e.features?.length) return;
-      const feature = e.features[0];
-      if (feature.layer.id !== 'start-end-points-layer') return;
-      dragType = feature.properties.type; // 'start' or 'end'
-      isDragging = true;
-      m.getCanvas().style.cursor = 'grabbing';
-      m.dragPan.disable();
-    }
-
-    function onMouseMove(e) {
-      if (!isDragging || !dragType) return;
-      const lngLat = e.lngLat;
-      // Snap to the nearest point along the currently highlighted road segment
-      // Find the currently highlighted segment geometry
-      const m = map.current;
-      const source = m.getSource('selected-road-segment');
-      if (!source) return;
-      const data = source._data || source._options?.data;
-      if (!data || !data.geometry || !Array.isArray(data.geometry.coordinates)) return;
-      const line = turf.lineString(data.geometry.coordinates);
-      const snapped = turf.nearestPointOnLine(line, turf.point([lngLat.lng, lngLat.lat]), { units: 'meters' });
-      if (!snapped || !snapped.geometry || !Array.isArray(snapped.geometry.coordinates)) return;
-      if (dragType === 'start') {
-        setStartPoint(snapped.geometry.coordinates);
-      } else if (dragType === 'end') {
-        setEndPoint(snapped.geometry.coordinates);
-      }
-    }
-
-    function onMouseUp() {
-      if (!isDragging) return;
-      isDragging = false;
-      dragType = null;
-      m.getCanvas().style.cursor = '';
-      m.dragPan.enable();
-    }
-
-    m.on('mousedown', 'start-end-points-layer', onMouseDown);
-    m.on('mousemove', onMouseMove);
-    m.on('mouseup', 'start-end-points-layer', onMouseUp);
-
-    return () => {
-      m.off('mousedown', 'start-end-points-layer', onMouseDown);
-      m.off('mousemove', onMouseMove);
-      m.off('mouseup', 'start-end-points-layer', onMouseUp);
-    };
-  }, [startEndMode, startPoint, endPoint]);
+  // (Removed conflicting extended drag effect; unified on primary drag handler elsewhere)
 
   // [START/END SEGMENT SELECTION] Highlight selected road segment and clear on exit
   useEffect(() => {
+    // expose a stable recompute function via ref (even if early returns happen)
+    recomputeStreetPathRef.current = () => setStreetPathNonce(n => n + 1);
     if (!map.current) return;
     const m = map.current;
 
     // Only remove highlight and start/end points when exiting start/end mode
     if (!startEndMode) {
-      if (m.getLayer('selected-road-segment-layer')) {
-        m.removeLayer('selected-road-segment-layer');
-      }
-      if (m.getLayer('selected-road-segment')) {
-        m.removeLayer('selected-road-segment');
-      }
-      if (m.getSource('selected-road-segment')) {
-        m.removeSource('selected-road-segment');
-      }
-      if (m.getLayer('start-end-points-layer')) {
-        m.removeLayer('start-end-points-layer');
-      }
-      if (m.getSource('start-end-points')) {
-        m.removeSource('start-end-points');
-      }
-  setStreetPathLengthM(null);
+      // Only clear highlighted road path (leave endpoints cleanup to watchdog / earlier effect)
+      if (m.getLayer('selected-road-segment-layer')) { try { m.removeLayer('selected-road-segment-layer'); } catch {} }
+      if (m.getSource('selected-road-segment')) { try { m.removeSource('selected-road-segment'); } catch {} }
+      setStreetPathLengthM(null);
       return;
     }
 
     // Only highlight if both points are set and startEndMode is active
     if (startEndMode && startPoint && endPoint) {
+      // In edit mode suppress automatic recompute unless explicitly forced
+      if (editingStreetSegmentId && !forceEditRecomputeRef.current) {
+        // Suppress unless explicitly forced (periodic drag throttling, mouseup, or tidy)
+        return;
+      }
+      // Clear the force flag (single-use) so subsequent recomputes are suppressed again
+      if (forceEditRecomputeRef.current) forceEditRecomputeRef.current = false;
+      // Dedupe: skip heavy path recompute if inputs unchanged since last successful build
+      const pathInputsKeyRef = (App.__lastPathInputsRef ||= { current: null });
+      const keyObj = { s: startPoint, e: endPoint, use: useType };
+      const key = JSON.stringify(keyObj);
+      if (pathInputsKeyRef.current && pathInputsKeyRef.current.key === key && pathInputsKeyRef.current.nonce === streetPathNonce) {
+        // eslint-disable-next-line no-console
+        console.log('[street-path] skip duplicate recompute', keyObj);
+        return;
+      }
+      // Suppress path rebuild while dragging unless we explicitly forced it
+      if (editingStreetSegmentId && endpointDraggingRefGlobal.current.current && !forceEditRecomputeRef.current) {
+        return; // skip recompute mid-drag unless forced
+      }
       const t0 = performance.now();
       // Always snap both points to nearest road segment using all visible drivable roads
       const roadLayerIds = getRoadLayerIds(m);
@@ -1605,15 +2688,36 @@ export default function App() {
       // graph build & snapping timing occurs inside shortestPathOnNetwork; capture intermediate markers
       // Snap both points to the nearest road segment in the network
       function findNearestPointOnNetwork(point, network) {
+        // Validate incoming point
+        if (!point || !Array.isArray(point) || point.length < 2 || !isFinite(point[0]) || !isFinite(point[1])) {
+          return point; // pass through; higher-level logic will fallback
+        }
         let nearest = null;
         let minDist = Infinity;
-        network.forEach(line => {
-          const snapped = turf.nearestPointOnLine(line, turf.point(point), { units: 'meters' });
-          if (snapped.properties.dist < minDist) {
-            minDist = snapped.properties.dist;
-            nearest = snapped.geometry.coordinates;
+        for (const line of network) {
+          try {
+            if (!line || line.geometry?.type !== 'LineString') continue;
+            const coords = line.geometry.coordinates;
+            if (!Array.isArray(coords) || coords.length < 2) continue;
+            // Validate every coordinate pair to avoid turf errors "coordinates must contain numbers"
+            let valid = true;
+            for (const c of coords) {
+              if (!c || c.length < 2 || !isFinite(c[0]) || !isFinite(c[1])) { valid = false; break; }
+            }
+            if (!valid) continue;
+            const snapped = turf.nearestPointOnLine(line, turf.point(point), { units: 'meters' });
+            if (!snapped || !snapped.geometry?.coordinates) continue;
+            const dist = snapped.properties?.dist;
+            if (typeof dist !== 'number' || !isFinite(dist)) continue;
+            if (dist < minDist) {
+              minDist = dist;
+              nearest = snapped.geometry.coordinates;
+            }
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn('[snap] skipped line due to error', e);
           }
-        });
+        }
         return nearest || point;
       }
       const startSnapped = findNearestPointOnNetwork(startPoint, roadNetwork);
@@ -1722,6 +2826,35 @@ export default function App() {
         const s = nearestSnap(lines, a);
         const t = nearestSnap(lines, b);
         if (!s || !t) return null;
+
+        // Fast path: if both snaps land on the exact same underlying line feature, just slice that line.
+        // This prevents the "bounce" behavior where we remove the original A<->B edge twice and force
+        // Dijkstra to route out toward an intersection and back when shortening a segment.
+        try {
+          if (s.line && t.line && s.line === t.line) {
+            const sliceA = turf.nearestPointOnLine(s.line, turf.point(s.coord));
+            const sliceB = turf.nearestPointOnLine(s.line, turf.point(t.coord));
+            let sliced = turf.lineSlice(sliceA, sliceB, s.line);
+            if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+              // reverse order fallback
+              sliced = turf.lineSlice(sliceB, sliceA, s.line);
+              if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+                // orient from start->end
+                const first = sliced.geometry.coordinates[0];
+                const d1 = turf.distance(turf.point(first), turf.point(s.coord));
+                const d2 = turf.distance(turf.point(first), turf.point(t.coord));
+                if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+              }
+            }
+            if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+              // eslint-disable-next-line no-console
+              console.log('[street-path] fast-path same-line slice used', {
+                sliceLenM: (()=>{ try { return turf.length(sliced,{units:'meters'}); } catch { return null; } })()
+              });
+              return sliced;
+            }
+          }
+        } catch {}
 
         // Attach start/end to graph by connecting to the nearest segment endpoints
         const startK = coordKey(s.coord);
@@ -1832,8 +2965,8 @@ export default function App() {
         return turf.lineString(out);
       }
 
-  let pathLine = shortestPathOnNetwork(roadNetwork, startSnapped, endSnapped);
-  const t3_preFallback = performance.now();
+      let pathLine = shortestPathOnNetwork(roadNetwork, startSnapped, endSnapped);
+      const t3_preFallback = performance.now();
       // Fallback: if pathLine is null, try to snap to the closest road segment between the snapped points
       if (!pathLine || !pathLine.geometry || !Array.isArray(pathLine.geometry.coordinates) || pathLine.geometry.coordinates.length < 2) {
         // Improved fallback: slice the closest road segment between the snapped points
@@ -1914,44 +3047,126 @@ export default function App() {
         }
       }
       const t3 = performance.now();
-      // Use the full path from start to end without clamping
-      const finalLine = pathLine;
+      // Final precision trimming: slice pathLine exactly between the snapped endpoints.
+      // This fixes cases where both endpoints lie on the same underlying segment and the
+      // graph solution overshoots to a vertex before coming back, leaving a longer stale line.
+      let finalLine = pathLine;
+      try {
+        if (pathLine && pathLine.geometry?.type === 'LineString' && Array.isArray(pathLine.geometry.coordinates) && pathLine.geometry.coordinates.length >= 2) {
+          const startSnapOnPath = turf.nearestPointOnLine(pathLine, turf.point(startSnapped));
+          const endSnapOnPath = turf.nearestPointOnLine(pathLine, turf.point(endSnapped));
+          let sliced = turf.lineSlice(startSnapOnPath, endSnapOnPath, pathLine);
+          // If order along line is reversed, slice will be empty (<2 coords); retry reversed.
+          if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+            sliced = turf.lineSlice(endSnapOnPath, startSnapOnPath, pathLine);
+            // Maintain original direction from startSnapped -> endSnapped if we reversed.
+            if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+              const first = sliced.geometry.coordinates[0];
+              const d1 = turf.distance(turf.point(first), turf.point(startSnapped));
+              const d2 = turf.distance(turf.point(first), turf.point(endSnapped));
+              if (d2 < d1) {
+                // Currently reversed relative to desired orientation; flip coordinates.
+                sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+              }
+            }
+          }
+          if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+            // Replace with precise slice only if it actually shortens or differs to force a repaint.
+            const origLen = (()=>{ try { return turf.length(pathLine, { units: 'meters' }); } catch { return null; } })();
+            const newLen = (()=>{ try { return turf.length(sliced, { units: 'meters' }); } catch { return null; } })();
+            if (newLen != null && origLen != null && (newLen <= origLen + 0.01)) {
+              if (origLen != null && newLen != null && Math.abs(origLen - newLen) > 0.05) {
+                // eslint-disable-next-line no-console
+                console.log('[street-path] trimmed path', { origLenM: origLen, newLenM: newLen });
+              }
+              finalLine = sliced;
+            }
+          }
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('[street-path-trim] trimming failed', e);
+      }
       if (finalLine && finalLine.geometry && Array.isArray(finalLine.geometry.coordinates) && finalLine.geometry.coordinates.length >= 2) {
         // Add or update the source safely
         if (!m.getSource('selected-road-segment')) {
-          m.addSource('selected-road-segment', {
-            type: 'geojson',
-            data: finalLine
-          });
+          m.addSource('selected-road-segment', { type: 'geojson', data: finalLine });
         } else {
-          m.getSource('selected-road-segment').setData(finalLine);
+          try { m.getSource('selected-road-segment').setData(finalLine); } catch {}
         }
+        // Cache & persist ephemeral path
+        selectedRoadSegmentRef.current = finalLine;
+        setEphemeralStreetPath(finalLine);
         // Add the layer to render the highlighted line if not present
+        console.log('[path-computation] adding/updating selected-road-segment-layer');
         if (!m.getLayer('selected-road-segment-layer')) {
           m.addLayer({
             id: 'selected-road-segment-layer',
             type: 'line',
             source: 'selected-road-segment',
             paint: {
-              // Dynamic color reflects current zone/segment (useType)
-              'line-color': colorByUse[useType] || '#ff9800',
+              'line-color': '#ff9800', // temporary default, will be updated by styling function
               'line-width': 6,
-              'line-opacity': 0.85,
-              'line-dasharray': [2, 2]
+              'line-opacity': 0.9,
+              'line-dasharray': [1, 0] // temporary default, will be updated by styling function
             }
           });
         }
-        else {
-          // Update color immediately on subsequent renders if type changed
+        // Apply proper styling (color and dash pattern) via master renderer
+        // The master renderer will handle styling automatically via ephemeralStreetPath state
           try {
-            m.setPaintProperty('selected-road-segment-layer','line-color', colorByUse[useType] || '#ff9800');
-          } catch {}
-        }
-        try {
-          const lenM = turf.length(finalLine, { units: 'meters' });
-          setStreetPathLengthM(lenM);
-        } catch { setStreetPathLengthM(null); }
+            const lenM = turf.length(finalLine, { units: 'meters' });
+            setStreetPathLengthM(lenM);
+            const nearlyEqual = (a, b, eps = 1e-7) => Array.isArray(a) && Array.isArray(b) && Math.abs(a[0]-b[0]) < eps && Math.abs(a[1]-b[1]) < eps;
+            if (!editingStreetSegmentId) {
+              try {
+                if (Array.isArray(startPoint)) {
+                  const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
+                  if (sSnap?.geometry?.coordinates && !nearlyEqual(startPoint, sSnap.geometry.coordinates)) {
+                    debugSetStartPoint(sSnap.geometry.coordinates, 'path:snap:start');
+                  }
+                }
+                if (Array.isArray(endPoint)) {
+                  const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
+                  if (eSnap?.geometry?.coordinates && !nearlyEqual(endPoint, eSnap.geometry.coordinates)) {
+                    debugSetEndPoint(eSnap.geometry.coordinates, 'path:snap:end');
+                  }
+                }
+              } catch {}
+              // eslint-disable-next-line no-console
+              console.log('[street-path] post-path endpoint reconcile', { mode: 'creation', startPoint, endPoint });
+            } else {
+              // Edit mode: soft reconcile endpoints onto the computed path only if visibly off (> 0.4m)
+              try {
+                const isDragging = endpointDraggingRefGlobal.current?.current === true;
+                // Also hold for a short window after a mouseup adjustment to avoid immediate override
+                const nowTs = Date.now();
+                const recentlyAdjusted = (roleTs) => (nowTs - roleTs) < softReconcileHoldMsRef.current;
+                if (!isDragging && !recentlyAdjusted(lastAdjustTsRef.current.start) && !recentlyAdjusted(lastAdjustTsRef.current.end)) {
+                const THRESH_M = 0.4;
+                if (Array.isArray(startPoint)) {
+                  const sSnap = turf.nearestPointOnLine(finalLine, turf.point(startPoint));
+                  const d = turf.pointToLineDistance(turf.point(startPoint), finalLine, { units: 'meters' });
+                  if (sSnap?.geometry?.coordinates && typeof d === 'number' && d > THRESH_M) {
+                    debugSetStartPoint(sSnap.geometry.coordinates, 'path:edit-soft-reconcile:start');
+                  }
+                }
+                if (Array.isArray(endPoint)) {
+                  const eSnap = turf.nearestPointOnLine(finalLine, turf.point(endPoint));
+                  const d = turf.pointToLineDistance(turf.point(endPoint), finalLine, { units: 'meters' });
+                  if (eSnap?.geometry?.coordinates && typeof d === 'number' && d > THRESH_M) {
+                    debugSetEndPoint(eSnap.geometry.coordinates, 'path:edit-soft-reconcile:end');
+                  }
+                }
+                }
+              } catch {}
+              // eslint-disable-next-line no-console
+              console.log('[street-path] post-path endpoint reconcile', { mode: 'edit-soft', dragging: endpointDraggingRefGlobal.current?.current === true, startPoint, endPoint });
+            }
+          } catch { setStreetPathLengthM(null); }
         const t4 = performance.now();
+        // Record last successful inputs (store globally on function object to survive re-renders without extra hook)
+        pathInputsKeyRef.current = { key, nonce: streetPathNonce };
         const sample = {
           total: t4 - t0,
             featureQuery: t1 - t0,
@@ -1967,24 +3182,411 @@ export default function App() {
         console.log('[street-perf]', sample);
       }
     }
-  }, [startEndMode, startPoint, endPoint]);
+  }, [startEndMode, startPoint, endPoint, streetPathNonce]);
 
-  // Reactive: update selected road segment line color when zone type toggles
+  // Watchdog: if editing an existing street and canonical endpoint layer/source missing (e.g. removed during tool reset), restore them
   useEffect(() => {
     if (!map.current) return;
-    if (!streetsActive) return; // only relevant in street tool
+    if (!editingStreetSegmentId) return; // only matters when editing street geometry
+    if (!startEndMode) return; // startEndMode already broad but guard anyway
+    const m = map.current;
+    const src = m.getSource('street-endpoints');
+    const layerExists = m.getLayer('street-endpoints-layer');
+    if (!src) { try { m.addSource('street-endpoints', { type:'geojson', data:{ type:'FeatureCollection', features:[] } }); } catch {} }
+    if (!layerExists) {
+      try {
+        m.addLayer({
+          id:'street-endpoints-layer',
+          type:'circle',
+          source:'street-endpoints',
+          paint:{
+            'circle-radius':7,
+            'circle-color': [
+              'case',
+              ['==',['get','role'],'start'], '#00b461',
+              ['==',['get','role'],'end'], '#ffc400',
+              '#ff0000'
+            ],
+            'circle-stroke-width':1.5,
+            'circle-stroke-color':'#fff'
+          }
+        });
+      } catch {}
+    }
+    if ((startPoint || endPoint) && m.getSource('street-endpoints')) {
+      const feats = [];
+      if (startPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:startPoint }, properties:{ role:'start' }});
+      if (endPoint) feats.push({ type:'Feature', geometry:{ type:'Point', coordinates:endPoint }, properties:{ role:'end' }});
+      try { m.getSource('street-endpoints').setData({ type:'FeatureCollection', features:feats }); } catch {}
+    }
+  }, [editingStreetSegmentId, startEndMode, startPoint, endPoint]);
+
+  // Diagnostics: log state of endpoint sources/layers to uncover why markers may be invisible
+  useEffect(() => {
+    if (!map.current) return;
+    if (!(startEndMode || editingStreetSegmentId)) return;
+    // Dedupe: avoid duplicate logs when React StrictMode re-invokes effects or when multiple state updates batch
+    const snapshot = {
+      startEndMode: !!startEndMode,
+      editingStreetSegmentId: editingStreetSegmentId || null,
+      startPoint: Array.isArray(startPoint) ? startPoint : null,
+      endPoint: Array.isArray(endPoint) ? endPoint : null,
+      basemapStyle: basemapStyle || null,
+      streetsActive: !!streetsActive,
+      activeTool: activeTool || null
+    };
+    const snapStr = JSON.stringify(snapshot);
+    App.__diagPrevSnap ||= { current: null };
+    if (App.__diagPrevSnap.current === snapStr) return;
+    App.__diagPrevSnap.current = snapStr;
+    const m = map.current;
+    let featureCount = null;
+    try {
+      // eslint-disable-next-line no-underscore-dangle
+      const data = m.getSource('street-endpoints')?._data;
+      featureCount = data?.features?.length ?? 0;
+    } catch {}
+    // eslint-disable-next-line no-console
+    console.groupCollapsed('[endpoint-diagnostics] consolidated tick');
+    // eslint-disable-next-line no-console
+    console.log('mode', { startEndMode, editingStreetSegmentId, streetsActive, activeTool });
+    // eslint-disable-next-line no-console
+    console.log('points state', { startPoint, endPoint });
+    // eslint-disable-next-line no-console
+    console.log('street-endpoints source', { exists: !!m.getSource('street-endpoints'), layerExists: !!m.getLayer('street-endpoints-layer'), featureCount });
+    if (!m.getLayer('street-endpoints-layer')) {
+      // eslint-disable-next-line no-console
+      console.warn('[endpoint-diagnostics] street-endpoints-layer missing');
+    }
+    console.groupEnd();
+  }, [startEndMode, editingStreetSegmentId, startPoint, endPoint, basemapStyle, streetsActive, activeTool]);
+
+  // Ref to cache the selected road segment (ephemeral path) across style switches
+  const selectedRoadSegmentRef = useRef(null);
+
+  // Centralized function to calculate street appearance properties
+  const calculateStreetAppearance = React.useCallback((currentUseType, isEditing = false) => {
+    return {
+      color: colorByUse[currentUseType] || '#ff9800',
+      dashArray: [1, 0], // solid for all modes as requested
+      opacity: 0.9,
+      // Slightly wider during edit so it stands out above saved lines
+      width: isEditing ? 7 : 6
+    };
+  }, [colorByUse]);
+
+  // Consolidated rendering function for all street segments using refreshMapData consistently
+  const renderAllStreetSegments = React.useCallback((mapInstance, segments, editingId, currentUseType, ephemeralPath) => {
+    if (!mapInstance) return;
+    
+    console.log('[renderAllStreetSegments] rendering', {
+      savedSegments: segments?.length || 0,
+      editingId,
+      hasEphemeral: !!ephemeralPath,
+      currentUseType
+    });
+
+    // Always use refreshMapData for consistency with polygon workflow
+    refreshMapData(mapInstance, drawnCoords, currentUseType, savedZones);
+
+    // Handle ephemeral editing layer with immediate color update
+    if (ephemeralPath && ephemeralPath.geometry?.coordinates?.length >= 2) {
+      const appearance = calculateStreetAppearance(currentUseType, !!editingId);
+      
+      console.log('[renderAllStreetSegments] updating ephemeral layer with appearance:', appearance);
+      
+      // Add or update ephemeral source
+      if (!mapInstance.getSource('selected-road-segment')) {
+        mapInstance.addSource('selected-road-segment', { 
+          type: 'geojson', 
+          data: ephemeralPath 
+        });
+      } else {
+        try {
+          mapInstance.getSource('selected-road-segment').setData(ephemeralPath);
+        } catch (e) {
+          console.warn('[renderAllStreetSegments] failed to update ephemeral source:', e);
+        }
+      }
+
+      // Add or update ephemeral layer with correct styling
+      if (!mapInstance.getLayer('selected-road-segment-layer')) {
+        mapInstance.addLayer({
+          id: 'selected-road-segment-layer',
+          type: 'line',
+          source: 'selected-road-segment',
+          paint: {
+            'line-color': appearance.color,
+            'line-width': appearance.width,
+            'line-opacity': appearance.opacity,
+            'line-dasharray': appearance.dashArray
+          }
+        });
+        
+      } else {
+        // Force update ALL paint properties to ensure color changes are applied
+        try {
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-color', appearance.color);
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-dasharray', appearance.dashArray);
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-width', appearance.width);
+          mapInstance.setPaintProperty('selected-road-segment-layer', 'line-opacity', appearance.opacity);
+          mapInstance.setLayoutProperty('selected-road-segment-layer', 'visibility', 'visible');
+          
+          console.log('[renderAllStreetSegments] force-updated ephemeral layer paint properties:', {
+            color: appearance.color,
+            dash: appearance.dashArray,
+            width: appearance.width,
+            opacity: appearance.opacity
+          });
+        } catch (e) {
+          console.warn('[renderAllStreetSegments] failed to update ephemeral layer:', e);
+        }
+      }
+
+      // Always ensure the ephemeral layer is on top so color changes are visible immediately
+      try {
+        if (mapInstance.getLayer('selected-road-segment-layer')) {
+          console.log('IF STATEMENT FOR THE EPHEMERAL LAYER [renderAllStreetSegments] moving ephemeral layer to top');
+          mapInstance.moveLayer('selected-road-segment-layer');
+        }
+      } catch (e) {
+        console.log('[renderAllStreetSegments] reorder (to top) failed:', e?.message || e);
+      }
+    } else {
+      // Hide ephemeral layer when no path
+      try {
+        if (mapInstance.getLayer('selected-road-segment-layer')) {
+          mapInstance.setLayoutProperty('selected-road-segment-layer', 'visibility', 'none');
+          console.log('[renderAllStreetSegments] hid ephemeral layer - no path');
+        }
+      } catch (e) {
+        console.warn('[renderAllStreetSegments] failed to hide ephemeral layer:', e);
+      }
+    }
+  }, [calculateStreetAppearance, refreshMapData, drawnCoords, savedZones]);
+
+  // Master rendering coordinator - handles all visual updates in one place
+  useEffect(() => {
+    if (!map.current) return;
+    
+    console.log('[useEffect:master-renderer] triggered', {
+      useType,
+      editingStreetSegmentId,
+      hasEphemeralPath: !!ephemeralStreetPath,
+      savedStreetSegments: savedStreetSegments?.length || 0
+    });
+    
+    // Debounce to prevent rapid successive updates
+    const timer = setTimeout(() => {
+      renderAllStreetSegments(
+        map.current,
+        savedStreetSegments,
+        editingStreetSegmentId,
+        useType,
+        ephemeralStreetPath
+      );
+    }, 5);
+    
+    return () => clearTimeout(timer);
+  }, [useType, editingStreetSegmentId, ephemeralStreetPath, savedStreetSegments, renderAllStreetSegments]);
+
+  // Track previous editingStreetSegmentId to detect post-save transitions
+  const prevEditingStreetSegmentIdRef = useRef(editingStreetSegmentId);
+  
+  // Simplified post-save cleanup - only remove ephemeral layers, don't trigger refreshMapData
+  useEffect(() => {
+    const wasEditing = prevEditingStreetSegmentIdRef.current;
+    const isEditing = editingStreetSegmentId;
+    
+    console.log('[useEffect:post-save-cleanup] editingStreetSegmentId changed:', { 
+      from: wasEditing, 
+      to: isEditing,
+      isExitingEditMode: wasEditing && !isEditing
+    });
+    
+    // Only clean up ephemeral layers when exiting edit mode
+    if (wasEditing && !isEditing && map.current) {
+      console.log('[useEffect:post-save-cleanup] cleaning up ephemeral layers after save');
+      
+      // Clear ephemeral path state first
+      setEphemeralStreetPath(null);
+      
+      // Remove ephemeral layers
+      try {
+        const m = map.current;
+        if (m.getLayer('selected-road-segment-layer')) {
+          m.removeLayer('selected-road-segment-layer');
+        }
+        if (m.getSource('selected-road-segment')) {
+          m.removeSource('selected-road-segment');
+        }
+      } catch (e) {
+        console.warn('[useEffect:post-save-cleanup] error cleaning ephemeral layers:', e);
+      }
+      
+      // The master renderer will handle rebuilding saved segments automatically
+    }
+    
+    prevEditingStreetSegmentIdRef.current = isEditing;
+  }, [editingStreetSegmentId]);
+
+  // Initialize ephemeral layer when entering edit mode - simplified (seed type only once per session)
+  useEffect(() => {
+    if (!map.current || !editingStreetSegmentId) return;
+    
+    const m = map.current;
+    const feat = (savedStreetSegments || []).find(f => 
+      f.properties?.id === editingStreetSegmentId || f.id === editingStreetSegmentId
+    );
+    
+    if (!feat || feat.geometry?.type !== 'LineString') return;
+    
+    console.log('[useEffect:init-edit-geometry] setting up ephemeral layer for editing', editingStreetSegmentId);
+    
+    try {
+      const lineFeature = turf.lineString(feat.geometry.coordinates);
+      
+      // Set ephemeral path state - this will trigger the master renderer
+      setEphemeralStreetPath(lineFeature);
+      selectedRoadSegmentRef.current = lineFeature;
+
+      // Seed the current type from the feature under edit so color starts consistent,
+      // but only once when entering edit mode (avoid overriding user changes).
+      if (!seededUseTypeOnEntryRef.current) {
+        const featType = feat.properties?.useType;
+        if (featType && featType !== useType) {
+          try {
+            // eslint-disable-next-line no-console
+            console.log('[edit-entry] seed useType from feature', { from: useType, to: featType, id: editingStreetSegmentId });
+          } catch {}
+          setUseType(featType);
+        }
+        seededUseTypeOnEntryRef.current = true;
+      }
+      
+    } catch (e) {
+      console.warn('[useEffect:init-edit-geometry] error setting up edit geometry:', e);
+    }
+  }, [editingStreetSegmentId, savedStreetSegments]);
+
+  // Reset seed flag when exiting street edit mode
+  useEffect(() => {
+    if (!editingStreetSegmentId) {
+      seededUseTypeOnEntryRef.current = false;
+    }
+  }, [editingStreetSegmentId]);
+
+  // Guard: when type changes during street edit, ensure the ephemeral layer color updates immediately
+  useEffect(() => {
+    if (!map.current) return;
+    if (!editingStreetSegmentId) return;
     const m = map.current;
     if (m.getLayer('selected-road-segment-layer')) {
       try {
         m.setPaintProperty('selected-road-segment-layer', 'line-color', colorByUse[useType] || '#ff9800');
+        // eslint-disable-next-line no-console
+        console.log('[useType] applied to ephemeral layer', { useType, color: colorByUse[useType] || '#ff9800' });
       } catch {}
     }
-  }, [useType, streetsActive]);
+  }, [useType, editingStreetSegmentId, colorByUse]);
+
+  // Edit preview: dashed delta showing extension/reduction from original endpoints (follow road network)
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const visible = !!editingStreetSegmentId && startEndMode;
+    const src = m.getSource('edit-delta');
+    const layerExists = m.getLayer('edit-delta-layer');
+    __dbg.log('delta', 'effect enter', { visible, layerExists: !!layerExists, hasSource: !!src, editingStreetSegmentId, startEndMode });
+    if (!src || !layerExists) return; // created by ensureSourcesAndLayers
+
+    if (!visible) {
+      __dbg.log('delta', 'not visible, hiding layer and clearing data');
+      try { m.setLayoutProperty('edit-delta-layer','visibility','none'); } catch {}
+      try { src.setData({ type:'FeatureCollection', features: [] }); } catch {}
+      return;
+    }
+
+    // Need original endpoints for the segment under edit
+    const feat = (savedStreetSegments || []).find(f => f.id === editingStreetSegmentId || f.properties?.id === editingStreetSegmentId);
+    __dbg.log('delta', 'found feature for edit', { found: !!feat, type: feat?.geometry?.type, id: editingStreetSegmentId });
+    if (!feat || feat.geometry?.type !== 'LineString') {
+      __dbg.log('delta', 'feature missing or not LineString, hiding');
+      try { m.setLayoutProperty('edit-delta-layer','visibility','none'); } catch {}
+      try { src.setData({ type:'FeatureCollection', features: [] }); } catch {}
+      return;
+    }
+
+    const coords = feat.geometry.coordinates || [];
+    if (coords.length < 2) {
+      try { m.setLayoutProperty('edit-delta-layer','visibility','none'); } catch {}
+      try { src.setData({ type:'FeatureCollection', features: [] }); } catch {}
+      return;
+    }
+
+    const origStart = coords[0];
+    const origEnd = coords[coords.length - 1];
+    const curStart = Array.isArray(startPointRef.current) ? startPointRef.current : null;
+    const curEnd = Array.isArray(endPointRef.current) ? endPointRef.current : null;
+  __dbg.log('delta', 'endpoints', { origStart, origEnd, curStart, curEnd });
+
+    // Lightweight throttle to avoid heavy recompute on every tiny drag
+    const now = performance.now();
+    const last = (App.__deltaLastTs ||= { current: 0 }).current;
+    if (now - last < 90) return; // ~11 fps
+    App.__deltaLastTs.current = now;
+
+    const features = [];
+    function safePath(a, b) {
+      try {
+        const ln = findShortestRoadPath(m, a, b);
+        if (ln && ln.geometry?.type === 'LineString' && ln.geometry.coordinates?.length >= 2) return ln;
+        __dbg.log('delta', 'safePath: no path from solver, falling back to straight line', { a, b });
+      } catch {}
+      // Fallback: straight line if pathfinder unavailable
+      return turf.lineString([a, b]);
+    }
+
+    if (curStart && (curStart[0] !== origStart[0] || curStart[1] !== origStart[1])) {
+      const p = safePath(origStart, curStart);
+      features.push({ type:'Feature', geometry:p.geometry, properties:{ role:'start-delta' } });
+    }
+    if (curEnd && (curEnd[0] !== origEnd[0] || curEnd[1] !== origEnd[1])) {
+      const p = safePath(origEnd, curEnd);
+      features.push({ type:'Feature', geometry:p.geometry, properties:{ role:'end-delta' } });
+    }
+
+    const fc = { type:'FeatureCollection', features };
+    __dbg.log('delta', 'setData', { featureCount: features.length, roles: features.map(f => f.properties?.role) });
+    try { src.setData(fc); } catch {}
+    try { m.setLayoutProperty('edit-delta-layer','visibility', features.length ? 'visible':'none'); } catch {}
+  }, [editingStreetSegmentId, startEndMode, startPoint, endPoint, savedStreetSegments]);
 
   // --- Save / finalize helpers -----------------------------------
 
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
   const canFinalizeStreets = streetsActive && !!startPoint && !!endPoint;
+  const hasActiveStreetPath = streetsActive && !!startPoint && !!endPoint && streetPathLengthM != null;
+
+  function cancelAllSelections() {
+    setSelectedSavedIndex(null);
+    setSelectedStreetSegmentIndex(null);
+    setEditingSavedIndex(null);
+    setEditingStreetSegmentId(null);
+    setZoneSummary(null);
+    // streetSegmentSummary & ephemeralStreetPathSummary are derived via useMemo, so clearing source state is enough
+    setDrawMode(null);
+    setStartPoint(null);
+    setEndPoint(null);
+    setStreetPathLengthM(null);
+    setPendingStreetName("");
+    // remove ephemeral map layers if present
+    if (map.current) {
+      const m = map.current;
+      ['selected-road-segment-layer','start-end-points-layer'].forEach(l=>{ if (m.getLayer(l)) try{ m.removeLayer(l);}catch{} });
+      ['selected-road-segment','start-end-points'].forEach(s=>{ if (m.getSource(s)) try{ m.removeSource(s);}catch{} });
+    }
+  }
   
   // Finalize button handler
   function finalizeCurrent() {
@@ -2004,16 +3606,186 @@ export default function App() {
 
   // Placeholder for street selection finalization; keeps polygon flow intact
   function finalizeStreetSelection() {
-    // For now we just clear the start/end selection after confirming
-    // In a fuller flow this would add the selected street segment to a list
     if (!map.current) return;
     const m = map.current;
+    // Prefer the freshest in-memory path, then fall back to the map source _data
+    const src = m.getSource('selected-road-segment');
+    /** @type {import('geojson').Feature | null} */
+    let candidate = null;
+    try { candidate = selectedRoadSegmentRef.current || ephemeralStreetPath || (src && src._data) || null; } catch {}
+    if (!candidate || candidate.type !== 'Feature' || candidate.geometry?.type !== 'LineString' || !Array.isArray(candidate.geometry.coordinates)) {
+      return; // nothing to save
+    }
+    // If we have current endpoints, slice the line exactly between them to avoid saving stale ends
+    let lineToSave = candidate;
+    try {
+      const s = Array.isArray(startPointRef.current) ? startPointRef.current : null;
+      const e = Array.isArray(endPointRef.current) ? endPointRef.current : null;
+      if (s && e) {
+        const sSnap = turf.nearestPointOnLine(candidate, turf.point(s));
+        const eSnap = turf.nearestPointOnLine(candidate, turf.point(e));
+        let sliced = turf.lineSlice(sSnap, eSnap, candidate);
+        if (!sliced?.geometry?.coordinates || sliced.geometry.coordinates.length < 2) {
+          sliced = turf.lineSlice(eSnap, sSnap, candidate);
+          // keep direction start->end if we reversed
+          if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+            const first = sliced.geometry.coordinates[0];
+            const d1 = turf.distance(turf.point(first), turf.point(s));
+            const d2 = turf.distance(turf.point(first), turf.point(e));
+            if (d2 < d1) sliced.geometry.coordinates = [...sliced.geometry.coordinates].reverse();
+          }
+        }
+        if (sliced?.geometry?.coordinates && sliced.geometry.coordinates.length >= 2) {
+          lineToSave = sliced;
+        }
+      }
+    } catch {}
+    const lenM = streetPathLengthM || (() => { try { return turf.length(lineToSave, { units: 'meters' }); } catch { return null; } })();
+    // Collect intersecting/overlapping street names for the line itself
+    let streets = [];
+    try {
+      const lineFeature = turf.lineString(lineToSave.geometry.coordinates);
+      streets = getStreetLineNames(m, lineFeature);
+    } catch {}
+    const baseProps = {
+      name: editingStreetSegmentId ? (editingStreetName.trim() || `Segment`) : (pendingStreetName.trim() || `Segment ${savedStreetSegments.length + 1}`),
+      description: editingStreetSegmentId ? (editingStreetDescription.trim() || null) : null,
+      useType,
+      lengthM: lenM,
+      streets,
+      createdAt: Date.now()
+    };
+    try {
+      console.log('[finalizeStreetSelection]', {
+        source: selectedRoadSegmentRef.current ? 'memory:selectedRoadSegmentRef' : (ephemeralStreetPath ? 'memory:ephemeralStreetPath' : 'mapSource:_data'),
+        coordsCount: lineToSave.geometry?.coordinates?.length,
+        startRef: startPointRef.current,
+        endRef: endPointRef.current,
+        lenM
+      });
+    } catch {}
+    if (editingStreetSegmentId) {
+      // Update existing with diagnostics of old vs new
+      const old = savedStreetSegments.find(f => f.properties?.id === editingStreetSegmentId);
+      try {
+        const oldStart = old?.geometry?.coordinates?.[0];
+        const oldEnd = old?.geometry?.coordinates?.[old?.geometry?.coordinates?.length - 1];
+        const oldLen = old ? (old.properties?.lengthM ?? (()=>{ try { return turf.length(old,{units:'meters'}) } catch { return null; } })()) : null;
+        const newStart = lineToSave.geometry?.coordinates?.[0];
+        const newEnd = lineToSave.geometry?.coordinates?.[lineToSave.geometry?.coordinates?.length - 1];
+        const newLen = lenM ?? (()=>{ try { return turf.length(lineToSave,{units:'meters'}) } catch { return null; } })();
+        console.log('[finalizeStreetSelection:update-existing]', { id: editingStreetSegmentId, oldStart, oldEnd, oldLen, newStart, newEnd, newLen });
+      } catch {}
+      setSavedStreetSegments(prev => prev.map(f => f.properties?.id === editingStreetSegmentId ? {
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [...lineToSave.geometry.coordinates] },
+        properties: { ...f.properties, ...baseProps, id: editingStreetSegmentId, updatedAt: Date.now() }
+      } : f));
+  clearEditingStreetSegment('finalizeStreetSelection:saveExisting');
+    } else {
+      const newFeature = {
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [...lineToSave.geometry.coordinates] },
+        properties: { ...baseProps, id: genId() }
+      };
+  setSavedStreetSegments(prev => [newFeature, ...prev]);
+    }
+    // Clear ephemeral selection layers immediately without delay
     if (m.getLayer('selected-road-segment-layer')) m.removeLayer('selected-road-segment-layer');
     if (m.getSource('selected-road-segment')) m.removeSource('selected-road-segment');
+    setEphemeralStreetPath(null); // This will trigger master renderer to rebuild saved segments
     if (m.getLayer('start-end-points-layer')) m.removeLayer('start-end-points-layer');
     if (m.getSource('start-end-points')) m.removeSource('start-end-points');
     setStartPoint(null);
     setEndPoint(null);
+    setStreetPathLengthM(null);
+    setPendingStreetName("");
+    setEditingStreetName("");
+    setEditingStreetDescription("");
+    // Deselect any previously selected street segment so list returns to neutral state
+    setSelectedStreetSegmentIndex(null);
+    // streetSegmentSummary & editingStreetSegmentSummary are derived via useMemo from savedStreetSegments/IDs;
+    // clearing underlying state (selection/edit IDs & ephemeral path state) is sufficient. Removed stale setter calls.
+  }
+
+  // Cancel an in-progress street geometry edit without saving changes
+  function cancelStreetGeometryEdit() {
+    if (!editingStreetSegmentId) return;
+    // Clear editing flags & temporary metadata
+  clearEditingStreetSegment('cancelStreetGeometryEdit');
+    setEditingStreetName("");
+    setEditingStreetDescription("");
+    // Remove transient path layers
+    if (map.current) {
+      const m = map.current;
+      ['selected-road-segment-layer','start-end-points-layer'].forEach(l=>{
+        if (m.getLayer(l)) { try { m.removeLayer(l); } catch {} }
+      });
+      ['selected-road-segment','start-end-points'].forEach(s=>{
+        if (m.getSource(s)) { try { m.removeSource(s); } catch {} }
+      });
+    }
+    // Clear ephemeral path state
+    setStartPoint(null);
+    setEndPoint(null);
+    setStreetPathLengthM(null);
+  }
+
+  // Dev-only validation harness for M3 path reliability
+  async function runStreetValidation(samples = 10) {
+    if (!import.meta.env.DEV) return;
+    if (!map.current) return;
+    const m = map.current;
+    const roadLayerIds = getRoadLayerIds(m);
+    let featuresRaw = [];
+    try { featuresRaw = m.queryRenderedFeatures({ layers: roadLayerIds }); } catch {}
+    const lines = featuresRaw.flatMap(explodeToLineStrings).filter(f => isDrivableRoad(f.properties));
+    if (!lines.length) {
+      console.warn('[validate] No lines in viewport');
+      return;
+    }
+    // Collect candidate coords pool
+    const pool = [];
+    lines.forEach(ln => {
+      const cs = ln.geometry.coordinates;
+      if (cs?.length) pool.push(...cs.filter(c => Array.isArray(c) && c.length === 2));
+    });
+    if (pool.length < 4) {
+      console.warn('[validate] Insufficient coordinate pool');
+      return;
+    }
+    function pickRand() { return pool[Math.floor(Math.random()*pool.length)]; }
+    const results = [];
+    for (let i=0;i<samples;i++) {
+      const a = pickRand();
+      const b = pickRand();
+      if (!a || !b || (a[0]===b[0] && a[1]===b[1])) { i--; continue; }
+      const t0 = performance.now();
+      // reuse shortest path logic by temporarily calling recomputeStreetPathRef after setting state
+      // We'll manually invoke the internal path builder by briefly setting points and forcing recompute
+      const prevStart = startPoint, prevEnd = endPoint;
+      setStartPoint(a); setEndPoint(b);
+      // Force recompute (async tick)
+      await new Promise(r => setTimeout(r, 30));
+      if (recomputeStreetPathRef.current) recomputeStreetPathRef.current();
+      await new Promise(r => setTimeout(r, 120)); // allow path effect
+      let len = null; let ok = true; let issues = [];
+      try { len = streetPathLengthM; } catch {}
+      if (len == null) { ok = false; issues.push('null-length'); }
+      else if (len < 30) { issues.push('short(<30m)'); }
+      const t1 = performance.now();
+      results.push({ i, len, ms: (t1 - t0), issues, ok });
+      // restore original points to avoid user-visible state drift after last iteration
+      if (i === samples -1) {
+        setStartPoint(prevStart); setEndPoint(prevEnd);
+        if (recomputeStreetPathRef.current) setTimeout(()=>recomputeStreetPathRef.current(),0);
+      }
+    }
+    const success = results.filter(r=>r.ok).length;
+    const median = (()=>{ const arr = results.map(r=>r.ms).sort((a,b)=>a-b); return arr[Math.floor(arr.length/2)] || 0; })();
+    const max = Math.max(...results.map(r=>r.ms));
+    // eslint-disable-next-line no-console
+    console.log('[validate:street]', { samples: results.length, success, medianMs: +median.toFixed(1), maxMs: +max.toFixed(1), results });
   }
 
   // Create a GeoJSON Feature from the drawn polygon and metadata
@@ -2024,6 +3796,7 @@ export default function App() {
     return {
       type: "Feature",
       properties: {
+        id: genId(),
         name:
           nameOverride ??
           (pendingName.trim() || `Custom Zone ${savedZones.length + 1}`),
@@ -2044,7 +3817,7 @@ export default function App() {
 
     if (editingSavedIndex != null) {
       setSavedZones((prev) =>
-        prev.map((f, i) => (i === editingSavedIndex ? feature : f))
+        prev.map((f, i) => (i === editingSavedIndex ? { ...feature, properties: { ...feature.properties, id: f.properties?.id || genId() } } : f))
       );
     } else {
       setSavedZones((prev) => [feature, ...prev]);
@@ -2061,21 +3834,7 @@ export default function App() {
     setSummaryContext(null);
   }
 
-  // Save as new even when editing an existing zone
-  function saveAsNewZone() {
-    const feature = makeFeatureFromDrawn();
-    if (!feature) return;
-    setSavedZones((prev) => [feature, ...prev]);
-    // Keep editing state off after saving as new
-    setShowSavePanel(false);
-    setPendingName("");
-    setPendingDescription("");
-  setActiveTool('none');
-    setDrawnCoords([]);
-    setZoneSummary(null);
-    setEditingSavedIndex(null);
-    setSummaryContext(null);
-  }
+  // Removed saveAsNewZone per updated UX (single save/update path only)
 
   // Cancel from the save panel
   function handleCancelSave() {
@@ -2130,6 +3889,7 @@ export default function App() {
     // Important: clear selection first so the "saved summary" effect won't run
     setSelectedSavedIndex(null);
     setEditingSavedIndex(index);
+  console.log('[PolygonEdit] Enter edit mode for saved zone index', index, 'feature id:', f.id || f.properties?.id);
 
     const ring = f.geometry.coordinates[0]; // closed ring
     const openRing = ring.slice(0, ring.length - 1); // open ring
@@ -2141,6 +3901,7 @@ export default function App() {
     setPendingDescription(f.properties?.description || "");
     setShowSavePanel(openSavePanel);
     setSidebarVisible(true);
+  console.log('[PolygonEdit] Loaded properties', { name: f.properties?.name, description: f.properties?.description, useType: type });
 
     // Make the finalize/edit UI appear immediately
     setSummaryContext("draw");
@@ -2184,6 +3945,7 @@ export default function App() {
     // Enter draw mode with the polygon loaded
   setActiveTool('polygon');
     setDrawnCoords(openRing);
+    console.log('[PolygonEdit] Seed drawnCoords length', openRing.length, openRing);
   }
 
   // Update the useType of a saved zone (from the summary panel)
@@ -2248,6 +4010,26 @@ export default function App() {
     fontSize: "0.9rem",
   };
 
+  // Consolidated button variants for consistent styling / labeling.
+  // Base style keeps neutral focus/size; variants supply background + color only.
+  const buttonVariants = {
+    base: buttonStyle,
+    primary: { ...buttonStyle, backgroundColor: '#0d6efd', color: '#fff' }, // main actions
+    success: { ...buttonStyle, backgroundColor: '#28a745', color: '#fff' }, // save/finalize
+    warning: { ...buttonStyle, backgroundColor: '#ffc107', color: '#000' }, // editing state highlight
+    info: { ...buttonStyle, backgroundColor: '#17a2b8', color: '#fff' },    // select / secondary emphasis
+    muted: { ...buttonStyle, backgroundColor: '#6c757d', color: '#fff' },   // re-edit idle
+    danger: { ...buttonStyle, backgroundColor: '#dc3545', color: '#fff' },  // destructive
+    outline: { ...buttonStyle, backgroundColor: '#ffffff', color: '#000', border: '1px solid #ccc' }, // neutral / cancel
+  };
+
+  // Consistent selected highlight style for list items (zones & streets)
+  const selectedCardStyle = {
+    border: '2px solid #28a745',
+    background: '#f1fff4',
+    boxShadow: '0 0 0 2px rgba(40,167,69,0.12)'
+  };
+
   const selectStyle = {
     padding: "0.5rem",
     borderRadius: "0.375rem",
@@ -2260,7 +4042,160 @@ export default function App() {
     color: "#555",
   };
 
-  const showRightPanel = zoneSummary || savedZones.length > 0;
+  const showRightPanel = zoneSummary || savedZones.length > 0 || editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary || savedStreetSegments.length > 0;
+  const streetCreationLock = streetsActive && ephemeralStreetPathSummary && !editingStreetSegmentId; // restrict other UI while first street segment unsaved
+  // New polygon creation lock (when drawing a brand new zone, not editing an existing one, and before showing save panel)
+  const polygonCreationLock = polygonActive && zoneSummary && summaryContext === 'draw' && editingSavedIndex == null && !showSavePanel;
+
+  // --- Polygon vertex drag handles (for editing saved zones) ---
+  // Listener / layer setup effect (does NOT depend on drawnCoords so dragging isn't interrupted)
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const srcId = 'polygon-vertices';
+    const layerId = 'polygon-vertices-layer';
+  // Show the vertex layer as soon as we enter polygon edit mode; data will populate once coords are available
+  // While editing a saved polygon we always want vertices even though activeTool may be forced Off for other edit types
+  const shouldShow = editingSavedIndex != null; // rely solely on edit state
+    console.log('[PolygonEdit] Vertex layer setup effect', { shouldShow, polygonActive, editingSavedIndex });
+
+    if (!shouldShow) {
+      if (m.getLayer(layerId)) { try { m.removeLayer(layerId); } catch {} }
+      if (m.getSource(srcId)) { try { m.removeSource(srcId); } catch {} }
+      console.log('[PolygonEdit] Removed vertex layer/source');
+      return;
+    }
+
+    // Ensure source exists (data populated by separate effect)
+    if (!m.getSource(srcId)) {
+      try { m.addSource(srcId, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } }); } catch {}
+      console.log('[PolygonEdit] Added vertex source');
+    }
+    if (!m.getLayer(layerId)) {
+      try {
+        m.addLayer({
+          id: layerId,
+          type: 'circle',
+            source: srcId,
+            paint: {
+              // Slightly larger radius to improve hit target
+              'circle-radius': 8,
+              'circle-color': '#ff0000',
+              'circle-stroke-width': 1.5,
+              'circle-stroke-color': '#fff'
+            }
+        });
+        console.log('[PolygonEdit] Added vertex layer');
+        // Ensure layer is on top for maximum hit test reliability
+        try { m.moveLayer(layerId); } catch {}
+      } catch {}
+    }
+
+    let dragging = false; let dragIndex = null;
+    function onMouseDown(e) {
+      const f = e.features && e.features[0];
+      if (!f) return;
+      const idx = f.properties?.vid;
+      if (typeof idx !== 'number') return;
+      dragIndex = idx;
+      dragging = true;
+      m.getCanvas().style.cursor = 'grabbing';
+      try { m.dragPan.disable(); } catch {}
+      console.log('[PolygonEdit] Drag start vertex', idx);
+    }
+    function onMouseMove(e) {
+      if (!dragging || typeof dragIndex !== 'number') return;
+      const lngLat = [e.lngLat.lng, e.lngLat.lat];
+      setDrawnCoords(prev => {
+        if (!Array.isArray(prev)) return prev;
+        if (dragIndex < 0 || dragIndex >= prev.length) return prev;
+        const next = [...prev];
+        next[dragIndex] = lngLat;
+        console.log('[PolygonEdit] Drag move vertex', dragIndex, '->', lngLat);
+        return next;
+      });
+    }
+    function finishDrag() {
+      if (!dragging) return;
+      dragging = false; dragIndex = null;
+      m.getCanvas().style.cursor = '';
+      try { m.dragPan.enable(); } catch {}
+      // Recompute metrics using ref (latest coords)
+      const coords = drawnCoordsRef.current;
+      try {
+        if (Array.isArray(coords) && coords.length >= 3) {
+          const closed = [...coords, coords[0]];
+          const poly = turf.polygon([closed], { useType });
+          const areaM2 = turf.area(poly);
+          const areaFt2 = convertToSquareFeet(areaM2);
+          const centroidPt = turf.centroid(poly).geometry.coordinates;
+          let streets = [];
+          try { streets = getIntersectingStreetNames(m, poly); } catch {}
+          setZoneSummary(s => s ? { ...s, areaM2, areaFt2, centroid: centroidPt, streets } : { areaM2, areaFt2, centroid: centroidPt, streets, useType });
+          console.log('[PolygonEdit] Drag finish recomputed metrics', { areaM2, vertexCount: coords.length });
+        }
+      } catch {}
+    }
+    function onMouseUp() { finishDrag(); }
+    function onKey(e) { if (e.key === 'Escape') finishDrag(); }
+    function onEnter() { if (!dragging) m.getCanvas().style.cursor = 'grab'; }
+    function onLeave() { if (!dragging) m.getCanvas().style.cursor = ''; }
+
+    m.on('mouseenter', layerId, onEnter);
+    m.on('mouseleave', layerId, onLeave);
+    m.on('mousedown', layerId, onMouseDown);
+    m.on('mousemove', onMouseMove);
+    m.on('mouseup', onMouseUp);
+    // Fallback: if direct layer hit misses (due to style order), attempt manual pick
+    function globalMouseDownFallback(e) {
+      if (dragging) return;
+      if (!(polygonActive && editingSavedIndex != null)) return;
+      // small bbox around cursor for picking
+      const bbox = [
+        [e.point.x - 6, e.point.y - 6],
+        [e.point.x + 6, e.point.y + 6]
+      ];
+      const feats = m.queryRenderedFeatures(bbox, { layers: [layerId] });
+      if (feats && feats.length) {
+        onMouseDown({ features: [feats[0]] });
+      }
+    }
+    m.on('mousedown', globalMouseDownFallback);
+    window.addEventListener('keyup', onKey);
+
+    return () => {
+      m.off('mouseenter', layerId, onEnter);
+      m.off('mouseleave', layerId, onLeave);
+  m.off('mousedown', layerId, onMouseDown);
+      m.off('mousemove', onMouseMove);
+      m.off('mouseup', onMouseUp);
+  m.off('mousedown', globalMouseDownFallback);
+      window.removeEventListener('keyup', onKey);
+    };
+  }, [polygonActive, editingSavedIndex, useType]);
+
+  // Keep vertex source data in sync with current coordinates & visibility condition
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const srcId = 'polygon-vertices';
+    const shouldShow = polygonActive && editingSavedIndex != null && Array.isArray(drawnCoords) && drawnCoords.length >= 3;
+    if (!shouldShow) return;
+    const features = drawnCoords.map((c, i) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: c },
+      properties: { vid: i }
+    }));
+    const collection = { type: 'FeatureCollection', features };
+    if (m.getSource(srcId)) { try { m.getSource(srcId).setData(collection); } catch {} }
+    console.log('[PolygonEdit] Vertex source sync', { count: features.length });
+  }, [drawnCoords, polygonActive, editingSavedIndex]);
+  // Unified lock for any new unsaved geometry (polygon or street)
+  const creationLock = streetCreationLock || polygonCreationLock;
+  // Additional lock when editing an existing street segment
+  const editingStreetLock = !!editingStreetSegmentId;
+  // Overarching UI lock used to disable other lists and controls while creating or editing
+  const uiLock = creationLock || editingStreetLock || (showSavePanel && polygonActive);
   // Card style reused for summary panel (was referenced but not declared)
   const cardStyle = {
     background: '#ffffff',
@@ -2279,6 +4214,22 @@ export default function App() {
 
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
+      {/* Global overlay to block all interactions outside active edit context */}
+      {(showSavePanel && polygonActive && editingSavedIndex == null) && (
+        <div
+          aria-hidden="true"
+          style={{
+            position:'absolute',
+            inset:0,
+            background:'rgba(255,255,255,0.01)',
+            // Low opacity so map still visible; pointer events capture
+            zIndex:8,
+            pointerEvents:'auto'
+          }}
+          onMouseDown={(e)=>{ e.stopPropagation(); /* swallow clicks */ }}
+          onClick={(e)=>{ e.stopPropagation(); }}
+        />
+      )}
       <div
         ref={mapContainer}
         style={{ position: "absolute", inset: 0, zIndex: 0 }}
@@ -2299,68 +4250,24 @@ export default function App() {
                   key={btn.key}
                   role="radio"
                   aria-checked={active}
-                  onClick={() => setActiveTool(btn.key)}
+                  disabled={creationLock || editingAny}
+                  onClick={() => { if (creationLock || editingAny) return; setActiveTool(btn.key); }}
                   style={{
                     ...buttonStyle,
                     backgroundColor: active ? '#007bff' : '#e2e6ea',
                     color: active ? '#fff' : '#222',
                     fontWeight: active ? 600 : 500,
                     padding: '0.4rem 0.65rem',
-                    minWidth: 62
+                    minWidth: 62,
+                    opacity: (creationLock || editingAny) ? 0.5 : 1,
+                    cursor: (creationLock || editingAny) ? 'not-allowed':'pointer'
                   }}
                 >{btn.label}</button>
               );
             })}
           </div>
         </div>
-        {polygonActive && (
-          <div style={{ display: 'grid', gap: '0.25rem' }}>
-            <div style={labelStyle}>Zone type</div>
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              {['mixed-use','residential','commercial'].map(t => (
-                <button
-                  key={t}
-                  aria-label={`Set zone type ${t}`}
-                  onClick={() => setUseType(t)}
-                  style={{
-                    width: 34,
-                    height: 34,
-                    borderRadius: 6,
-                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
-                    background: colorByUse[t],
-                    cursor: 'pointer',
-                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
-                  }}
-                  title={t.replace('-', ' ')}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-        {streetsActive && (
-          <div style={{ display: 'grid', gap: '0.25rem' }}>
-    <div style={labelStyle}>Zone type</div>
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              {['mixed-use','residential','commercial'].map(t => (
-                <button
-                  key={t}
-                  aria-label={`Set zone type ${t}`}
-                  onClick={() => setUseType(t)}
-                  style={{
-                    width: 30,
-                    height: 30,
-                    borderRadius: 6,
-                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
-                    background: colorByUse[t],
-                    cursor: 'pointer',
-                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
-                  }}
-                  title={t.replace('-', ' ')}
-                />
-              ))}
-            </div>
-          </div>
-        )}
+        {/* Removed global Zone type pickers; now shown contextually in save/finalize panels only */}
 
   {/* Basemap control removed from primary drawing panel (relocated bottom-left) */}
 
@@ -2368,32 +4275,12 @@ export default function App() {
 
         {/* ✅ Street selection controls now inside the panel */}
         {/* Street metrics shown only when Street tool active */}
-    {streetsActive && (
-          <div style={{ display: 'grid', gap: '0.25rem', minWidth: 160 }}>
-            <div style={labelStyle}>Street metrics</div>
-      {streetPathLengthM != null && (
-              <div style={{ fontSize: '0.7rem', color: '#444' }}>
-                Length: {streetPathLengthM.toFixed(1)} m
-              </div>
-            )}
-      {/* Dev-only perf metrics */}
-      {import.meta.env.DEV && streetPerfSamples.length > 0 && (() => {
-              const last = streetPerfSamples[streetPerfSamples.length - 1];
-              const avg = streetPerfSamples.reduce((s, p) => s + p.total, 0) / streetPerfSamples.length;
-              return (
-                <div style={{ fontSize: '0.65rem', color: '#555', lineHeight: 1.3 }}>
-                  <div>Last: {last.total.toFixed(1)} ms</div>
-                  <div>Avg: {avg.toFixed(1)} ms</div>
-                </div>
-              );
-            })()}
-          </div>
-        )}
+    {/* Street metrics panel removed per requirements */}
       </div>
 
       {/* Bottom-left basemap toggle */}
-      <div style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10 }}>
-        <div style={{ display:'flex', gap:'0.4rem', background:'#ffffffd9', backdropFilter:'blur(4px)', padding:'0.4rem 0.6rem', borderRadius:8, boxShadow:'0 2px 8px rgba(0,0,0,0.15)' }} aria-label="Basemap style" role="radiogroup">
+  <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10, opacity: (streetCreationLock || polygonCreationLock) ? 0.5 : 1, pointerEvents: (streetCreationLock || polygonCreationLock) ? 'none':'auto' }}>
+        <div className="basemap-toggle__options" style={{ display:'flex', gap:'0.4rem', background:'#ffffffd9', backdropFilter:'blur(4px)', padding:'0.4rem 0.6rem', borderRadius:8, boxShadow:'0 2px 8px rgba(0,0,0,0.15)' }} aria-label="Basemap style" role="radiogroup">
           {[
             { key:'streets', label:'Streets' },
             { key:'satellite', label:'Satellite' }
@@ -2402,6 +4289,7 @@ export default function App() {
             return (
               <button
                 key={opt.key}
+                className={`basemap-toggle__btn ${active ? 'is-active' : ''}`}
                 role="radio"
                 aria-checked={active}
                 onClick={() => setBasemapStyle(opt.key)}
@@ -2427,7 +4315,8 @@ export default function App() {
         <div
           style={{
             position: 'absolute',
-            top: '6rem',
+            // Offset to clear control panel; unified save now in sidebar summary
+            top: '7.25rem',
             left: '1rem',
             backgroundColor: '#fffff3',
             border: '1px solid #ccc',
@@ -2471,7 +4360,7 @@ export default function App() {
                 <ul style={{ paddingLeft: '1rem', fontSize: '.85rem', lineHeight: 1.5, margin: 0 }}>
                   <li>Click start, then end along roads to trace path.</li>
                   <li>Drag endpoints to refine alignment.</li>
-                  <li>Switch <strong>Zone type</strong> to recolor the segment.</li>
+                  <li>Switch <strong>Zone type</strong> to recolor the segment{streetCreationLock ? ' (locked until saved/cancelled)' : ''}.</li>
                   <li>Finalize & Save to persist the street segment.</li>
                 </ul>
               )}
@@ -2484,6 +4373,8 @@ export default function App() {
       {showRightPanel && (
         <>
           <button
+            id="sidebar-toggle"
+            className="sidebar__toggle"
             onClick={() => setSidebarVisible(!sidebarVisible)}
             style={{
               position: "absolute",
@@ -2501,11 +4392,12 @@ export default function App() {
             aria-label={sidebarVisible ? "Hide summary" : "Show summary"}
             title={sidebarVisible ? "Hide summary" : "Show summary"}
           >
-            {/* Show the action, not the state */}
             {sidebarVisible ? "❯" : "❮"}
           </button>
 
           <div
+            id="sidebar"
+            className={`sidebar ${sidebarVisible ? 'is-open' : 'is-closed'}`}
             style={{
               position: "absolute",
               right: 0,
@@ -2522,13 +4414,14 @@ export default function App() {
               transition: "transform 0.3s ease",
             }}
           >
-            {/* ← resizer HANDLE (child), not the container */}
             <div
+              id="sidebar-resizer"
+              className="sidebar__resizer"
               onMouseDown={startSidebarResize}
               title="Resize"
               style={{
                 position: "absolute",
-                left: 0, // sits over the left padding area
+                left: 0,
                 top: 0,
                 width: 6,
                 height: "100%",
@@ -2536,272 +4429,187 @@ export default function App() {
                 background: "transparent",
               }}
             />
-            {zoneSummary && (
-              <>
-                <div style={cardStyle}>
-                  <h2
-                    style={{
-                      fontSize: "1.2rem",
-                      marginBottom: "0.75rem",
-                      borderBottom: "2px solid #eee",
-                      paddingBottom: "0.5rem",
-                    }}
-                  >
-                    Zone Summary
+            {(zoneSummary || streetSegmentSummary || editingStreetSegmentSummary || ephemeralStreetPathSummary) && (
+              <div style={cardStyle} className="summary-card" id="summary-card">
+                {/* Editing notices relocated here above the header */}
+                {editingStreetSegmentId && !zoneSummary && (
+                  <div style={{
+                    background: '#fff3cd',
+                    border: '1px solid #ffeeba',
+                    color: '#856404',
+                    padding: '0.5rem',
+                    borderRadius: 6,
+                    margin: '0 0 0.65rem 0',
+                    fontSize: '0.7rem'
+                  }}>
+                    You're editing a street. Finish or cancel to select or edit a different one.
+                  </div>
+                )}
+                {isEditingSaved && zoneSummary && (
+                  <div style={{
+                    background: '#fff3cd',
+                    border: '1px solid #ffeeba',
+                    color: '#856404',
+                    padding: '0.5rem',
+                    borderRadius: 6,
+                    margin: '0 0 0.65rem 0',
+                    fontSize: '0.7rem'
+                  }}>
+                    You're editing a zone. Finish or cancel to select or edit a different one.
+                  </div>
+                )}
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'0.75rem', borderBottom:'2px solid #eee', paddingBottom:'0.5rem', gap:'0.5rem' }}>
+                  <h2 style={{ fontSize: '1.2rem', margin:0 }}>
+                    {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
                   </h2>
-
-                  <p style={{ marginBottom: "0.5rem" }}>
-                    <strong>Name:</strong> {displayName}
-                  </p>
-                  <p style={{ marginBottom: "0.5rem" }}>
-                    <strong>Type:</strong> {zoneSummary.useType}
-                  </p>
-                  <p style={{ marginBottom: "0.5rem" }}>
-                    <strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² /{" "}
-                    {zoneSummary.areaFt2.toFixed(2)} ft²
-                  </p>
-                  <p style={{ marginBottom: "1rem" }}>
-                    <strong>Centroid:</strong>{" "}
-                    {zoneSummary.centroid[0].toFixed(6)},{" "}
-                    {zoneSummary.centroid[1].toFixed(6)}
-                  </p>
-
-                  {zoneSummary.address && (
-                    <>
-                      <h3
-                        style={{
-                          fontSize: "1.05rem",
-                          margin: "1rem 0 0.5rem",
-                          borderBottom: "1px solid #ddd",
-                          paddingBottom: "0.25rem",
-                        }}
-                      >
-                        Location Details
-                      </h3>
-                      <ul
-                        style={{
-                          paddingLeft: "1rem",
-                          listStyle: "disc",
-                          lineHeight: "1.6",
-                        }}
-                      >
-                        {zoneSummary.address.street && (
-                          <li>
-                            <strong>Street:</strong>{" "}
-                            {zoneSummary.address.street}
-                          </li>
-                        )}
-                        {zoneSummary.address.postalCode && (
-                          <li>
-                            <strong>Postal Code:</strong>{" "}
-                            {zoneSummary.address.postalCode}
-                          </li>
-                        )}
-                        {zoneSummary.address.neighborhood && (
-                          <li>
-                            <strong>Neighborhood:</strong>{" "}
-                            {zoneSummary.address.neighborhood}
-                          </li>
-                        )}
-                        {zoneSummary.address.city && (
-                          <li>
-                            <strong>City:</strong> {zoneSummary.address.city}
-                          </li>
-                        )}
-                        {zoneSummary.address.state && (
-                          <li>
-                            <strong>State:</strong> {zoneSummary.address.state}
-                          </li>
-                        )}
-                        {zoneSummary.address.country && (
-                          <li>
-                            <strong>Country:</strong>{" "}
-                            {zoneSummary.address.country}
-                          </li>
-                        )}
-                      </ul>
-                    </>
-                  )}
-
-                  {zoneSummary.streets && zoneSummary.streets.length > 0 && (
-                    <>
-                      <h3
-                        style={{
-                          fontSize: "1.05rem",
-                          margin: "1rem 0 0.5rem",
-                          borderBottom: "1px solid #ddd",
-                          paddingBottom: "0.25rem",
-                        }}
-                      >
-                        Streets intersecting zone
-                      </h3>
-                      <ul
-                        style={{
-                          paddingLeft: "1rem",
-                          listStyle: "disc",
-                          lineHeight: "1.6",
-                        }}
-                      >
-                        {zoneSummary.streets.map((s, i) => (
-                          <li key={i}>{s}</li>
-                        ))}
-                      </ul>
-                    </>
-                  )}
-
-                  {/* Finalize / Save block only for drawings */}
-                  {(summaryContext === "draw" || editingSavedIndex != null) && (
-                    <div
-                      style={{
-                        marginTop: "1rem",
-                        paddingTop: "0.75rem",
-                        borderTop: "1px solid #eee",
-                      }}
-                    >
-                      {!showSavePanel ? (
-                        <button
-                          onClick={finalizeCurrent}
-                          disabled={!(canFinalizePolygon || canFinalizeStreets)}
-                          style={{ ...buttonStyle, backgroundColor: "#17a2b8", opacity: (canFinalizePolygon || canFinalizeStreets) ? 1 : 0.6 }}
-                          title={polygonActive ? "Save this polygon" : streetsActive ? "Save buffered street corridor(s)" : ""}
-                        >
-                          Finalize & Save
-                        </button>
-                      ) : (
-                        <div style={{ display: "grid", gap: "0.5rem" }}>
-                          {editingSavedIndex != null && (
-                            <div style={{ fontSize: "0.85rem", color: "#555" }}>
-                              Editing saved zone #{editingSavedIndex + 1}
-                            </div>
-                          )}
-                          <label style={{ fontSize: "0.85rem" }}>Name</label>
-                          <input
-                            value={pendingName}
-                            onChange={(e) => setPendingName(e.target.value)}
-                            placeholder="Custom Zone"
-                            style={{
-                              padding: "0.5rem",
-                              border: "1px solid #ccc",
-                              borderRadius: 6,
-                            }}
-                          />
-                          <label style={{ fontSize: "0.85rem" }}>
-                            Description
-                          </label>
-                          <textarea
-                            value={pendingDescription}
-                            onChange={(e) =>
-                              setPendingDescription(e.target.value)
-                            }
-                            rows={3}
-                            placeholder="Notes, purpose, constraints"
-                            style={{
-                              padding: "0.5rem",
-                              border: "1px solid #ccc",
-                              borderRadius: 6,
-                            }}
-                          />
-                          <div
-                            style={{
-                              display: "flex",
-                              gap: "0.5rem",
-                              flexWrap: "wrap",
-                            }}
-                          >
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                              <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>Type:</span>
-                              {['mixed-use','residential','commercial'].map(t => (
-                                <button
-                                  key={t}
-                                  onClick={() => setUseType(t)}
-                                  title={t}
-                                  aria-label={`Set type ${t}`}
-                                  style={{
-                                    width: 28,
-                                    height: 28,
-                                    borderRadius: 6,
-                                    border: useType === t ? '2px solid #222' : '1px solid #bbb',
-                                    background: colorByUse[t],
-                                    cursor: 'pointer',
-                                    boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none'
-                                  }}
-                                />
-                              ))}
-                            </div>
-                            <button
-                              onClick={saveZone}
-                              style={{
-                                ...buttonStyle,
-                                backgroundColor: "#28a745",
-                              }}
-                            >
-                              {editingSavedIndex != null
-                                ? "Save changes"
-                                : "Save"}
-                            </button>
-                            {editingSavedIndex != null && (
-                              <button
-                                onClick={saveAsNewZone}
-                               
-                                style={{ ...buttonStyle }}
-                              >
-                                Save as new
-                              </button>
-                            )}
-                            <button
-                              onClick={handleCancelSave}
-                              style={{ ...buttonStyle }}
-                            >
-                              Cancel
-
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
+                  {(zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && !polygonCreationLock && !(showSavePanel && polygonActive && editingSavedIndex == null) && !(showSavePanel && polygonActive && editingSavedIndex != null) && !editingStreetSegmentId && (
+                    <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
                   )}
                 </div>
-              </>
+                {zoneSummary && (
+                  <div className="summary-card__zone" style={polygonCreationLock ? { pointerEvents:'auto' } : {}}>
+                    <p style={{ marginBottom: "0.5rem" }}><strong>Name:</strong> {displayName}</p>
+                    <p style={{ marginBottom: "0.5rem" }}><strong>Type:</strong> {zoneSummary.useType}</p>
+                    <p style={{ marginBottom: "0.5rem" }}><strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² / {zoneSummary.areaFt2.toFixed(2)} ft²</p>
+                    <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
+                  </div>
+                )}
+                {(editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary; const startCoords = Array.isArray(ss.start) ? ss.start : [0,0]; const endCoords = Array.isArray(ss.end) ? ss.end : [0,0]; return (
+                  <div className="summary-card__street">
+                    <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {ss.name}</p>
+                    <p style={{ marginBottom: '0.5rem' }}><strong>Type:</strong> {ss.useType}</p>
+                    {ss.lengthM != null && (
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {ss.lengthM.toFixed(1)} m{ss.lengthFt ? ` / ${ss.lengthFt.toFixed(1)} ft` : ''}</p>
+                    )}
+                    {ss.centroid && (
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Centroid:</strong> {ss.centroid[0].toFixed(6)}, {ss.centroid[1].toFixed(6)}</p>
+                    )}
+                    {startCoords && startCoords[0] != null && startCoords[1] != null && (
+                      <p style={{ marginBottom: '0.5rem' }}><strong>Start:</strong> {Number(startCoords[0]).toFixed(6)}, {Number(startCoords[1]).toFixed(6)}</p>
+                    )}
+                    {endCoords && endCoords[0] != null && endCoords[1] != null && (
+                      <p style={{ marginBottom: ss.streets && ss.streets.length ? '0.5rem' : '1rem' }}><strong>End:</strong> {Number(endCoords[0]).toFixed(6)}, {Number(endCoords[1]).toFixed(6)}</p>
+                    )}
+                    {ss.streets && ss.streets.length > 0 && (
+                      <div style={{ marginBottom:'0.75rem' }}>
+                        <h3 style={{ fontSize:'1.05rem', margin:'0.75rem 0 0.4rem', borderBottom:'1px solid #ddd', paddingBottom:'0.25rem' }}>Streets intersecting segment</h3>
+                        <ul style={{ paddingLeft:'1rem', listStyle:'disc', lineHeight:'1.5' }}>
+                          {ss.streets.map((s,i)=>(<li key={i}>{s}</li>))}
+                        </ul>
+                      </div>
+                    )}
+                    {editingStreetSegmentSummary && (
+                      <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
+                    )}
+                    {editingStreetSegmentId && (
+                      <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>
+                        <EditForm
+                          mode="street"
+                          name={editingStreetName}
+                          description={editingStreetDescription}
+                          useType={useType}
+                          onNameChange={setEditingStreetName}
+                          onDescriptionChange={setEditingStreetDescription}
+                          onTypeChange={updateUseType}
+                          onCancel={cancelStreetGeometryEdit}
+                          onSave={finalizeStreetSelection}
+                          savingLabel="Save changes"
+                          note={<div style={{ fontSize:'0.65rem', color:'#555' }}>Editing saved street segment</div>}
+                          colorByUse={colorByUse}
+                          buttonVariants={buttonVariants}
+                          originalName={editingStreetSegmentSummary?.name}
+                          originalDescription={editingStreetSegmentSummary?.description}
+                          originalUseType={editingStreetSegmentSummary?.useType}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )})()}
+                {zoneSummary && zoneSummary.address && (
+                  <div className="summary-card__address">
+                    <h3 style={{ fontSize: "1.05rem", margin: "1rem 0 0.5rem", borderBottom: "1px solid #ddd", paddingBottom: "0.25rem" }}>Location Details</h3>
+                    <ul style={{ paddingLeft: "1rem", listStyle: "disc", lineHeight: "1.6" }}>
+                      {zoneSummary.address.street && (<li><strong>Street:</strong> {zoneSummary.address.street}</li>)}
+                      {zoneSummary.address.postalCode && (<li><strong>Postal Code:</strong> {zoneSummary.address.postalCode}</li>)}
+                      {zoneSummary.address.neighbourhood && (<li><strong>Neighborhood:</strong> {zoneSummary.address.neighbourhood}</li>)}
+                      {zoneSummary.address.city && (<li><strong>City:</strong> {zoneSummary.address.city}</li>)}
+                      {zoneSummary.address.state && (<li><strong>State:</strong> {zoneSummary.address.state}</li>)}
+                      {zoneSummary.address.country && (<li><strong>Country:</strong> {zoneSummary.address.country}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {zoneSummary && zoneSummary.streets && zoneSummary.streets.length > 0 && (
+                  <div className="summary-card__streets">
+                    <h3 style={{ fontSize: "1.05rem", margin: "1rem 0 0.5rem", borderBottom: "1px solid #ddd", paddingBottom: "0.25rem" }}>Streets intersecting zone</h3>
+                    <ul style={{ paddingLeft: "1rem", listStyle: "disc", lineHeight: "1.6" }}>
+                      {zoneSummary.streets.map((s,i)=>(<li key={i}>{s}</li>))}
+                    </ul>
+                  </div>
+                )}
+                {/* Polygon finalize section (original logic preserved) */}
+                {(zoneSummary && (summaryContext === "draw" || editingSavedIndex != null)) && (
+                  <div style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid #eee" }}>
+                    {!showSavePanel ? (
+                      <div style={{ display:'flex', gap:'0.5rem', flexWrap:'wrap' }}>
+                        <button
+                          onClick={finalizeCurrent}
+                          disabled={!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)}
+                          className="btn btn--finalize"
+                          style={{ ...(canFinalizePolygon || canFinalizeStreets ? buttonVariants.success : buttonVariants.success), opacity: (!!editingStreetSegmentId || !(canFinalizePolygon || canFinalizeStreets)) ? 0.5 : 1 }}
+                        >Finalize & Save</button>
+                        {polygonCreationLock && (
+                          <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                        )}
+                      </div>
+                    ) : (
+                      <EditForm
+                        mode="zone"
+                        name={pendingName}
+                        description={pendingDescription}
+                        useType={useType}
+                        onNameChange={setPendingName}
+                        onDescriptionChange={setPendingDescription}
+                        onTypeChange={updateUseType}
+                        onCancel={handleCancelSave}
+                        onSave={saveZone}
+                        savingLabel={editingSavedIndex != null ? 'Save changes' : 'Save'}
+                        note={editingSavedIndex != null ? (<div style={{ fontSize:'0.75rem', color:'#555' }}>Editing saved zone #{editingSavedIndex + 1}</div>) : null}
+                        colorByUse={colorByUse}
+                        buttonVariants={buttonVariants}
+                      />
+                    )}
+                  </div>
+                )}
+                {/* Street finalize when ephemeral unsaved path present (only once) */}
+                {ephemeralStreetPathSummary && !zoneSummary && (
+                  <div style={{ marginTop: '0.75rem', display:'grid', gap:'0.55rem' }}>
+                    <label htmlFor="street-name" style={{ fontSize:'0.75rem', fontWeight:600 }}>Name</label>
+                    <input id="street-name" name="streetName" value={pendingStreetName} onChange={e=>setPendingStreetName(e.target.value)} placeholder="Segment name" style={{ padding:'0.45rem', border:'1px solid #ccc', borderRadius:6, fontSize:'0.8rem' }} />
+                    <label htmlFor="street-desc" style={{ fontSize:'0.75rem', fontWeight:600 }}>Description</label>
+                    <textarea id="street-desc" name="streetDescription" rows={2} value={pendingStreetDescription} onChange={e=>setPendingStreetDescription(e.target.value)} placeholder="Optional description" style={{ padding:'0.45rem', border:'1px solid #ccc', borderRadius:6, fontSize:'0.8rem', resize:'vertical' }} />
+                    <div style={{ display:'flex', alignItems:'center', gap:'0.5rem', flexWrap:'wrap' }}>
+                      <span style={{ fontSize:'0.75rem', fontWeight:600 }}>Type:</span>
+                      {['mixed-use','residential','commercial'].map(t => (
+                        <button key={t} id={`street-type-${t}`} name="streetType" onClick={()=>updateUseType(t)} title={t} aria-label={`Set type ${t}`} style={{ width: 28, height: 28, borderRadius: 6, border: useType === t ? '2px solid #222' : '1px solid #bbb', background: colorByUse[t], cursor: 'pointer', boxShadow: useType === t ? '0 0 0 2px rgba(0,0,0,0.25)' : 'none' }} />
+                      ))}
+                    </div>
+                    <div style={{ display:'flex', gap:'0.5rem', flexWrap:'wrap', marginTop:'0.25rem' }}>
+                      <button onClick={finalizeStreetSelection} disabled={!!editingStreetSegmentId} className="btn btn--finalize" style={{...buttonVariants.success, opacity: editingStreetSegmentId ? 0.5 : 1}}>Finalize & Save</button>
+                      <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
+            {/* Saved items lists follow */}
+            {/* (Removed duplicate street finalize block) */}
 
             {/* Saved zones list */}
             {savedZones.length > 0 && (
-              <div style={{ marginTop: zoneSummary ? "1rem" : 0 }}>
-                {/* Saved Zones "card" with a distinct background */}
-                <div
-                  style={{
-                    background: "#f7f9ff", // <-- tinted card so it contrasts with the white Zone Summary
-                    border: "1px solid #dbeafe",
-                    borderRadius: 8,
-                    padding: "0.75rem",
-                  }}
-                >
-                  <h2
-                    style={{
-                      fontSize: "1.2rem",
-                      marginBottom: "0.5rem",
-                      borderBottom: "2px solid #cfe1ff",
-                      paddingBottom: "0.5rem",
-                    }}
-                  >
-                    Saved Zones
-                  </h2>
-
-                  {isEditingSaved && (
-                    <div
-                      style={{
-                        background: "#fff3cd",
-                        border: "1px solid #ffeeba",
-                        color: "#856404",
-                        padding: "0.5rem",
-                        borderRadius: 6,
-                        margin: "0.5rem 0",
-                      }}
-                    >
-                      You're editing a zone. Finish or cancel to select or edit
-                      a different one.
-                    </div>
-                  )}
+              <div style={{ marginTop: zoneSummary ? "1rem" : 0, opacity: uiLock ? 0.45 : 1, pointerEvents: uiLock ? 'none':'auto' }} aria-disabled={uiLock}>
+                {/* Saved Zones card */}
+                <div style={{ background: "#f7f9ff", border: "1px solid #dbeafe", borderRadius: 8, padding: "0.75rem" }}>
+                  <h2 style={{ fontSize: "1.2rem", marginTop: 0, marginBottom: "0.5rem", borderBottom: "2px solid #cfe1ff", paddingBottom: "0.5rem" }}>Saved Zones</h2>
 
                   <ul
                     style={{
@@ -2812,19 +4620,26 @@ export default function App() {
                       gap: "0.5rem",
                     }}
                   >
-                    {savedZones.map((f, idx) => (
+                    {savedZones.map((f, idx) => {
+                      const zoneSelected = selectedSavedIndex === idx;
+                      return (
                       <li
                         key={idx}
+                        className={`list-item zone-item ${zoneSelected ? 'is-selected' : ''}`}
                         style={{
-                          background: "#fff", // item cards pop against the blue-ish container
-                          border: "1px solid #e5e5e5",
+                          background: '#fff',
+                          border: '1px solid #e5e5e5',
                           borderRadius: 8,
-                          padding: "0.5rem",
+                          padding: '0.5rem',
+                          ...(zoneSelected ? selectedCardStyle : {})
                         }}
                       >
-                        <div style={{ fontWeight: 600 }}>
-                          {f.properties?.name || `Zone ${idx + 1}`}
-                          {selectedSavedIndex === idx ? " • selected" : ""}
+                        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8 }}>
+                          <div style={{ fontWeight: 600, fontSize:'0.9rem' }}>
+                            {f.properties?.name || `Zone ${idx + 1}`}
+                            {selectedSavedIndex === idx ? " • selected" : ""}
+                          </div>
+                          <span style={{ width:12, height:12, borderRadius:3, background: colorByUse[f.properties?.useType || 'mixed-use'], border:'1px solid #ccc' }} />
                         </div>
 
                         {f.properties?.description && (
@@ -2839,134 +4654,166 @@ export default function App() {
                             ""}
                         </div>
 
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "0.5rem",
-                            marginTop: 6,
-                          }}
-                        >
-                          <span style={{ fontSize: "0.85rem" }}>Type</span>
-                          <select
-                            value={f.properties?.useType || "mixed-use"}
-                            onChange={(e) =>
-                              updateSavedUseType(idx, e.target.value)
-                            }
-                            style={selectStyle}
-                          >
-                            <option value="mixed-use">Mixed Use</option>
-                            <option value="residential">Residential</option>
-                            <option value="commercial">Commercial</option>
-                          </select>
-                          <span
-                            style={{
-                              width: 12,
-                              height: 12,
-                              borderRadius: 2,
-                              backgroundColor:
-                                colorByUse[
-                                  f.properties?.useType || "mixed-use"
-                                ],
-                              display: "inline-block",
-                              border: "1px solid #ccc",
-                            }}
-                          />
-                        </div>
+                        {/* Removed per-zone inline type select to simplify UI */}
 
-                        <div
-                          style={{
-                            display: "flex",
-                            gap: "0.5rem",
-                            marginTop: 6,
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <button
-                            disabled={isEditingSaved}
-                            onClick={() => {
-                              if (isEditingSaved) return;
-                              setSelectedSavedIndex(idx);
-                              applySelectedFilter(map.current, idx);
-                              flyToSaved(f);
-                            }}
-                            title={
-                              isEditingSaved
-                                ? "Finish or cancel current edit first"
-                                : "Select"
-                            }
+                        {!isEditingSaved && !uiLock && (
+                          <div
                             style={{
-                              ...buttonStyle,
-                              opacity: isEditingSaved ? 0.6 : 1,
-                              cursor: isEditingSaved
-                                ? "not-allowed"
-                                : "pointer",
+                              display: "flex",
+                              gap: "0.5rem",
+                              marginTop: 6,
+                              flexWrap: "wrap",
                             }}
                           >
-                            Select
-                          </button>
+                            <button
+                              disabled={isEditingSaved || creationLock}
+                              onClick={() => {
+                                if (isEditingSaved || creationLock) return;
+                                if (selectedSavedIndex === idx) {
+                                  setSelectedSavedIndex(null);
+                                  applySelectedFilter(map.current, null);
+                                } else {
+                                  setSelectedSavedIndex(idx);
+                                  applySelectedFilter(map.current, idx);
+                                  flyToSaved(f);
+                                }
+                              }}
+                              className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
+                              title={isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
+                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: (isEditingSaved || creationLock) ? 0.6 : 1, cursor: (isEditingSaved || creationLock) ? 'not-allowed':'pointer' }}
+                            >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
 
-                          <button
-                            disabled={
-                              isEditingSaved && editingSavedIndex !== idx
-                            }
-                            onClick={() => {
-                              if (isEditingSaved && editingSavedIndex !== idx)
-                                return;
-                              loadSavedIntoDraw(idx, true);
-                            }}
-                            title={
-                              isEditingSaved && editingSavedIndex !== idx
-                                ? "Finish or cancel current edit first"
-                                : "Edit geometry"
-                            }
-                            style={{
-                              ...buttonStyle,
-                              backgroundColor: "#17a2b8",
-                              opacity:
-                                isEditingSaved && editingSavedIndex !== idx
-                                  ? 0.6
-                                  : 1,
-                              cursor:
-                                isEditingSaved && editingSavedIndex !== idx
-                                  ? "not-allowed"
-                                  : "pointer",
-                            }}
-                          >
-                            {isEditingSaved && editingSavedIndex === idx
-                              ? "Editing…"
-                              : "Edit geometry"}
-                          </button>
+                            <button
+                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
+                              onClick={() => {
+                                if ((isEditingSaved && editingSavedIndex !== idx) || creationLock) return;
+                                loadSavedIntoDraw(idx, true);
+                              }}
+                              className={`btn btn--edit ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
+                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Edit geometry'}
+                              style={{ ...(isEditingSaved && editingSavedIndex === idx ? buttonVariants.warning : buttonVariants.muted), opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
+                            >{isEditingSaved && editingSavedIndex === idx ? 'Editing…' : 'Edit geometry'}</button>
 
-                          <button
-                            disabled={
-                              isEditingSaved && editingSavedIndex !== idx
-                            }
-                            onClick={() => deleteSaved(idx)}
-                            title={
-                              isEditingSaved && editingSavedIndex !== idx
-                                ? "Finish or cancel current edit first"
-                                : "Delete"
-                            }
-                            style={{
-                              ...buttonStyle,
-                              backgroundColor: "#dc3545",
-                              color: "#fff",
-                              opacity:
-                                isEditingSaved && editingSavedIndex !== idx
-                                  ? 0.6
-                                  : 1,
-                              cursor:
-                                isEditingSaved && editingSavedIndex !== idx
-                                  ? "not-allowed"
-                                  : "pointer",
-                            }}
-                          >
-                            Delete
-                          </button>
-                        </div>
+                            <button
+                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
+                              onClick={() => deleteSaved(idx)}
+                              className={`btn btn--delete ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
+                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Delete'}
+                              style={{ ...buttonVariants.danger, opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
+                            >Delete</button>
+                          </div>
+                        )}
                       </li>
-                    ))}
+                    );})}
+                  </ul>
+                </div>
+              </div>
+            )}
+
+            {savedStreetSegments.length > 0 && (
+              <div style={{ marginTop: '1rem', opacity: uiLock ? 0.45 : 1, pointerEvents: uiLock ? 'none':'auto' }} aria-disabled={uiLock}>
+                <div style={{ background: '#f6fff7', border: '1px solid #cde9d6', borderRadius: 8, padding: '0.75rem' }}>
+                  <h2 style={{ fontSize: '1.1rem', margin: 0, marginBottom: '.5rem', borderBottom: '2px solid #d6f2e0', paddingBottom: '.4rem' }}>Saved Street Segments</h2>
+                  <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: '0.5rem' }}>
+                    {savedStreetSegments.map((f, idx) => {
+                      const sel = selectedStreetSegmentIndex === idx;
+                      const segId = f.properties?.id;
+                      const editingThis = editingStreetSegmentId && editingStreetSegmentId === segId;
+                      const editingActive = !!editingStreetSegmentId || editingSavedIndex != null; // any geometry edit in progress
+                      // Disable interactions with saved segments while a new unsaved geometry (street or polygon) is being created
+                      const savedActionsLocked = creationLock || (editingActive && !editingThis);
+                      const anyEditLock = editingActive || creationLock; // unified lock for edit buttons
+                      return (
+                        <li key={idx} className={`list-item street-item ${sel ? 'is-selected' : ''}`} style={{
+                          background: '#fff',
+                          border: '1px solid #e2e2e2',
+                          borderRadius: 8,
+                          padding: '0.55rem',
+                          display: 'grid',
+                          gap: '0.35rem',
+                          ...(sel ? selectedCardStyle : {})
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
+                              <span>{f.properties?.name || `Segment ${idx + 1}`}</span>
+                              {sel ? ' • selected' : ''}
+                            </div>
+                            <span style={{ width: 12, height: 12, borderRadius: 3, background: colorByUse[f.properties?.useType || 'mixed-use'], border: '1px solid #ccc' }} />
+                          </div>
+                          <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
+                          <div style={{ fontSize: '0.65rem', color: '#777' }}>ID: {segId?.slice(0,10)}</div>
+                          {/* Removed per-street inline type select (editing block now owns type changes) */}
+                          {/* Hide all action buttons while any street segment is in edit mode; prevent duplicate save/cancel */}
+                          {(editingStreetSegmentId || uiLock) ? (
+                            editingThis ? (
+                              <div style={{ fontSize:'0.65rem', color:'#555' }}>Editing form shown above.</div>
+                            ) : null
+                          ) : (
+                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                              <button
+                                disabled={savedActionsLocked}
+                                onClick={() => {
+                                  if (savedActionsLocked) return;
+                                  if (sel) {
+                                    setSelectedStreetSegmentIndex(null);
+                                    if (map.current) {
+                                      try { map.current.setFilter('saved-street-segments-selected', null); } catch {}
+                                    }
+                                  } else {
+                                    setSelectedStreetSegmentIndex(idx);
+                                    if (map.current) {
+                                      const m = map.current;
+                                      const filt = ['==',['get','__sid'], idx];
+                                      try { m.setFilter('saved-street-segments-selected', filt); } catch {}
+                                      try {
+                                        const bb = turf.bbox(f);
+                                        m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                      } catch {}
+                                    }
+                                  }
+                                }}
+                                className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
+                                  style={{...(sel ? buttonVariants.success : buttonVariants.info), opacity: savedActionsLocked ? 0.5 : 1, cursor: savedActionsLocked ? 'not-allowed':'pointer'}}
+                              >{sel ? 'Deselect' : 'Select'}</button>
+                              <button
+                                title='Edit geometry'
+                                disabled={anyEditLock}
+                                onClick={() => {
+                                  if (anyEditLock) return;
+                                  try {
+                                    // Enter street geometry edit mode using the freshest saved geometry.
+                                    // Do NOT seed endpoints from this captured list item; let the
+                                    // useEffect([editingStreetSegmentId]) locate the feature by id
+                                    // in the latest savedStreetSegments and seed start/end + refs there.
+                                    setActiveTool('street');
+                                    setEditingStreetSegmentId(segId);
+                                    if (map.current) {
+                                      try {
+                                        const bb = turf.bbox(f);
+                                        map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                      } catch {}
+                                    }
+                                  } catch {}
+                                }}
+                                className='btn btn--edit'
+                                style={{...buttonVariants.muted, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
+                              >Edit geometry</button>
+                              <button
+                                disabled={anyEditLock}
+                                onClick={() => {
+                                  if (anyEditLock) return;
+                                  setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
+                                  if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
+                                  if (editingStreetSegmentId === segId) clearEditingStreetSegment('deleteSavedSegment');
+                                }}
+                                className="btn btn--delete"
+                                style={{...buttonVariants.danger, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
+                              >Delete</button>
+                            </div>
+                          )}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               </div>
