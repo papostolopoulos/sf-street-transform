@@ -27,7 +27,15 @@ const SILENCE_DEBUG_LOGS = true;
       '[finalizeStreetSelection]',
       '[finalizeStreetSelection:update-existing]',
       '[street-perf]',
-      '[endpoint-diagnostics]'
+      '[endpoint-diagnostics]',
+      '[street-edit]',
+      '[edit-entry]',
+      '[useType]',
+      '[refreshMapData]',
+      '[renderAllStreetSegments]',
+      '[useEffect:',
+      '[path-computation]',
+      '[snap]'
     ];
     const PLAIN_PREFIXES = [
       'startEndMode changed:',
@@ -265,6 +273,7 @@ export default function App() {
       return {
         id: selectedStreetSegment.properties?.id,
         name: selectedStreetSegment.properties?.name,
+        description: selectedStreetSegment.properties?.description || null,
         useType: selectedStreetSegment.properties?.useType,
         lengthM: lenM,
         start,
@@ -484,14 +493,16 @@ export default function App() {
     try {
       const res = await fetch(url);
       const data = await res.json();
-      const f = data?.features || [];
+      const features = data?.features || [];
+      const byType = (type) => features.find(f => f.place_type?.includes(type));
+      const text = (f) => f?.text_en || f?.text || null;
       return {
-        street: f[0]?.text_en || null,
-        postalCode: f[1]?.text_en || null,
-        neighborhood: f[2]?.text_en || null,
-        city: f[3]?.text_en || null,
-        state: f[4]?.text_en || null,
-        country: f[5]?.text_en || null,
+        street:        text(byType('address')),
+        postalCode:    text(byType('postcode')),
+        neighbourhood: text(byType('neighborhood')),
+        city:          text(byType('place')),
+        state:         text(byType('region')),
+        country:       text(byType('country')),
       };
     } catch {
       return null;
@@ -1055,6 +1066,7 @@ export default function App() {
         address,
         streets,
         useType,
+        description: feature.properties?.description || null,
       };
     } catch (err) {
       console.warn('buildSummaryFromFeature failed:', err);
@@ -1698,11 +1710,9 @@ export default function App() {
           // Move above saved segments for clarity (if reference layer exists). If move fails, attempt to re-add at top.
           try {
             if (m.getLayer('saved-street-segments-line')) {
-              console.log('INSIDE THE IF STATEMENT FOR MOVING THE LAYER WHEN SWITCHING BASEMAP - [style-switch] moving selected-road-segment-layer above saved-street-segments-line');
               // Ensure the ephemeral edit layer is always on top during style restore
               m.moveLayer('selected-road-segment-layer');
             } else {
-              console.log('INSIDE THE ELSE STATEMENT FOR MOVING THE LAYER WHEN SWITCHING BASEMAP - [style-switch] saved-street-segments-line layer not found, re-adding selected-road-segment-layer to top');
               // fallback: remove and re-add to top
               const featureBackup = cachedSelectedRoad;
               try { m.removeLayer('selected-road-segment-layer'); } catch {}
@@ -2180,6 +2190,7 @@ export default function App() {
       const idx = f.properties?.__sid;
       if (typeof idx === "number") {
         setSelectedSavedIndex(idx);
+        setSelectedStreetSegmentIndex(null);
         applySelectedFilter(m, idx);
         // Also fly to the zone on map-click
         const feature = savedZones[idx];
@@ -2207,6 +2218,7 @@ export default function App() {
       const sid = f.properties?.__sid;
       if (typeof sid === 'number') {
         setSelectedStreetSegmentIndex(sid);
+        setSelectedSavedIndex(null);
         // Update map filter for selected styling
         try {
           const filt = ['==', ['get','__sid'], sid];
@@ -2234,6 +2246,24 @@ export default function App() {
       m.off('click', 'saved-street-segments-casing', handler);
     };
   }, [savedStreetSegments, editingStreetSegmentId, drawMode, basemapStyle]);
+
+  // Deselect saved zone/segment when user clicks on empty map area (neutral mode only)
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const handleEmptyClick = (e) => {
+      if (drawMode || activeTool !== 'none' || editingStreetSegmentId || editingSavedIndex != null) return;
+      const checkLayers = ['saved-zones-fill', 'saved-street-segments-line', 'saved-street-segments-casing']
+        .filter(id => { try { return !!m.getLayer(id); } catch { return false; } });
+      const hits = checkLayers.length > 0 ? m.queryRenderedFeatures(e.point, { layers: checkLayers }) : [];
+      if (!hits || hits.length === 0) {
+        setSelectedSavedIndex(null);
+        setSelectedStreetSegmentIndex(null);
+      }
+    };
+    m.on('click', handleEmptyClick);
+    return () => { try { m.off('click', handleEmptyClick); } catch {} };
+  }, [drawMode, activeTool, editingStreetSegmentId, editingSavedIndex, basemapStyle]);
 
   // Enter/exit draw mode housekeeping
   useEffect(() => {
@@ -3097,6 +3127,7 @@ export default function App() {
         // Cache & persist ephemeral path
         selectedRoadSegmentRef.current = finalLine;
         setEphemeralStreetPath(finalLine);
+        setSidebarVisible(true); // auto-open sidebar so Finalize & Save is discoverable
         // Add the layer to render the highlighted line if not present
         console.log('[path-computation] adding/updating selected-road-segment-layer');
         if (!m.getLayer('selected-road-segment-layer')) {
@@ -3249,11 +3280,7 @@ export default function App() {
     // eslint-disable-next-line no-console
     console.groupCollapsed('[endpoint-diagnostics] consolidated tick');
     // eslint-disable-next-line no-console
-    console.log('mode', { startEndMode, editingStreetSegmentId, streetsActive, activeTool });
-    // eslint-disable-next-line no-console
-    console.log('points state', { startPoint, endPoint });
-    // eslint-disable-next-line no-console
-    console.log('street-endpoints source', { exists: !!m.getSource('street-endpoints'), layerExists: !!m.getLayer('street-endpoints-layer'), featureCount });
+    console.log('[endpoint-diagnostics] street-endpoints source', { exists: !!m.getSource('street-endpoints'), layerExists: !!m.getLayer('street-endpoints-layer'), featureCount });
     if (!m.getLayer('street-endpoints-layer')) {
       // eslint-disable-next-line no-console
       console.warn('[endpoint-diagnostics] street-endpoints-layer missing');
@@ -3346,11 +3373,10 @@ export default function App() {
       // Always ensure the ephemeral layer is on top so color changes are visible immediately
       try {
         if (mapInstance.getLayer('selected-road-segment-layer')) {
-          console.log('IF STATEMENT FOR THE EPHEMERAL LAYER [renderAllStreetSegments] moving ephemeral layer to top');
           mapInstance.moveLayer('selected-road-segment-layer');
         }
       } catch (e) {
-        console.log('[renderAllStreetSegments] reorder (to top) failed:', e?.message || e);
+        console.warn('[renderAllStreetSegments] reorder (to top) failed:', e?.message || e);
       }
     } else {
       // Hide ephemeral layer when no path
@@ -3567,6 +3593,31 @@ export default function App() {
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
   const canFinalizeStreets = streetsActive && !!startPoint && !!endPoint;
   const hasActiveStreetPath = streetsActive && !!startPoint && !!endPoint && streetPathLengthM != null;
+
+  // Contextual inline hint shown below the tool buttons — guides the user through the current step.
+  // Only shown for first-time neutral state (no saved items) and during active tool flows.
+  const toolHint = React.useMemo(() => {
+    if (showSavePanel || editingStreetSegmentId || editingSavedIndex != null) return null;
+    if (activeTool === 'none') {
+      return (savedZones.length === 0 && savedStreetSegments.length === 0)
+        ? 'Select Polygon or Street to start drawing.'
+        : null;
+    }
+    if (polygonActive) {
+      if (drawnCoords.length === 0) return 'Click on the map to place your first vertex.';
+      if (drawnCoords.length < 3) return `${drawnCoords.length} vert${drawnCoords.length === 1 ? 'ex' : 'ices'} placed — need at least 3 to finalize.`;
+      return 'Ready to finalize, or keep adding vertices.';
+    }
+    if (streetsActive) {
+      if (!startPoint) return 'Click a road to set the start point.';
+      if (!endPoint) return 'Start point set — click another road point to trace the path.';
+      if (ephemeralStreetPath) return 'Drag endpoints to adjust · Finalize & Save when ready.';
+      return 'Path not found — try closer points on a connected road.';
+    }
+    return null;
+  }, [activeTool, polygonActive, streetsActive, drawnCoords.length, startPoint, endPoint,
+      ephemeralStreetPath, savedZones.length, savedStreetSegments.length,
+      showSavePanel, editingStreetSegmentId, editingSavedIndex]);
 
   function cancelAllSelections() {
     setSelectedSavedIndex(null);
@@ -3995,9 +4046,9 @@ export default function App() {
     borderRadius: "0.5rem",
     boxShadow: "0 2px 10px rgba(0,0,0,0.15)",
     display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    gap: "0.5rem",
+    flexDirection: "column",
+    gap: "0.4rem",
+    minWidth: 210,
   };
 
   const buttonStyle = {
@@ -4235,47 +4286,47 @@ export default function App() {
         style={{ position: "absolute", inset: 0, zIndex: 0 }}
       />
 
-      <div style={controlPanelStyle}>
-  <div style={{ display: 'grid', gap: '0.25rem', minWidth: 200 }}>
-          <div style={labelStyle}>Drawing tool</div>
-          <div style={{ display: 'flex', gap: '0.4rem' }} role="radiogroup" aria-label="Drawing tool">
-            {[
-              { key: 'none', label: 'Off' },
-              { key: 'polygon', label: 'Polygon' },
-              { key: 'street', label: 'Street' }
-            ].map(btn => {
-              const active = activeTool === btn.key;
-              return (
-                <button
-                  key={btn.key}
-                  role="radio"
-                  aria-checked={active}
-                  disabled={creationLock || editingAny}
-                  onClick={() => { if (creationLock || editingAny) return; setActiveTool(btn.key); }}
-                  style={{
-                    ...buttonStyle,
-                    backgroundColor: active ? '#007bff' : '#e2e6ea',
-                    color: active ? '#fff' : '#222',
-                    fontWeight: active ? 600 : 500,
-                    padding: '0.4rem 0.65rem',
-                    minWidth: 62,
-                    opacity: (creationLock || editingAny) ? 0.5 : 1,
-                    cursor: (creationLock || editingAny) ? 'not-allowed':'pointer'
-                  }}
-                >{btn.label}</button>
-              );
-            })}
-          </div>
+      <div id="tool-panel" className="tool-panel" style={controlPanelStyle}>
+        {/* Tool mode selector — Off / Polygon / Street */}
+        <div className="tool-panel__label" style={labelStyle}>Drawing tool</div>
+        <div className="tool-panel__buttons" style={{ display: 'flex', gap: '0.4rem' }} role="radiogroup" aria-label="Drawing tool">
+          {[
+            { key: 'none', label: 'Off' },
+            { key: 'polygon', label: 'Polygon' },
+            { key: 'street', label: 'Street' }
+          ].map(btn => {
+            const active = activeTool === btn.key;
+            return (
+              <button
+                key={btn.key}
+                id={`drawing-tool-${btn.key}`}
+                className={`tool-panel__btn btn ${active ? 'is-active' : ''}`}
+                role="radio"
+                aria-checked={active}
+                disabled={creationLock || editingAny}
+                onClick={() => { if (creationLock || editingAny) return; setActiveTool(btn.key); }}
+                style={{
+                  ...buttonStyle,
+                  backgroundColor: active ? '#007bff' : '#e2e6ea',
+                  color: active ? '#fff' : '#222',
+                  fontWeight: active ? 600 : 500,
+                  padding: '0.4rem 0.65rem',
+                  minWidth: 62,
+                  opacity: (creationLock || editingAny) ? 0.5 : 1,
+                  cursor: (creationLock || editingAny) ? 'not-allowed' : 'pointer'
+                }}
+              >{btn.label}</button>
+            );
+          })}
         </div>
-        {/* Removed global Zone type pickers; now shown contextually in save/finalize panels only */}
 
-  {/* Basemap control removed from primary drawing panel (relocated bottom-left) */}
-
-  {/* Zone type picker removed from global panel (now contextual) */}
-
-        {/* ✅ Street selection controls now inside the panel */}
-        {/* Street metrics shown only when Street tool active */}
-    {/* Street metrics panel removed per requirements */}
+        {/* Contextual inline hint — updates in real time to guide the user through the current step */}
+        {toolHint && (
+          <div className="tool-hint" style={{ display: 'flex', alignItems: 'flex-start', gap: '0.3rem', fontSize: '0.72rem', color: '#555', lineHeight: 1.45 }}>
+            <span className="tool-hint__arrow" style={{ color: '#007bff', fontWeight: 700, flexShrink: 0, marginTop: 1 }}>›</span>
+            <span className="tool-hint__text">{toolHint}</span>
+          </div>
+        )}
       </div>
 
       {/* Bottom-left basemap toggle */}
@@ -4469,6 +4520,7 @@ export default function App() {
                 {zoneSummary && (
                   <div className="summary-card__zone" style={polygonCreationLock ? { pointerEvents:'auto' } : {}}>
                     <p style={{ marginBottom: "0.5rem" }}><strong>Name:</strong> {displayName}</p>
+                    {zoneSummary.description && <p style={{ marginBottom: "0.5rem" }}><strong>Description:</strong> {zoneSummary.description}</p>}
                     <p style={{ marginBottom: "0.5rem" }}><strong>Type:</strong> {zoneSummary.useType}</p>
                     <p style={{ marginBottom: "0.5rem" }}><strong>Area:</strong> {zoneSummary.areaM2.toFixed(2)} m² / {zoneSummary.areaFt2.toFixed(2)} ft²</p>
                     <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
@@ -4477,6 +4529,7 @@ export default function App() {
                 {(editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary; const startCoords = Array.isArray(ss.start) ? ss.start : [0,0]; const endCoords = Array.isArray(ss.end) ? ss.end : [0,0]; return (
                   <div className="summary-card__street">
                     <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {ss.name}</p>
+                    {ss.description && <p style={{ marginBottom: '0.5rem' }}><strong>Description:</strong> {ss.description}</p>}
                     <p style={{ marginBottom: '0.5rem' }}><strong>Type:</strong> {ss.useType}</p>
                     {ss.lengthM != null && (
                       <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {ss.lengthM.toFixed(1)} m{ss.lengthFt ? ` / ${ss.lengthFt.toFixed(1)} ft` : ''}</p>
@@ -4674,6 +4727,7 @@ export default function App() {
                                   applySelectedFilter(map.current, null);
                                 } else {
                                   setSelectedSavedIndex(idx);
+                                  setSelectedStreetSegmentIndex(null);
                                   applySelectedFilter(map.current, idx);
                                   flyToSaved(f);
                                 }
@@ -4761,6 +4815,7 @@ export default function App() {
                                     }
                                   } else {
                                     setSelectedStreetSegmentIndex(idx);
+                                    setSelectedSavedIndex(null);
                                     if (map.current) {
                                       const m = map.current;
                                       const filt = ['==',['get','__sid'], idx];
