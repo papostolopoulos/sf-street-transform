@@ -171,6 +171,8 @@ export default function App() {
   // Saved street segments (M4 slice)
   const [savedStreetSegments, setSavedStreetSegments] = useState([]); // Feature<LineString>[]
   const [selectedStreetSegmentIndex, setSelectedStreetSegmentIndex] = useState(null);
+  const [segmentsVisible, setSegmentsVisible] = useState(true); // show/hide saved segments layer
+  const [buildings3DEnabled, setBuildings3DEnabled] = useState(false); // 3D building extrusion toggle
   // Editing an existing saved street segment geometry (declare early so downstream hooks can reference)
   const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
   // Live ref for editingStreetSegmentId to avoid stale closure inside map event handlers
@@ -614,6 +616,16 @@ export default function App() {
   }
 
   // Ensure sources and layers exist after load/style switch
+  // Find the vector source + source-layer name for buildings in the currently loaded style
+  function getBuildingSourceInfo(mapInstance) {
+    try {
+      const layers = mapInstance.getStyle()?.layers || [];
+      const hit = layers.find(l => l['source-layer'] === 'building' && (l.type === 'fill' || l.type === 'fill-extrusion'));
+      if (hit) return { source: hit.source, sourceLayer: 'building' };
+    } catch {}
+    return null;
+  }
+
   function ensureSourcesAndLayers(mapInstance) {
     // Add source for drawn line if not present
     if (!mapInstance.getSource("drawn-line")) {
@@ -891,6 +903,31 @@ export default function App() {
           'line-opacity': 0.35
         }
       });
+    }
+
+    // 3D building extrusion — hidden by default, toggled by buildings3DEnabled
+    if (!mapInstance.getLayer('buildings-3d')) {
+      const bldg = getBuildingSourceInfo(mapInstance);
+      if (bldg) {
+        try {
+          mapInstance.addLayer({
+            id: 'buildings-3d',
+            type: 'fill-extrusion',
+            source: bldg.source,
+            'source-layer': bldg.sourceLayer,
+            minzoom: 14,
+            paint: {
+              'fill-extrusion-color': ['case', ['has', 'colour'], ['get', 'colour'], '#d6cfc7'],
+              'fill-extrusion-height': ['coalesce', ['get', 'render_height'], ['get', 'height'], 5],
+              'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], ['get', 'min_height'], 0],
+              'fill-extrusion-opacity': 0.72
+            },
+            layout: { visibility: 'none' }
+          });
+        } catch (e) {
+          console.warn('[buildings-3d] could not add extrusion layer:', e);
+        }
+      }
     }
   }
 
@@ -2246,6 +2283,25 @@ export default function App() {
       m.off('click', 'saved-street-segments-casing', handler);
     };
   }, [savedStreetSegments, editingStreetSegmentId, drawMode, basemapStyle]);
+
+  // Sync saved street segment layer visibility when the toggle changes or after a style switch
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const vis = segmentsVisible ? 'visible' : 'none';
+    ['saved-street-segments-line', 'saved-street-segments-casing', 'saved-street-segments-selected'].forEach(id => {
+      try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', vis); } catch {}
+    });
+  }, [segmentsVisible, basemapStyle]);
+
+  // Sync 3D building extrusion layer and map pitch when toggle changes or after a style switch
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const vis = buildings3DEnabled ? 'visible' : 'none';
+    try { if (m.getLayer('buildings-3d')) m.setLayoutProperty('buildings-3d', 'visibility', vis); } catch {}
+    m.easeTo({ pitch: buildings3DEnabled ? 45 : 0, duration: 600 });
+  }, [buildings3DEnabled, basemapStyle]);
 
   // Deselect saved zone/segment when user clicks on empty map area (neutral mode only)
   useEffect(() => {
@@ -3737,7 +3793,7 @@ export default function App() {
       const newFeature = {
         type: 'Feature',
         geometry: { type: 'LineString', coordinates: [...lineToSave.geometry.coordinates] },
-        properties: { ...baseProps, id: genId() }
+        properties: { ...baseProps, id: genId(), tags: [] }
       };
   setSavedStreetSegments(prev => [newFeature, ...prev]);
     }
@@ -3856,6 +3912,7 @@ export default function App() {
         areaM2: zoneSummary.areaM2,
         areaFt2: zoneSummary.areaFt2,
         address: zoneSummary.address,
+        tags: [],
       },
       geometry: { type: "Polygon", coordinates: [closed] },
     };
@@ -3868,7 +3925,7 @@ export default function App() {
 
     if (editingSavedIndex != null) {
       setSavedZones((prev) =>
-        prev.map((f, i) => (i === editingSavedIndex ? { ...feature, properties: { ...feature.properties, id: f.properties?.id || genId() } } : f))
+        prev.map((f, i) => (i === editingSavedIndex ? { ...feature, properties: { ...feature.properties, id: f.properties?.id || genId(), tags: f.properties?.tags || [] } } : f))
       );
     } else {
       setSavedZones((prev) => [feature, ...prev]);
@@ -4330,6 +4387,27 @@ export default function App() {
       </div>
 
       {/* Bottom-left basemap toggle */}
+  <div id="view-controls" className="view-controls" style={{ position:'absolute', left:'1rem', bottom:'3.5rem', zIndex:10 }}>
+        <button
+          id="buildings-3d-toggle"
+          className={`view-controls__btn btn ${buildings3DEnabled ? 'is-active' : ''}`}
+          onClick={() => setBuildings3DEnabled(v => !v)}
+          title={buildings3DEnabled ? 'Disable 3D buildings' : 'Enable 3D buildings'}
+          style={{
+            background: buildings3DEnabled ? '#007bff' : '#ffffffd9',
+            backdropFilter: 'blur(4px)',
+            color: buildings3DEnabled ? '#fff' : '#222',
+            border: 'none',
+            padding: '0.35rem 0.75rem',
+            borderRadius: 6,
+            fontSize: '0.75rem',
+            fontWeight: 600,
+            cursor: 'pointer',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)'
+          }}
+        >3D Buildings</button>
+      </div>
+
   <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10, opacity: (streetCreationLock || polygonCreationLock) ? 0.5 : 1, pointerEvents: (streetCreationLock || polygonCreationLock) ? 'none':'auto' }}>
         <div className="basemap-toggle__options" style={{ display:'flex', gap:'0.4rem', background:'#ffffffd9', backdropFilter:'blur(4px)', padding:'0.4rem 0.6rem', borderRadius:8, boxShadow:'0 2px 8px rgba(0,0,0,0.15)' }} aria-label="Basemap style" role="radiogroup">
           {[
@@ -4767,7 +4845,15 @@ export default function App() {
             {savedStreetSegments.length > 0 && (
               <div style={{ marginTop: '1rem', opacity: uiLock ? 0.45 : 1, pointerEvents: uiLock ? 'none':'auto' }} aria-disabled={uiLock}>
                 <div style={{ background: '#f6fff7', border: '1px solid #cde9d6', borderRadius: 8, padding: '0.75rem' }}>
-                  <h2 style={{ fontSize: '1.1rem', margin: 0, marginBottom: '.5rem', borderBottom: '2px solid #d6f2e0', paddingBottom: '.4rem' }}>Saved Street Segments</h2>
+                  <div className="segments-section__header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '.5rem', borderBottom: '2px solid #d6f2e0', paddingBottom: '.4rem' }}>
+                    <h2 className="segments-section__title" style={{ fontSize: '1.1rem', margin: 0 }}>Saved Street Segments</h2>
+                    <button
+                      className={`btn segments-section__visibility-toggle ${segmentsVisible ? 'is-active' : ''}`}
+                      onClick={() => setSegmentsVisible(v => !v)}
+                      title={segmentsVisible ? 'Hide segments on map' : 'Show segments on map'}
+                      style={{ fontSize: '0.72rem', padding: '0.2rem 0.5rem', background: segmentsVisible ? '#e8f5e9' : '#f0f0f0', border: '1px solid #ccc', borderRadius: 4, cursor: 'pointer', color: '#444' }}
+                    >{segmentsVisible ? '● Visible' : '○ Hidden'}</button>
+                  </div>
                   <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: '0.5rem' }}>
                     {savedStreetSegments.map((f, idx) => {
                       const sel = selectedStreetSegmentIndex === idx;
@@ -4795,7 +4881,7 @@ export default function App() {
                             <span style={{ width: 12, height: 12, borderRadius: 3, background: colorByUse[f.properties?.useType || 'mixed-use'], border: '1px solid #ccc' }} />
                           </div>
                           <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
-                          <div style={{ fontSize: '0.65rem', color: '#777' }}>ID: {segId?.slice(0,10)}</div>
+
                           {/* Removed per-street inline type select (editing block now owns type changes) */}
                           {/* Hide all action buttons while any street segment is in edit mode; prevent duplicate save/cancel */}
                           {(editingStreetSegmentId || uiLock) ? (
