@@ -102,6 +102,7 @@ All map logic, state, rendering, and UI lives in `App.jsx`. This is intentional 
   address: {            // from MapTiler reverse geocode
     street, postalCode, neighbourhood, city, state, country
   },
+  tags: string[],       // transformation tags (e.g. 'bike-lane', 'trees') — populated by M5
   createdAt: string,    // ISO timestamp
 }
 ```
@@ -231,8 +232,24 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 
 ---
 
+### M3.8 — 3D Building Extrusion
+**Status: DONE | Est: 4 hrs | 100%**
+
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| Enable `fill-extrusion` layer using OSM building height data from MapTiler | ✅ | `buildings-3d` layer added via `getBuildingSourceInfo()` + `ensureSourcesAndLayers` |
+| Pitch / tilt map camera to a slight angle by default (or on toggle) | ✅ | `map.easeTo({ pitch: 45 })` on enable; `pitch: 0` on disable |
+| Toggle button to switch between flat 2D and pitched 3D view | ✅ | `3D Buildings` button above basemap toggle; `buildings3DEnabled` state |
+| Confirm custom layers (zones, segments) remain visible in 3D mode | ✅ | Verified — zones and segments render correctly above extruded buildings |
+| Style-switch resilience: restore extrusion layer after basemap change | ✅ | `basemapStyle` in `useEffect` dep array re-applies visibility after style switch |
+
+**Dependency:** None — can be done immediately after M4.  
+**Why here:** Adds spatial depth to the map at minimal cost; makes street transformations feel grounded in a real neighbourhood before transformation furniture is added in M5.
+
+---
+
 ### M4 — Street Segment Persistence
-**Status: IN PROGRESS | Est: 16 hrs | ~55% complete**
+**Status: DONE | Est: 16 hrs | 100%**
 
 | Sub-task | Status | Notes |
 |----------|--------|-------|
@@ -245,11 +262,11 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | useType change with immediate recolour + persistence | ✅ | |
 | Geometry re-edit (reload path → adjust → re-finalize same ID) | ✅ | |
 | Auto length recompute on finalize | ✅ | |
-| Delete segment | ⚠️ | Code present; needs end-to-end verification |
-| Tags / metadata groundwork (for M5) | ❌ | Not started |
-| Filter toggle to show/hide saved segments layer | ❌ | Not started |
+| Delete segment | ✅ | Verified working end-to-end |
+| Tags / metadata groundwork (for M5) | ✅ | `tags: []` added to zone + segment feature schema; preserved on re-edit |
+| Filter toggle to show/hide saved segments layer | ✅ | `segmentsVisible` state; `● Visible / ○ Hidden` button in segment section header |
 
-**Remaining to close M4:** Verify delete flow; add tags groundwork to feature properties; consider show/hide toggle for saved segments.
+**Status: DONE 100%**
 
 ---
 
@@ -265,6 +282,23 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | Display active tags in sidebar summary | ❌ |
 
 **Dependency:** M2 + M4 (stable zone and segment entities to attach tags to).
+
+---
+
+### M5.5 — Road-Width Polygon Rendering
+**Status: NOT STARTED | Est: 16 hrs | 0%**
+
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| Buffer saved segment centerline into a width-accurate polygon using Turf `buffer()` | ❌ | Default width by road type (residential ~10 m, arterial ~18 m); use OSM `width` tag when available |
+| Subdivide buffer polygon into lane bands (sidewalk / parking / travel / bike) | ❌ | Fixed proportions as a starting point; later driven by transformation tags |
+| Render each band as a separate `fill` layer with distinct colour per band type | ❌ | Replaces thin centerline as the primary segment visual |
+| Update band colours reactively when transformation tags are applied (M5 dependency) | ❌ | e.g. parking band → green when "remove parking" tag applied |
+| Ensure polygon rendering survives basemap style switch | ❌ | Follow `ensureSourcesAndLayers` resilience pattern |
+| Fallback: keep centerline rendering for segments with no width data | ❌ | Graceful degradation |
+
+**Dependency:** M5 (tags needed to colour individual bands meaningfully).  
+**Why here:** Transforms the road from an abstract line into a spatial canvas — makes it visually obvious what space is being reallocated when a user applies a transformation tag.
 
 ---
 
@@ -295,6 +329,24 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | Acceptable render performance | ❌ |
 
 **Dependency:** M5 (need transformation tags to know what "After" looks like).
+
+---
+
+### M7.5 — Street Cross-Section Panel
+**Status: NOT STARTED | Est: 20 hrs | 0%**
+
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| Cross-section panel UI: horizontal schematic diagram of the street width | ❌ | SVG or Canvas; shows labelled bands (sidewalk, parking, travel lanes, bike lane, median) |
+| Derive initial band composition from road type + OSM tags | ❌ | e.g. primary road → 2 travel lanes + 2 parking lanes + 2 sidewalks |
+| User can reassign a band to a different type (drag or click-to-cycle) | ❌ | e.g. click parking band → cycle through: parking → bike lane → green space → remove |
+| Band changes write back to the segment's `tags` array | ❌ | Keeps cross-section in sync with the M5 tag model |
+| Cross-section updates when a transformation tag is applied from M5 menu | ❌ | Two-way sync: tag panel ↔ cross-section panel |
+| Panel renders in sidebar alongside the existing segment summary | ❌ | Collapsible; only shown when a segment is selected |
+| Consider StreetMix embed as an alternative to custom implementation | ❌ | StreetMix has open API; evaluate complexity vs. build cost |
+
+**Dependency:** M5.5 (road-width polygon) + M6 (impact metrics feed into the panel).  
+**Why here:** Gives users a clear schematic model of *how much space* exists and how they are redistributing it — bridges the gap between abstract tags and the physical reality of a street cross-section.
 
 ---
 
@@ -345,14 +397,16 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 ### M11 — 3D / Advanced Visualization (Stretch)
 **Status: NOT STARTED | Est: 40 hrs | 0%**
 
-| Sub-task | Status |
-|----------|--------|
-| 3D view prototype (Three.js or MapLibre 3D terrain) | ❌ |
-| Load a saved design in 3D | ❌ |
-| Navigate (rotate / zoom) in 3D view | ❌ |
-| "Go to 3D view" button wired from main map | ❌ |
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| 3D street furniture rendering (trees, benches, planters as extruded symbols) | ❌ | Builds on M3.8 extrusion foundation |
+| Load a saved design and render transformation tags in 3D | ❌ | |
+| Navigate (rotate / zoom / tilt) in 3D view | ❌ | MapLibre pitch + bearing controls |
+| "Go to 3D view" button wired from main map | ❌ | |
+| MapLibre 3D terrain (hillshade + elevation) | ❌ | MapTiler terrain tiles |
 
-**Dependency:** M7 (Before/After 2D must exist first).
+**Dependency:** M3.8 (building extrusion baseline) + M7.5 (cross-section model to render in 3D).  
+**Note:** Basic building extrusion moved to M3.8. M11 focuses on rendering transformation furniture and terrain in full 3D.
 
 ---
 
@@ -364,17 +418,20 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | M2 | Zone Summaries & Save/Load | 18 | DONE | 100% |
 | M3 | Street Segment Selection | 24 | DONE | 100% |
 | M3.5 | UI & Interaction Refinement | 14 | DONE | 100% |
-| M4 | Street Segment Persistence | 16 | IN PROGRESS | ~55% |
+| M3.8 | 3D Building Extrusion | 4 | DONE | 100% |
+| M4 | Street Segment Persistence | 16 | DONE | 100% |
 | M5 | Transformation Menu Phase 1 | 20 | NOT STARTED | 0% |
+| M5.5 | Road-Width Polygon Rendering | 16 | NOT STARTED | 0% |
 | M6 | Impact Panel Phase 1 | 14 | NOT STARTED | 0% |
 | M7 | Before / After View 2D | 28 | NOT STARTED | 0% |
+| M7.5 | Street Cross-Section Panel | 20 | NOT STARTED | 0% |
 | M8 | Auth & Cloud Persistence | 34 | NOT STARTED | 0% |
 | M9 | Counterpoint Mode Phase 1 | 12 | NOT STARTED | 0% |
 | M10 | MVP Release | 24 | NOT STARTED | 0% |
 | M11 | 3D / Advanced Visualization (Stretch) | 40 | NOT STARTED | 0% |
-| **Total** | | **274** | | |
+| **Total** | | **314** | | |
 
-**MVP boundary (M10):** M1–M6. Estimated remaining MVP work: ~106 hrs (M2 partial + M3.5 partial + M4 partial + M5 + M6 + M10).
+**MVP boundary (M10):** M1–M7.5 + M10. Estimated remaining MVP work: ~158 hrs (M3.8 + M5 + M5.5 + M6 + M7 + M7.5 + M10).
 
 ---
 
@@ -399,6 +456,9 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | 2025-09-17 | Enhancement | M4 | Inline rename + per-segment useType dropdown with immediate recolour & persistence | TBD |
 | 2026-06-07 | Review | M1–M4 | Code audit: verified M1/M3 done; M2/M3.5/M4 partial items documented; predefined zones removed (superseded by M2) | — |
 | 2026-06-07 | Feature/Fix | M2+M3.5 | Fixed reverseGeocode field mapping (place_type lookup); cross-selection clearing; empty-click deselect; description in summary cards; log silencer expanded; toolHint inline; tool palette BEM tokens + sidebar auto-open on path ready | 2.5 |
+| 2026-06-09 | Feature | M4 | Tags groundwork: added `tags: []` to zone + segment feature schema; preserved on geometry re-edit | 0.3 |
+| 2026-06-10 | Feature | M4 | Show/hide toggle for saved segments layer (`segmentsVisible` state + `● Visible / ○ Hidden` button in sidebar header); M4 closed | 0.4 |
+| 2026-06-11 | Feature | M3.8 | 3D building extrusion: `fill-extrusion` layer via `getBuildingSourceInfo()`; pitch 45° on enable; `3D Buildings` toggle button above basemap; style-switch resilient; zones + segments verified above buildings; M3.8 closed | 1.0 |
 
 _Add an entry when a milestone advances ≥10% or completes. Log focused engineering time only (exclude context switching)._
 

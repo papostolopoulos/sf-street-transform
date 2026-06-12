@@ -149,6 +149,7 @@ initialStartRef / initialEndRef  // original endpoints when entering edit
   lengthM: number,     // streets only
   streets: string[],   // intersecting street names
   address: { street, postalCode, neighbourhood, city, state, country },
+  tags: string[],      // transformation tags (e.g. 'bike-lane', 'trees') — populated by M5
   createdAt: string,   // ISO timestamp
 }
 ```
