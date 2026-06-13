@@ -271,15 +271,15 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 ---
 
 ### M5 — Transformation Menu (Phase 1)
-**Status: NOT STARTED | Est: 20 hrs | 0%**
+**Status: DONE | Est: 20 hrs | 100%**
 
-| Sub-task | Status |
-|----------|--------|
-| Transformation menu UI (Trees, Bike Lane, Outdoor Seating, Stormwater Planters) | ❌ |
-| Apply tag to selected zone / segment | ❌ |
-| Remove tag from zone / segment | ❌ |
-| Persist tags in feature `properties` | ❌ |
-| Display active tags in sidebar summary | ❌ |
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| Transformation menu UI (20 tags across 5 groups) | ✅ | Green / Play / Seating & Gathering / Mobility / Safety; grouped pill toggles in summary card |
+| Apply tag to selected zone / segment | ✅ | `toggleZoneTag()` / `toggleSegmentTag()` |
+| Remove tag from zone / segment | ✅ | Same toggle functions; click active tag to remove |
+| Persist tags in feature `properties` | ✅ | Tags written into `savedZones` / `savedStreetSegments` → localStorage via existing persistence hooks |
+| Display active tags in sidebar summary | ✅ | Active tags shown as filled colored pills; inactive as outlined |
 
 **Dependency:** M2 + M4 (stable zone and segment entities to attach tags to).
 
@@ -420,7 +420,7 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | M3.5 | UI & Interaction Refinement | 14 | DONE | 100% |
 | M3.8 | 3D Building Extrusion | 4 | DONE | 100% |
 | M4 | Street Segment Persistence | 16 | DONE | 100% |
-| M5 | Transformation Menu Phase 1 | 20 | NOT STARTED | 0% |
+| M5 | Transformation Menu Phase 1 | 20 | DONE | 100% |
 | M5.5 | Road-Width Polygon Rendering | 16 | NOT STARTED | 0% |
 | M6 | Impact Panel Phase 1 | 14 | NOT STARTED | 0% |
 | M7 | Before / After View 2D | 28 | NOT STARTED | 0% |
@@ -459,6 +459,8 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | 2026-06-09 | Feature | M4 | Tags groundwork: added `tags: []` to zone + segment feature schema; preserved on geometry re-edit | 0.3 |
 | 2026-06-10 | Feature | M4 | Show/hide toggle for saved segments layer (`segmentsVisible` state + `● Visible / ○ Hidden` button in sidebar header); M4 closed | 0.4 |
 | 2026-06-11 | Feature | M3.8 | 3D building extrusion: `fill-extrusion` layer via `getBuildingSourceInfo()`; pitch 45° on enable; `3D Buildings` toggle button above basemap; style-switch resilient; zones + segments verified above buildings; M3.8 closed | 1.0 |
+| 2026-06-11 | Feature | M5 | Transformation menu: 8-tag initial set; pill toggles in summary card for zones + segments; tags persisted to localStorage | 1.2 |
+| 2026-06-12 | Enhancement | M5 | Expanded to 20 tags in 5 groups (Green / Play / Seating & Gathering / Mobility / Safety); shared `renderTransformationMenu()` helper; `TRANSFORMATION_TAG_GROUPS` replaces flat array | 0.5 |
 
 _Add an entry when a milestone advances ≥10% or completes. Log focused engineering time only (exclude context switching)._
 
