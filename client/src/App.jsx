@@ -97,6 +97,59 @@ function genId() {
   return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,9);
 }
 // Utility: Explode GeoJSON features to array of LineStrings
+// Available transformation tags for M5 — Phase 1 set from Project_Vision.md mockups
+// Transformation tags grouped by category (M5) — drawn from Project_Vision.md + global city references
+const TRANSFORMATION_TAG_GROUPS = [
+  {
+    group: 'Green',
+    tags: [
+      { key: 'trees',               label: 'Trees',            color: '#2d9e4f' },
+      { key: 'stormwater-planters', label: 'Planters',         color: '#558b2f' },
+      { key: 'community-garden',    label: 'Community Garden', color: '#5d4037' },
+      { key: 'flower-meadow',       label: 'Flower Meadow',    color: '#c2185b' },
+      { key: 'urban-orchard',       label: 'Urban Orchard',    color: '#ef6c00' },
+    ],
+  },
+  {
+    group: 'Play',
+    tags: [
+      { key: 'playground',    label: 'Playground',  color: '#d81b60' },
+      { key: 'outdoor-gym',   label: 'Outdoor Gym', color: '#f57c00' },
+      { key: 'splash-pad',    label: 'Splash Pad',  color: '#0288d1' },
+      { key: 'dog-park',      label: 'Dog Park',    color: '#6d4c41' },
+    ],
+  },
+  {
+    group: 'Seating & Gathering',
+    tags: [
+      { key: 'outdoor-seating', label: 'Outdoor Seating', color: '#e65100' },
+      { key: 'benches',         label: 'Benches',          color: '#795548' },
+      { key: 'bbq-station',     label: 'BBQ Station',      color: '#bf360c' },
+      { key: 'parklet',         label: 'Parklet',          color: '#e64a19' },
+    ],
+  },
+  {
+    group: 'Mobility',
+    tags: [
+      { key: 'bike-lane',          label: 'Bike Lane',          color: '#1976d2' },
+      { key: 'cargo-bike-parking', label: 'Cargo Bike Parking', color: '#1565c0' },
+      { key: 'ev-charging',        label: 'EV Charging',        color: '#00796b' },
+      { key: 'car-free-zone',      label: 'Car-Free Zone',      color: '#00897b' },
+      { key: 'delivery-parking',   label: 'Delivery Parking',   color: '#546e7a' },
+    ],
+  },
+  {
+    group: 'Safety',
+    tags: [
+      { key: 'led-crosswalk',    label: 'LED Crosswalk',    color: '#f57c00' },
+      { key: 'raised-crosswalk', label: 'Raised Crosswalk', color: '#e65100' },
+      { key: 'mini-roundabout',  label: 'Roundabout',       color: '#7b1fa2' },
+    ],
+  },
+];
+// Flat list derived from groups — used for any key-based lookups
+const TRANSFORMATION_TAGS = TRANSFORMATION_TAG_GROUPS.flatMap(g => g.tags);
+
 function explodeToLineStrings(feature) {
 
   if (!feature) return [];
@@ -3644,6 +3697,68 @@ export default function App() {
     try { m.setLayoutProperty('edit-delta-layer','visibility', features.length ? 'visible':'none'); } catch {}
   }, [editingStreetSegmentId, startEndMode, startPoint, endPoint, savedStreetSegments]);
 
+  // --- Transformation tag helpers (M5) -----------------------------------
+
+  // Renders the grouped transformation tag menu — shared by zone and segment summary cards
+  function renderTransformationMenu(activeTags, onToggle) {
+    return (
+      <div className="transformation-menu" style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #eee' }}>
+        <h3 className="transformation-menu__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: '0 0 0.6rem' }}>Transformations</h3>
+        <div className="transformation-menu__groups" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+          {TRANSFORMATION_TAG_GROUPS.map(grp => (
+            <div key={grp.group} className="transformation-menu__group">
+              <div className="transformation-menu__group-label" style={{ fontSize: '0.65rem', fontWeight: 700, color: '#999', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>{grp.group}</div>
+              <div className="transformation-menu__tags" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem' }}>
+                {grp.tags.map(tag => {
+                  const active = activeTags.includes(tag.key);
+                  return (
+                    <button
+                      key={tag.key}
+                      className={`transformation-menu__tag btn ${active ? 'is-active' : ''}`}
+                      onClick={() => onToggle(tag.key)}
+                      title={active ? `Remove: ${tag.label}` : `Add: ${tag.label}`}
+                      style={{
+                        fontSize: '0.72rem', fontWeight: active ? 600 : 400,
+                        padding: '0.25rem 0.55rem', borderRadius: 12,
+                        border: `1.5px solid ${tag.color}`,
+                        background: active ? tag.color : 'transparent',
+                        color: active ? '#fff' : tag.color,
+                        cursor: 'pointer', transition: 'all 0.15s'
+                      }}
+                    >{tag.label}</button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // Add or remove a tag on the currently selected saved zone
+  function toggleZoneTag(tagKey) {
+    if (selectedSavedIndex == null) return;
+    setSavedZones(prev => prev.map((f, i) => {
+      if (i !== selectedSavedIndex) return f;
+      const tags = f.properties?.tags || [];
+      const next = tags.includes(tagKey) ? tags.filter(t => t !== tagKey) : [...tags, tagKey];
+      return { ...f, properties: { ...f.properties, tags: next } };
+    }));
+  }
+
+  // Add or remove a tag on the currently selected saved street segment
+  function toggleSegmentTag(tagKey) {
+    const segId = selectedStreetSegment?.properties?.id;
+    if (!segId) return;
+    setSavedStreetSegments(prev => prev.map(f => {
+      if (f.properties?.id !== segId) return f;
+      const tags = f.properties?.tags || [];
+      const next = tags.includes(tagKey) ? tags.filter(t => t !== tagKey) : [...tags, tagKey];
+      return { ...f, properties: { ...f.properties, tags: next } };
+    }));
+  }
+
   // --- Save / finalize helpers -----------------------------------
 
   const canFinalizePolygon = polygonActive && drawnCoords.length >= 3;
@@ -4604,6 +4719,13 @@ export default function App() {
                     <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
                   </div>
                 )}
+                {/* Transformation menu — shown on saved zone selection, hidden during draw/edit flows */}
+                {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
+                  renderTransformationMenu(
+                    savedZones[selectedSavedIndex]?.properties?.tags || [],
+                    toggleZoneTag
+                  )
+                }
                 {(editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary; const startCoords = Array.isArray(ss.start) ? ss.start : [0,0]; const endCoords = Array.isArray(ss.end) ? ss.end : [0,0]; return (
                   <div className="summary-card__street">
                     <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {ss.name}</p>
@@ -4632,6 +4754,13 @@ export default function App() {
                     {editingStreetSegmentSummary && (
                       <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
                     )}
+                    {/* Transformation menu — shown on saved segment selection, hidden during geometry edit */}
+                    {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
+                      renderTransformationMenu(
+                        selectedStreetSegment?.properties?.tags || [],
+                        toggleSegmentTag
+                      )
+                    }
                     {editingStreetSegmentId && (
                       <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>
                         <EditForm
