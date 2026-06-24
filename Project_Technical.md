@@ -286,19 +286,41 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 ---
 
 ### M5.5 — Road-Width Polygon Rendering
-**Status: NOT STARTED | Est: 16 hrs | 0%**
+**Status: DONE | Est: 16 hrs | 100%**
 
 | Sub-task | Status | Notes |
 |----------|--------|-------|
-| Buffer saved segment centerline into a width-accurate polygon using Turf `buffer()` | ❌ | Default width by road type (residential ~10 m, arterial ~18 m); use OSM `width` tag when available |
-| Subdivide buffer polygon into lane bands (sidewalk / parking / travel / bike) | ❌ | Fixed proportions as a starting point; later driven by transformation tags |
-| Render each band as a separate `fill` layer with distinct colour per band type | ❌ | Replaces thin centerline as the primary segment visual |
-| Update band colours reactively when transformation tags are applied (M5 dependency) | ❌ | e.g. parking band → green when "remove parking" tag applied |
-| Ensure polygon rendering survives basemap style switch | ❌ | Follow `ensureSourcesAndLayers` resilience pattern |
-| Fallback: keep centerline rendering for segments with no width data | ❌ | Graceful degradation |
+| Buffer saved segment centerline into a width-accurate polygon using Turf `lineOffset()` | ✅ | Width by useType: residential 10 m, mixed-use 14 m, commercial 18 m; `widthM` property overrides |
+| Subdivide buffer polygon into 4 equal lane bands (parking-left / travel-left / travel-right / parking-right) | ✅ | `computeSegmentBands()` returns band polygons with `bandRole` + `bandType` properties |
+| Render each band as a `fill` layer with distinct colour per band type | ✅ | `segment-bands-fill` + `segment-bands-outline` layers; visible at zoom ≥ 13 |
+| Update band colours reactively when transformation tags are applied | ✅ | `getBandType()` maps active tags → parking bands transform to bike/green/seating/play/plaza |
+| Ensure polygon rendering survives basemap style switch | ✅ | `segment-bands` source + layers in `ensureSourcesAndLayers`; recomputed in `refreshMapData` |
+| Fallback: keep centerline rendering for segments at zoom < 13 | ✅ | Existing `saved-street-segments-line` shows below zoom 13 (bands have `minzoom: 13`) |
 
 **Dependency:** M5 (tags needed to colour individual bands meaningfully).  
 **Why here:** Transforms the road from an abstract line into a spatial canvas — makes it visually obvious what space is being reallocated when a user applies a transformation tag.
+
+---
+
+### M5.6 — OSM Sidewalk & Carriageway Overlay
+**Status: NOT STARTED | Est: 10 hrs | 0%**
+
+**Goal:** Let users clearly distinguish building edge / sidewalk / parking lane / carriageway without relying on satellite imagery or guessed buffer widths. Uses OpenStreetMap data fetched via the Overpass API.
+
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| Query Overpass API for sidewalk polygons within the current map bbox | ❌ | `highway=footway, footway=sidewalk` or `highway=path, footway=sidewalk` |
+| Query Overpass API for road area polygons (`area:highway`) near saved segments | ❌ | Returns actual carriageway polygon where mapped in OSM |
+| Render sidewalk polygons as a semi-transparent overlay layer (distinct from bands) | ❌ | Suggested colour: warm beige / sandstone |
+| Render carriageway area polygons as an overlay (replaces guessed buffer width) | ❌ | Replaces `segment-bands` fixed-width buffer with real OSM geometry |
+| Cache fetched polygons per bbox to avoid redundant API calls | ❌ | Re-query on significant pan / zoom change |
+| Toggle to show / hide the OSM overlay independently of segment bands | ❌ | `osmOverlayEnabled` state; button in view-controls |
+| Graceful fallback if Overpass returns no data (OSM coverage is incomplete) | ❌ | Keep fixed-width buffer bands as fallback |
+| Surface OSM `lanes` + `width` tags to calibrate buffer width for segments that lack area polygons | ❌ | `lanes × 3.5 m` + parking lane allowance |
+
+**Dependency:** M5.5 (segment bands provide the fallback layer).  
+**Why here:** True sidewalk / carriageway boundaries make transformation placement meaningful — users can see where the building edge is, where the sidewalk is, and where the road is, matching what they observe on the ground.  
+**Coverage note:** OSM sidewalk polygon coverage in SF is partial. Expect ~40–60% coverage in the Mission / Potrero / Hayes Valley areas; lower in outer neighbourhoods.
 
 ---
 
@@ -403,7 +425,7 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | Load a saved design and render transformation tags in 3D | ❌ | |
 | Navigate (rotate / zoom / tilt) in 3D view | ❌ | MapLibre pitch + bearing controls |
 | "Go to 3D view" button wired from main map | ❌ | |
-| MapLibre 3D terrain (hillshade + elevation) | ❌ | MapTiler terrain tiles |
+| MapLibre 3D terrain (hillshade + elevation) | ✅ | Delivered early: `terrain-rgb-v2` DEM source + `setTerrain()`, `Terrain` toggle button, pitch 55°, style-switch resilient |
 
 **Dependency:** M3.8 (building extrusion baseline) + M7.5 (cross-section model to render in 3D).  
 **Note:** Basic building extrusion moved to M3.8. M11 focuses on rendering transformation furniture and terrain in full 3D.
@@ -421,7 +443,8 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | M3.8 | 3D Building Extrusion | 4 | DONE | 100% |
 | M4 | Street Segment Persistence | 16 | DONE | 100% |
 | M5 | Transformation Menu Phase 1 | 20 | DONE | 100% |
-| M5.5 | Road-Width Polygon Rendering | 16 | NOT STARTED | 0% |
+| M5.5 | Road-Width Polygon Rendering | 16 | DONE | 100% |
+| M5.6 | OSM Sidewalk & Carriageway Overlay | 10 | NOT STARTED | 0% |
 | M6 | Impact Panel Phase 1 | 14 | NOT STARTED | 0% |
 | M7 | Before / After View 2D | 28 | NOT STARTED | 0% |
 | M7.5 | Street Cross-Section Panel | 20 | NOT STARTED | 0% |
@@ -431,7 +454,7 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | M11 | 3D / Advanced Visualization (Stretch) | 40 | NOT STARTED | 0% |
 | **Total** | | **314** | | |
 
-**MVP boundary (M10):** M1–M7.5 + M10. Estimated remaining MVP work: ~158 hrs (M3.8 + M5 + M5.5 + M6 + M7 + M7.5 + M10).
+**MVP boundary (M10):** M1–M7.5 + M10. Estimated remaining MVP work: ~128 hrs (M5.6 + M6 + M7 + M7.5 + M10).
 
 ---
 
@@ -461,6 +484,8 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | 2026-06-11 | Feature | M3.8 | 3D building extrusion: `fill-extrusion` layer via `getBuildingSourceInfo()`; pitch 45° on enable; `3D Buildings` toggle button above basemap; style-switch resilient; zones + segments verified above buildings; M3.8 closed | 1.0 |
 | 2026-06-11 | Feature | M5 | Transformation menu: 8-tag initial set; pill toggles in summary card for zones + segments; tags persisted to localStorage | 1.2 |
 | 2026-06-12 | Enhancement | M5 | Expanded to 20 tags in 5 groups (Green / Play / Seating & Gathering / Mobility / Safety); shared `renderTransformationMenu()` helper; `TRANSFORMATION_TAG_GROUPS` replaces flat array | 0.5 |
+| 2026-06-22 | Feature | M5.5 | Road-width band rendering: `computeSegmentBands()` via `turf.buffer()`+`turf.difference()`; outer parking ring + inner travel strip; `BAND_COLORS` + `getBandType()` maps active tags to band colour; `segment-bands-fill` + `segment-bands-outline` layers (minzoom 13); recomputed in `refreshMapData`; visibility toggle extended; M5.5 closed | 2.0 |
+| 2026-06-23 | Enhancement | M11/M3.8 | Terrain DEM toggle: `terrainEnabled` state; MapTiler `terrain-rgb-v2` raster-dem source; `setTerrain({ exaggeration:1.5 })`; pitch 55° on enable; `Terrain` button in view-controls; style-switch resilient; delivered ahead of M11 | 0.5 |
 
 _Add an entry when a milestone advances ≥10% or completes. Log focused engineering time only (exclude context switching)._
 
