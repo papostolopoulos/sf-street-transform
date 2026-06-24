@@ -150,6 +150,83 @@ const TRANSFORMATION_TAG_GROUPS = [
 // Flat list derived from groups — used for any key-based lookups
 const TRANSFORMATION_TAGS = TRANSFORMATION_TAG_GROUPS.flatMap(g => g.tags);
 
+// --- M5.5: Road-width polygon rendering helpers ----------------------------
+
+// Fill colors keyed by band type — referenced in both the paint expression and band computation
+const BAND_COLORS = {
+  parking: '#c8bfb4',  // muted pavement
+  travel:  '#a89e94',  // darker road surface
+  bike:    '#4caf50',  // green bike lane
+  green:   '#2d9e4f',  // trees / garden
+  seating: '#ff9800',  // outdoor seating / parklet
+  play:    '#2196f3',  // playground / gym / splash pad
+  plaza:   '#e8e0d0',  // car-free pedestrian surface
+};
+
+// Map a band's role + active tags to the correct visual type
+function getBandType(bandRole, tags) {
+  if (bandRole.startsWith('travel')) {
+    if (tags.includes('car-free-zone')) return 'plaza';
+    return 'travel';
+  }
+  // parking bands transform based on whichever tag takes highest priority
+  if (tags.includes('bike-lane')) return 'bike';
+  if (tags.some(t => ['trees','community-garden','flower-meadow','urban-orchard'].includes(t))) return 'green';
+  if (tags.some(t => ['outdoor-seating','benches','bbq-station','parklet'].includes(t))) return 'seating';
+  if (tags.some(t => ['playground','outdoor-gym','splash-pad','dog-park'].includes(t))) return 'play';
+  return 'parking';
+}
+
+// Compute road-width band polygons for a saved segment using concentric buffers.
+// turf.buffer handles curved roads, Dijkstra waypoints, and end caps correctly — the
+// manual bearing-offset approach produced self-intersecting polygons on curved paths.
+// Returns 2 features: an inner travel-lane strip and an outer parking/curb ring.
+function computeSegmentBands(feature) {
+  try {
+    const coords = feature.geometry?.coordinates;
+    if (!coords || coords.length < 2) return [];
+    const line    = turf.lineString(coords);
+    const useType = feature.properties?.useType || 'mixed-use';
+    const widthM  = feature.properties?.widthM ||
+      (useType === 'residential' ? 10 : useType === 'commercial' ? 18 : 14);
+    const tags  = feature.properties?.tags || [];
+    const segId = feature.properties?.id;
+    const h = widthM / 2; // outer half-width
+
+    const outerBuf = turf.buffer(line, h,     { units: 'meters' });
+    const innerBuf = turf.buffer(line, h / 2, { units: 'meters' });
+    if (!outerBuf) return [];
+
+    const bands = [];
+
+    // Outer ring → parking / reclaimed curb strips (both sides combined)
+    if (innerBuf) {
+      try {
+        const parkingRing = turf.difference(outerBuf, innerBuf);
+        if (parkingRing) {
+          bands.push({
+            ...parkingRing,
+            properties: { segId, bandRole: 'parking', bandType: getBandType('parking-left', tags) }
+          });
+        }
+      } catch (e) {
+        console.warn('[segment-bands] difference failed:', e?.message);
+      }
+    }
+
+    // Inner strip → travel lanes / car-free zone
+    bands.push({
+      ...(innerBuf || outerBuf),
+      properties: { segId, bandRole: 'travel', bandType: getBandType('travel-left', tags) }
+    });
+
+    return bands;
+  } catch (e) {
+    console.warn('[computeSegmentBands] error:', e?.message);
+    return [];
+  }
+}
+
 function explodeToLineStrings(feature) {
 
   if (!feature) return [];
@@ -226,6 +303,8 @@ export default function App() {
   const [selectedStreetSegmentIndex, setSelectedStreetSegmentIndex] = useState(null);
   const [segmentsVisible, setSegmentsVisible] = useState(true); // show/hide saved segments layer
   const [buildings3DEnabled, setBuildings3DEnabled] = useState(false); // 3D building extrusion toggle
+  const [terrainEnabled, setTerrainEnabled] = useState(false);         // terrain DEM extrusion (satellite)
+  const [streets3DHintDismissed, setStreets3DHintDismissed] = useState(false); // one-per-session dismiss
   // Editing an existing saved street segment geometry (declare early so downstream hooks can reference)
   const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
   // Live ref for editingStreetSegmentId to avoid stale closure inside map event handlers
@@ -906,6 +985,49 @@ export default function App() {
       });
     }
 
+    // Segment band polygons (M5.5) — rendered below the casing/line/selected layers
+    if (!mapInstance.getSource('segment-bands')) {
+      mapInstance.addSource('segment-bands', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('segment-bands-fill')) {
+      mapInstance.addLayer({
+        id: 'segment-bands-fill',
+        type: 'fill',
+        source: 'segment-bands',
+        minzoom: 13,
+        paint: {
+          'fill-color': [
+            'match', ['get', 'bandType'],
+            'parking', BAND_COLORS.parking,
+            'travel',  BAND_COLORS.travel,
+            'bike',    BAND_COLORS.bike,
+            'green',   BAND_COLORS.green,
+            'seating', BAND_COLORS.seating,
+            'play',    BAND_COLORS.play,
+            'plaza',   BAND_COLORS.plaza,
+            BAND_COLORS.parking
+          ],
+          'fill-opacity': 0.88
+        }
+      });
+    }
+    if (!mapInstance.getLayer('segment-bands-outline')) {
+      mapInstance.addLayer({
+        id: 'segment-bands-outline',
+        type: 'line',
+        source: 'segment-bands',
+        minzoom: 13,
+        paint: {
+          'line-color': '#6b5e54',
+          'line-width': 0.5,
+          'line-opacity': 0.45
+        }
+      });
+    }
+
     // Saved street segments
     if (!mapInstance.getSource('saved-street-segments')) {
       mapInstance.addSource('saved-street-segments', {
@@ -1104,6 +1226,20 @@ export default function App() {
       const filt = typeof selectedStreetSegmentIndex === 'number' ? ['==',['get','__sid'], selectedStreetSegmentIndex] : ['==',['get','__sid'], -999];
       try { mapInstance.setFilter('saved-street-segments-selected', filt); } catch {}
     }
+
+    // Recompute band polygons for all visible saved segments (M5.5)
+    const bandsFC = {
+      type: 'FeatureCollection',
+      features: (savedStreetSegments || [])
+        .filter(f => {
+          const fid = f?.properties?.id || f?.id;
+          return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+        })
+        .flatMap(f => computeSegmentBands(f))
+    };
+    // Source may not exist yet if the map hasn't loaded; ensureSourcesAndLayers + refreshMapData
+    // are called together in the load/styledata handlers, so the next call will populate it.
+    mapInstance.getSource('segment-bands')?.setData(bandsFC);
   }
 
   // Build a zone summary from any Feature<Polygon>
@@ -2342,7 +2478,8 @@ export default function App() {
     if (!map.current) return;
     const m = map.current;
     const vis = segmentsVisible ? 'visible' : 'none';
-    ['saved-street-segments-line', 'saved-street-segments-casing', 'saved-street-segments-selected'].forEach(id => {
+    ['saved-street-segments-line', 'saved-street-segments-casing', 'saved-street-segments-selected',
+     'segment-bands-fill', 'segment-bands-outline'].forEach(id => {
       try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', vis); } catch {}
     });
   }, [segmentsVisible, basemapStyle]);
@@ -2353,8 +2490,42 @@ export default function App() {
     const m = map.current;
     const vis = buildings3DEnabled ? 'visible' : 'none';
     try { if (m.getLayer('buildings-3d')) m.setLayoutProperty('buildings-3d', 'visibility', vis); } catch {}
-    m.easeTo({ pitch: buildings3DEnabled ? 45 : 0, duration: 600 });
-  }, [buildings3DEnabled, basemapStyle]);
+    // Only drive pitch if terrain isn't already controlling it
+    if (!terrainEnabled) m.easeTo({ pitch: buildings3DEnabled ? 45 : 0, duration: 600 });
+  }, [buildings3DEnabled, basemapStyle, terrainEnabled]);
+
+  // Add / remove MapTiler terrain DEM when the terrain toggle changes or after a style switch.
+  // Terrain RGB tiles give real topographic extrusion — most useful in satellite mode, but
+  // works in streets mode too. A style switch destroys all sources, so we re-add here.
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+
+    const applyTerrain = () => {
+      if (terrainEnabled) {
+        if (!m.getSource('terrain-dem')) {
+          m.addSource('terrain-dem', {
+            type: 'raster-dem',
+            url: `https://api.maptiler.com/tiles/terrain-rgb-v2/tiles.json?key=${MAPTILER_KEY}`,
+            tileSize: 256,
+          });
+        }
+        m.setTerrain({ source: 'terrain-dem', exaggeration: 1.5 });
+        m.easeTo({ pitch: 55, duration: 700 });
+      } else {
+        try { m.setTerrain(null); } catch {}
+        try { if (m.getSource('terrain-dem')) m.removeSource('terrain-dem'); } catch {}
+        if (!buildings3DEnabled) m.easeTo({ pitch: 0, duration: 600 });
+      }
+    };
+
+    // The style may still be loading after a basemap switch; wait for it to be ready
+    if (m.isStyleLoaded()) {
+      applyTerrain();
+    } else {
+      m.once('styledata', applyTerrain);
+    }
+  }, [terrainEnabled, basemapStyle, buildings3DEnabled]);
 
   // Deselect saved zone/segment when user clicks on empty map area (neutral mode only)
   useEffect(() => {
@@ -4521,6 +4692,25 @@ export default function App() {
             boxShadow: '0 2px 8px rgba(0,0,0,0.15)'
           }}
         >3D Buildings</button>
+        <button
+          id="terrain-toggle"
+          className={`view-controls__btn btn ${terrainEnabled ? 'is-active' : ''}`}
+          onClick={() => setTerrainEnabled(v => !v)}
+          title={terrainEnabled ? 'Disable terrain' : 'Enable terrain elevation (best in Satellite view)'}
+          style={{
+            background: terrainEnabled ? '#2d7d46' : '#ffffffd9',
+            backdropFilter: 'blur(4px)',
+            color: terrainEnabled ? '#fff' : '#222',
+            border: 'none',
+            padding: '0.35rem 0.75rem',
+            borderRadius: 6,
+            fontSize: '0.75rem',
+            fontWeight: 600,
+            cursor: 'pointer',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            marginTop: '0.35rem',
+          }}
+        >Terrain</button>
       </div>
 
   <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10, opacity: (streetCreationLock || polygonCreationLock) ? 0.5 : 1, pointerEvents: (streetCreationLock || polygonCreationLock) ? 'none':'auto' }}>
@@ -4983,6 +5173,48 @@ export default function App() {
                       style={{ fontSize: '0.72rem', padding: '0.2rem 0.5rem', background: segmentsVisible ? '#e8f5e9' : '#f0f0f0', border: '1px solid #ccc', borderRadius: 4, cursor: 'pointer', color: '#444' }}
                     >{segmentsVisible ? '● Visible' : '○ Hidden'}</button>
                   </div>
+                  {/* Nudge user toward Streets + 3D for best spatial context — dismissed per session */}
+                  {!streets3DHintDismissed && !(basemapStyle === 'streets' && buildings3DEnabled) && (
+                    <div
+                      className="streets-3d-hint"
+                      style={{
+                        display: 'flex', alignItems: 'flex-start', gap: '0.5rem',
+                        background: '#eef4ff', border: '1px solid #b6cef7',
+                        borderRadius: 6, padding: '0.45rem 0.55rem',
+                        fontSize: '0.72rem', color: '#2c4a8c', marginBottom: '0.55rem',
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      <span style={{ flexShrink: 0, marginTop: 1 }}>💡</span>
+                      <span style={{ flex: 1 }}>
+                        For the clearest street context, try{' '}
+                        <strong>Streets + 3D Buildings</strong> — building walls define the road corridor.
+                      </span>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', flexShrink: 0 }}>
+                        <button
+                          className="btn streets-3d-hint__switch"
+                          onClick={() => { setBasemapStyle('streets'); setBuildings3DEnabled(true); }}
+                          style={{
+                            fontSize: '0.68rem', padding: '0.15rem 0.45rem',
+                            background: '#2c6fdb', color: '#fff', border: 'none',
+                            borderRadius: 4, cursor: 'pointer', fontWeight: 600,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >Switch</button>
+                        <button
+                          className="btn streets-3d-hint__dismiss"
+                          onClick={() => setStreets3DHintDismissed(true)}
+                          title="Dismiss"
+                          style={{
+                            fontSize: '0.68rem', padding: '0.15rem 0.45rem',
+                            background: 'transparent', color: '#6680b0', border: '1px solid #b6cef7',
+                            borderRadius: 4, cursor: 'pointer',
+                          }}
+                        >×</button>
+                      </div>
+                    </div>
+                  )}
+
                   <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: '0.5rem' }}>
                     {savedStreetSegments.map((f, idx) => {
                       const sel = selectedStreetSegmentIndex === idx;
