@@ -247,6 +247,41 @@ function explodeToLineStrings(feature) {
 
 }
 
+// Convert a raw Overpass JSON response into a mixed GeoJSON FeatureCollection.
+// Closed ways tagged with area:highway become Polygon features (featureType='road-area');
+// all other ways become LineString features (featureType='sidewalk').
+// Both types share the same source so one fetch populates both layers.
+function overpassToGeoJSON(data) {
+  const nodeIndex = {};
+  for (const el of data.elements) {
+    if (el.type === 'node') nodeIndex[el.id] = [el.lon, el.lat];
+  }
+  const features = [];
+  for (const el of data.elements) {
+    if (el.type !== 'way' || !el.nodes?.length) continue;
+    const coords = el.nodes.map(id => nodeIndex[id]).filter(Boolean);
+    if (coords.length < 2) continue;
+    const tags = el.tags || {};
+    const isClosed = coords.length >= 4 &&
+      coords[0][0] === coords[coords.length - 1][0] &&
+      coords[0][1] === coords[coords.length - 1][1];
+    if (tags['area:highway'] && isClosed) {
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Polygon', coordinates: [coords] },
+        properties: { osmId: el.id, featureType: 'road-area', ...tags },
+      });
+    } else {
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: coords },
+        properties: { osmId: el.id, featureType: 'sidewalk', ...tags },
+      });
+    }
+  }
+  return { type: 'FeatureCollection', features };
+}
+
 export default function App() {
   const map = useRef(null);
   // Use type to color mapping
@@ -305,6 +340,10 @@ export default function App() {
   const [buildings3DEnabled, setBuildings3DEnabled] = useState(false); // 3D building extrusion toggle
   const [terrainEnabled, setTerrainEnabled] = useState(false);         // terrain DEM extrusion (satellite)
   const [streets3DHintDismissed, setStreets3DHintDismissed] = useState(false); // one-per-session dismiss
+  const [osmSidewalksEnabled, setOsmSidewalksEnabled] = useState(false);
+  const [osmSidewalksFetching, setOsmSidewalksFetching] = useState(false);
+  const [osmSidewalksCount, setOsmSidewalksCount] = useState(null); // feature count from last successful fetch
+  const osmSidewalksBboxRef = useRef(null); // last successfully fetched snapped-bbox key
   // Editing an existing saved street segment geometry (declare early so downstream hooks can reference)
   const [editingStreetSegmentId, setEditingStreetSegmentId] = useState(null);
   // Live ref for editingStreetSegmentId to avoid stale closure inside map event handlers
@@ -1104,6 +1143,61 @@ export default function App() {
         }
       }
     }
+
+    // OSM sidewalk + road-area overlay (M5.6) — shared source, split by geometry type
+    if (!mapInstance.getSource('osm-sidewalks')) {
+      mapInstance.addSource('osm-sidewalks', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+    }
+    // Road-area fill: closed area:highway polygons — actual carriageway boundary from OSM.
+    // Rendered below the sidewalk line so the orange outline stays on top.
+    if (!mapInstance.getLayer('osm-road-areas-fill')) {
+      mapInstance.addLayer({
+        id: 'osm-road-areas-fill',
+        type: 'fill',
+        source: 'osm-sidewalks',
+        minzoom: 14,
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        layout: { visibility: 'none' },
+        paint: {
+          'fill-color': '#8a8078',   // muted asphalt tone
+          'fill-opacity': 0.35,
+        },
+      });
+    }
+    if (!mapInstance.getLayer('osm-road-areas-outline')) {
+      mapInstance.addLayer({
+        id: 'osm-road-areas-outline',
+        type: 'line',
+        source: 'osm-sidewalks',
+        minzoom: 14,
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        layout: { visibility: 'none', 'line-join': 'round' },
+        paint: {
+          'line-color': '#5a5048',
+          'line-width': 1.5,
+          'line-opacity': 0.7,
+        },
+      });
+    }
+    // Sidewalk lines — only LineString features from the shared source
+    if (!mapInstance.getLayer('osm-sidewalks-line')) {
+      mapInstance.addLayer({
+        id: 'osm-sidewalks-line',
+        type: 'line',
+        source: 'osm-sidewalks',
+        minzoom: 14,
+        filter: ['==', ['geometry-type'], 'LineString'],
+        layout: { visibility: 'none', 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#d4691e',   // burnt orange — distinct against beige 3D streets basemap
+          'line-width': ['interpolate', ['linear'], ['zoom'], 14, 2.5, 17, 6],
+          'line-opacity': 0.9,
+        },
+      });
+    }
   }
 
   // Update selected filters
@@ -1877,6 +1971,27 @@ export default function App() {
       ensureSourcesAndLayers(m);
       refreshMapData(m, drawnCoords, useType, savedZones);
       applySelectedFilter(m, selectedSavedIndex);
+
+      // Re-apply view toggle states — ensureSourcesAndLayers re-creates layers with
+      // visibility:'none', so we must restore the active state here after each style switch.
+      if (buildings3DEnabled) {
+        try { if (m.getLayer('buildings-3d')) m.setLayoutProperty('buildings-3d', 'visibility', 'visible'); } catch {}
+      }
+      if (osmSidewalksEnabled) {
+        ['osm-road-areas-fill', 'osm-road-areas-outline', 'osm-sidewalks-line'].forEach(id => {
+          try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', 'visible'); } catch {}
+        });
+        osmSidewalksBboxRef.current = null; // force re-fetch for the new style's viewport
+        fetchOsmSidewalks(m);
+      }
+      if (terrainEnabled) {
+        try {
+          if (!m.getSource('terrain-dem')) {
+            m.addSource('terrain-dem', { type: 'raster-dem', url: `https://api.maptiler.com/tiles/terrain-rgb-v2/tiles.json?key=${MAPTILER_KEY}`, tileSize: 256 });
+          }
+          m.setTerrain({ source: 'terrain-dem', exaggeration: 1.5 });
+        } catch {}
+      }
       // Keep street layers visible if actively editing a saved street segment even when tool auto-resets Off
       const visStreets = (activeTool === 'street' || editingStreetSegmentId) ? 'visible' : 'none';
       console.log('[style-switch] setting street layer visibility:', { 
@@ -2526,6 +2641,92 @@ export default function App() {
       m.once('styledata', applyTerrain);
     }
   }, [terrainEnabled, basemapStyle, buildings3DEnabled]);
+
+  // Fetch sidewalk LineStrings from the Overpass API for the current map viewport.
+  // Uses bbox grid-snapping (0.005° ≈ 550 m cells) so small pans reuse cached data instead
+  // of firing a new request. Falls back to a mirror endpoint if the primary is rate-limited.
+  // On any failure, keeps previous data intact so the map stays usable.
+  async function fetchOsmSidewalks(mapInstance) {
+    if (!mapInstance) return;
+    if (mapInstance.getZoom() < 14) return;
+
+    // Snap viewport to a 0.005° grid and add 0.003° padding so the fetched tile slightly
+    // exceeds the visible area — pans under ~500 m reuse the same snapped tile key.
+    const GRID = 0.005;
+    const PAD  = 0.003;
+    const b = mapInstance.getBounds();
+    const s = (Math.floor(b.getSouth() / GRID) * GRID - PAD).toFixed(4);
+    const w = (Math.floor(b.getWest()  / GRID) * GRID - PAD).toFixed(4);
+    const n = (Math.ceil (b.getNorth() / GRID) * GRID + PAD).toFixed(4);
+    const e = (Math.ceil (b.getEast()  / GRID) * GRID + PAD).toFixed(4);
+    const bboxKey = `${s},${w},${n},${e}`;
+    if (osmSidewalksBboxRef.current === bboxKey) return;
+
+    setOsmSidewalksFetching(true);
+    try {
+      // Sidewalk lines + road surface area polygons in one request.
+      // area:highway closed ways give the actual carriageway boundary from OSM.
+      const q = `[out:json][timeout:25];(way["footway"="sidewalk"](${s},${w},${n},${e});way["highway"="footway"](${s},${w},${n},${e});way["highway"="path"]["foot"!="no"]["access"!="private"](${s},${w},${n},${e});way["area:highway"](${s},${w},${n},${e}););out body;>;out skel qt;`;
+
+      // Try primary endpoint, fall back to mirror if rate-limited or unavailable
+      const ENDPOINTS = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+      ];
+      let json = null;
+      for (const url of ENDPOINTS) {
+        try {
+          const res = await fetch(`${url}?data=${encodeURIComponent(q)}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          json = await res.json();
+          break;
+        } catch (e) {
+          console.warn(`[osm-sidewalks] ${url} failed:`, e.message);
+        }
+      }
+      if (!json) throw new Error('all endpoints failed');
+
+      const fc = overpassToGeoJSON(json);
+      mapInstance.getSource('osm-sidewalks')?.setData(fc);
+      osmSidewalksBboxRef.current = bboxKey;
+      setOsmSidewalksCount(fc.features.length);
+      console.warn(`[osm-sidewalks] ${fc.features.length} features loaded`);
+    } catch (err) {
+      // Keep old data and count — don't blank the map for a transient API hiccup
+      console.warn('[osm-sidewalks] all endpoints failed, retaining old data:', err.message);
+    } finally {
+      setOsmSidewalksFetching(false);
+    }
+  }
+
+  // Show / hide OSM sidewalk layer and trigger initial fetch when toggle changes
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const vis = osmSidewalksEnabled ? 'visible' : 'none';
+    ['osm-road-areas-fill', 'osm-road-areas-outline', 'osm-sidewalks-line'].forEach(id => {
+      try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', vis); } catch {}
+    });
+    if (osmSidewalksEnabled) {
+      osmSidewalksBboxRef.current = null; // force re-fetch on every enable
+      if (m.isStyleLoaded()) fetchOsmSidewalks(m);
+      else m.once('styledata', () => fetchOsmSidewalks(m));
+    }
+  }, [osmSidewalksEnabled, basemapStyle]);
+
+  // Re-fetch after the user pans / zooms while the sidewalk layer is on.
+  // 1500 ms debounce + 4 s cooldown inside fetchOsmSidewalks keeps Overpass requests sparse.
+  useEffect(() => {
+    if (!map.current || !osmSidewalksEnabled) return;
+    const m = map.current;
+    let timer;
+    const onMoveEnd = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fetchOsmSidewalks(m), 1500);
+    };
+    m.on('moveend', onMoveEnd);
+    return () => { m.off('moveend', onMoveEnd); clearTimeout(timer); };
+  }, [osmSidewalksEnabled]);
 
   // Deselect saved zone/segment when user clicks on empty map area (neutral mode only)
   useEffect(() => {
@@ -4711,6 +4912,26 @@ export default function App() {
             marginTop: '0.35rem',
           }}
         >Terrain</button>
+        <button
+          id="osm-sidewalks-toggle"
+          className={`view-controls__btn btn ${osmSidewalksEnabled ? 'is-active' : ''}`}
+          onClick={() => setOsmSidewalksEnabled(v => !v)}
+          title={osmSidewalksEnabled ? 'Hide OSM sidewalks' : 'Show OSM sidewalks (zoom ≥ 14)'}
+          style={{
+            background: osmSidewalksEnabled ? '#a0522d' : '#ffffffd9',
+            backdropFilter: 'blur(4px)',
+            color: osmSidewalksEnabled ? '#fff' : '#222',
+            border: 'none',
+            padding: '0.35rem 0.75rem',
+            borderRadius: 6,
+            fontSize: '0.75rem',
+            fontWeight: 600,
+            cursor: 'pointer',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            marginTop: '0.35rem',
+            opacity: osmSidewalksFetching ? 0.65 : 1,
+          }}
+        >{osmSidewalksFetching ? 'Loading…' : osmSidewalksEnabled && osmSidewalksCount !== null ? `Sidewalks (${osmSidewalksCount})` : 'Sidewalks'}</button>
       </div>
 
   <div id="basemap-toggle" className="basemap-toggle" style={{ position:'absolute', left:'1rem', bottom:'1rem', zIndex:10, opacity: (streetCreationLock || polygonCreationLock) ? 0.5 : 1, pointerEvents: (streetCreationLock || polygonCreationLock) ? 'none':'auto' }}>
