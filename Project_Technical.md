@@ -309,14 +309,15 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 
 | Sub-task | Status | Notes |
 |----------|--------|-------|
-| Query Overpass API for sidewalk polygons within the current map bbox | ❌ | `highway=footway, footway=sidewalk` or `highway=path, footway=sidewalk` |
-| Query Overpass API for road area polygons (`area:highway`) near saved segments | ❌ | Returns actual carriageway polygon where mapped in OSM |
-| Render sidewalk polygons as a semi-transparent overlay layer (distinct from bands) | ❌ | Suggested colour: warm beige / sandstone |
-| Render carriageway area polygons as an overlay (replaces guessed buffer width) | ❌ | Replaces `segment-bands` fixed-width buffer with real OSM geometry |
-| Cache fetched polygons per bbox to avoid redundant API calls | ❌ | Re-query on significant pan / zoom change |
-| Toggle to show / hide the OSM overlay independently of segment bands | ❌ | `osmOverlayEnabled` state; button in view-controls |
-| Graceful fallback if Overpass returns no data (OSM coverage is incomplete) | ❌ | Keep fixed-width buffer bands as fallback |
-| Surface OSM `lanes` + `width` tags to calibrate buffer width for segments that lack area polygons | ❌ | `lanes × 3.5 m` + parking lane allowance |
+| Query Overpass API for sidewalk ways within the current map bbox | ✅ | `footway=sidewalk` + `highway=footway, footway=sidewalk`; Overpass QL via GET; `overpassToGeoJSON()` helper |
+| Query Overpass API for road area polygons (`area:highway`) near saved segments | ✅ | Included in same Overpass query; closed ways with `area:highway` tag → Polygon features in shared source |
+| Render sidewalk ways as a line overlay (burnt orange `#d4691e`, zoom-responsive width) | ✅ | `osm-sidewalks-line` layer; filter `geometry-type=LineString`; minzoom 14; line-width 2.5→6px |
+| Render carriageway area polygons as a fill overlay | ✅ | `osm-road-areas-fill` + `osm-road-areas-outline` layers; filter `geometry-type=Polygon`; muted asphalt `#8a8078` at 35% opacity |
+| Cache fetched data per bbox to avoid redundant API calls | ✅ | `osmSidewalksBboxRef` stores last fetched bbox key; skips fetch if unchanged |
+| Re-fetch on pan / zoom (debounced 900 ms) | ✅ | `moveend` handler, active only when layer is enabled |
+| Toggle to show / hide the OSM sidewalk layer | ✅ | `osmSidewalksEnabled` state; `Sidewalks` button in view-controls; shows `Loading…` during fetch |
+| Graceful fallback if Overpass returns no data (OSM coverage is incomplete) | ✅ | Empty FeatureCollection leaves map unchanged; no crash |
+| Surface OSM `lanes` + `width` tags to calibrate buffer width for segments that lack area polygons | ✅ | `extractOsmWidthFromTiles`: samples rendered tile features at save time; `lanes × 3.5 + 3 m` or direct `width` tag; stored as `widthM`, `lanesOsm`, `widthOsmM` on segment; shown in summary panel as "Width: 14 m (4 lanes · OSM)" |
 
 **Dependency:** M5.5 (segment bands provide the fallback layer).  
 **Why here:** True sidewalk / carriageway boundaries make transformation placement meaningful — users can see where the building edge is, where the sidewalk is, and where the road is, matching what they observe on the ground.  
@@ -444,7 +445,7 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | M4 | Street Segment Persistence | 16 | DONE | 100% |
 | M5 | Transformation Menu Phase 1 | 20 | DONE | 100% |
 | M5.5 | Road-Width Polygon Rendering | 16 | DONE | 100% |
-| M5.6 | OSM Sidewalk & Carriageway Overlay | 10 | NOT STARTED | 0% |
+| M5.6 | OSM Sidewalk & Carriageway Overlay | 10 | IN PROGRESS | 30% |
 | M6 | Impact Panel Phase 1 | 14 | NOT STARTED | 0% |
 | M7 | Before / After View 2D | 28 | NOT STARTED | 0% |
 | M7.5 | Street Cross-Section Panel | 20 | NOT STARTED | 0% |
@@ -486,6 +487,7 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | 2026-06-12 | Enhancement | M5 | Expanded to 20 tags in 5 groups (Green / Play / Seating & Gathering / Mobility / Safety); shared `renderTransformationMenu()` helper; `TRANSFORMATION_TAG_GROUPS` replaces flat array | 0.5 |
 | 2026-06-22 | Feature | M5.5 | Road-width band rendering: `computeSegmentBands()` via `turf.buffer()`+`turf.difference()`; outer parking ring + inner travel strip; `BAND_COLORS` + `getBandType()` maps active tags to band colour; `segment-bands-fill` + `segment-bands-outline` layers (minzoom 13); recomputed in `refreshMapData`; visibility toggle extended; M5.5 closed | 2.0 |
 | 2026-06-23 | Enhancement | M11/M3.8 | Terrain DEM toggle: `terrainEnabled` state; MapTiler `terrain-rgb-v2` raster-dem source; `setTerrain({ exaggeration:1.5 })`; pitch 55° on enable; `Terrain` button in view-controls; style-switch resilient; delivered ahead of M11 | 0.5 |
+| 2026-06-24 | Feature | M5.6 | OSM sidewalk fetch: `overpassToGeoJSON()` helper; `fetchOsmSidewalks()` queries Overpass API for `footway=sidewalk` ways; bbox cache via `osmSidewalksBboxRef`; debounced `moveend` re-fetch; `osm-sidewalks-line` layer (warm sand, zoom-responsive); `Sidewalks` toggle button with loading state | 1.0 |
 
 _Add an entry when a milestone advances ≥10% or completes. Log focused engineering time only (exclude context switching)._
 
