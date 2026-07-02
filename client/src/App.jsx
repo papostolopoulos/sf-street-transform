@@ -150,6 +150,40 @@ const TRANSFORMATION_TAG_GROUPS = [
 // Flat list derived from groups — used for any key-based lookups
 const TRANSFORMATION_TAGS = TRANSFORMATION_TAG_GROUPS.flatMap(g => g.tags);
 
+// --- M6: Impact metric computation -----------------------------------------
+
+// Tags that imply tree / planting presence in the transformed zone
+const TREE_TAGS = new Set(['trees', 'urban-orchard', 'community-garden', 'stormwater-planters', 'flower-meadow']);
+
+// Derive heuristic impact metrics from a saved Feature (Polygon or LineString).
+// Only computes metrics when the relevant transformation tag is active.
+// Returns { treeCount, treeCountBasis, ... } — any field absent when tag is off.
+function computeImpactMetrics(feature) {
+  if (!feature?.geometry) return {};
+  const tags = feature.properties?.tags || [];
+  const geomType = feature.geometry.type;
+  const metrics = {};
+
+  if (tags.some(t => TREE_TAGS.has(t))) {
+    try {
+      if (geomType === 'Polygon' || geomType === 'MultiPolygon') {
+        // Area-based: 1 tree per 15 m² of reclaimed street-level green space
+        const areaSqm = turf.area(feature);
+        metrics.treeCount = Math.max(1, Math.round(areaSqm / 15));
+        metrics.treeCountBasis = 'area';
+      } else if (geomType === 'LineString') {
+        // Linear planting: SF standard spacing ~8 m, both sides of the street
+        const lengthM = feature.properties?.lengthM
+          ?? turf.length(feature, { units: 'meters' });
+        metrics.treeCount = Math.max(1, Math.round(lengthM / 8) * 2);
+        metrics.treeCountBasis = 'length';
+      }
+    } catch {}
+  }
+
+  return metrics;
+}
+
 // --- M5.5: Road-width polygon rendering helpers ----------------------------
 
 // Fill colors keyed by band type — referenced in both the paint expression and band computation
@@ -4181,6 +4215,33 @@ export default function App() {
     );
   }
 
+  // Render the impact metrics panel below the transformation menu.
+  // Returns null when no metrics are active (no relevant tags selected).
+  function renderImpactPanel(metrics) {
+    if (!metrics || Object.keys(metrics).length === 0) return null;
+    return (
+      <div className="impact-panel" style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #eee' }}>
+        <h3 className="impact-panel__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: '0 0 0.5rem' }}>Estimated Impact</h3>
+        <div className="impact-panel__metrics" style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+          {metrics.treeCount != null && (
+            <div className="impact-panel__metric impact-panel__metric--trees" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span style={{ fontSize: '1.1rem', lineHeight: 1 }}>🌳</span>
+              <div>
+                <span style={{ fontWeight: 700, color: '#2d9e4f', fontSize: '1rem' }}>{metrics.treeCount}</span>
+                <span style={{ fontSize: '0.73rem', color: '#555', marginLeft: '0.3rem' }}>
+                  est. trees
+                  {metrics.treeCountBasis === 'length'
+                    ? ' · 8 m spacing, both sides'
+                    : ' · 1 per 15 m²'}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   // Add or remove a tag on the currently selected saved zone
   function toggleZoneTag(tagKey) {
     if (selectedSavedIndex == null) return;
@@ -5222,6 +5283,10 @@ export default function App() {
                     toggleZoneTag
                   )
                 }
+                {/* Impact panel — updates live as tags are toggled */}
+                {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
+                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]))
+                }
                 {(editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary; const startCoords = Array.isArray(ss.start) ? ss.start : [0,0]; const endCoords = Array.isArray(ss.end) ? ss.end : [0,0]; return (
                   <div className="summary-card__street">
                     <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {ss.name}</p>
@@ -5268,6 +5333,10 @@ export default function App() {
                         selectedStreetSegment?.properties?.tags || [],
                         toggleSegmentTag
                       )
+                    }
+                    {/* Impact panel — updates live as tags are toggled */}
+                    {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
+                      renderImpactPanel(computeImpactMetrics(selectedStreetSegment))
                     }
                     {editingStreetSegmentId && (
                       <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>

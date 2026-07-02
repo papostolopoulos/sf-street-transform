@@ -326,15 +326,15 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 ---
 
 ### M6 — Impact Panel (Phase 1)
-**Status: NOT STARTED | Est: 14 hrs | 0%**
+**Status: IN PROGRESS | Est: 14 hrs | 20%**
 
 | Sub-task | Status |
 |----------|--------|
-| Estimated tree count derived from zone area | ❌ |
+| Estimated tree count derived from zone area | ✅ | `computeImpactMetrics`: Polygon → area/15 m², LineString → length/8 × 2 sides; shown when any green tag active; `renderImpactPanel` updates live on tag toggle |
 | Area % calculation (of block / neighbourhood) | ❌ |
 | Speed calming indicator (heuristic) | ❌ |
-| Render impact metrics in sidebar Info Panel | ❌ |
-| Works for both polygon zones and street segments without crashes | ❌ |
+| Render impact metrics in sidebar Info Panel | ✅ | `impact-panel` section below transformation menu; appears for zones and street segments |
+| Works for both polygon zones and street segments without crashes | ✅ |
 
 **Dependency:** M5 (tags determine which metrics to compute).
 
