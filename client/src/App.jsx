@@ -449,6 +449,9 @@ export default function App() {
         description: selectedStreetSegment.properties?.description || null,
         useType: selectedStreetSegment.properties?.useType,
         lengthM: lenM,
+        widthM:    selectedStreetSegment.properties?.widthM    ?? null,
+        lanesOsm:  selectedStreetSegment.properties?.lanesOsm  ?? null,
+        widthOsmM: selectedStreetSegment.properties?.widthOsmM ?? null,
         start,
         end,
         streets: streetsNames
@@ -478,6 +481,9 @@ export default function App() {
         useType: feat.properties?.useType,
         lengthM: lenM,
         lengthFt: (lenM != null) ? lenM * 3.28084 : null,
+        widthM:    feat.properties?.widthM    ?? null,
+        lanesOsm:  feat.properties?.lanesOsm  ?? null,
+        widthOsmM: feat.properties?.widthOsmM ?? null,
         centroid,
         start,
         end,
@@ -784,6 +790,73 @@ export default function App() {
       }
     }
     return Array.from(names).sort((a,b)=>a.localeCompare(b));
+  }
+
+  // Sample rendered road tile features at evenly-spaced points along a segment and
+  // extract OSM lanes / width tags to calibrate the band-width computation.
+  // Returns { lanesOsm, widthOsmM, widthM } — any field may be null if not found in tiles.
+  function extractOsmWidthFromTiles(mapInstance, lineFeature) {
+    try {
+      const line = turf.lineString(lineFeature.geometry.coordinates);
+      const lenKm = turf.length(line, { units: 'kilometers' });
+      if (!lenKm) return {};
+
+      // Sample one point every ~15 m, capped at 7 samples total
+      const sampleCount = Math.max(2, Math.min(7, Math.ceil((lenKm * 1000) / 15)));
+      const samplePts = [];
+      for (let i = 0; i < sampleCount; i++) {
+        const d = lenKm * (i / (sampleCount - 1));
+        const pt = turf.along(line, d, { units: 'kilometers' });
+        samplePts.push(pt.geometry.coordinates);
+      }
+
+      const roadLayers = getRoadLayerIds(mapInstance);
+      if (!roadLayers.length) return {};
+
+      let maxLanes = null;
+      let widthOsmM = null;
+
+      for (const [lng, lat] of samplePts) {
+        const px = mapInstance.project([lng, lat]);
+        // 8 px search radius — tight enough to stay on the road being sampled
+        const feats = mapInstance.queryRenderedFeatures(
+          [[px.x - 8, px.y - 8], [px.x + 8, px.y + 8]],
+          { layers: roadLayers }
+        );
+        for (const f of feats) {
+          if (!isDrivableRoad(f.properties)) continue;
+          const p = f.properties;
+
+          // lanes: OpenMapTiles schema includes this as an integer at z12+
+          const lanes = parseInt(p.lanes ?? p.lane_count ?? '', 10);
+          if (!isNaN(lanes) && lanes > 0) {
+            maxLanes = Math.max(maxLanes ?? 0, lanes);
+          }
+
+          // width: OSM value in metres, stored as string "12" or "12 m"
+          const rawW = p.width ?? p.road_width;
+          if (rawW != null) {
+            const w = parseFloat(String(rawW).replace(/[^0-9.]/g, ''));
+            if (!isNaN(w) && w > 2) {
+              widthOsmM = widthOsmM == null ? w : Math.max(widthOsmM, w);
+            }
+          }
+        }
+      }
+
+      let widthM = null;
+      if (widthOsmM != null) {
+        widthM = widthOsmM;
+      } else if (maxLanes != null) {
+        // 3.5 m per lane + 3.0 m shared gutter/curb allowance on both sides
+        widthM = Math.round(maxLanes * 3.5 + 3.0);
+      }
+
+      return { lanesOsm: maxLanes ?? null, widthOsmM: widthOsmM ?? null, widthM };
+    } catch (e) {
+      console.warn('[extractOsmWidth] error:', e?.message);
+      return {};
+    }
   }
 
   // Ensure sources and layers exist after load/style switch
@@ -4241,13 +4314,19 @@ export default function App() {
       const lineFeature = turf.lineString(lineToSave.geometry.coordinates);
       streets = getStreetLineNames(m, lineFeature);
     } catch {}
+    // Enrich with OSM lanes/width from rendered tiles while the road is still in view
+    let osmWidth = {};
+    try { osmWidth = extractOsmWidthFromTiles(m, { type: 'Feature', geometry: lineToSave.geometry }); } catch {}
     const baseProps = {
       name: editingStreetSegmentId ? (editingStreetName.trim() || `Segment`) : (pendingStreetName.trim() || `Segment ${savedStreetSegments.length + 1}`),
       description: editingStreetSegmentId ? (editingStreetDescription.trim() || null) : null,
       useType,
       lengthM: lenM,
       streets,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      ...(osmWidth.widthM   != null && { widthM:    osmWidth.widthM }),
+      ...(osmWidth.lanesOsm != null && { lanesOsm:  osmWidth.lanesOsm }),
+      ...(osmWidth.widthOsmM != null && { widthOsmM: osmWidth.widthOsmM }),
     };
     try {
       console.log('[finalizeStreetSelection]', {
@@ -5144,6 +5223,18 @@ export default function App() {
                     <p style={{ marginBottom: '0.5rem' }}><strong>Type:</strong> {ss.useType}</p>
                     {ss.lengthM != null && (
                       <p style={{ marginBottom: '0.5rem' }}><strong>Length:</strong> {ss.lengthM.toFixed(1)} m{ss.lengthFt ? ` / ${ss.lengthFt.toFixed(1)} ft` : ''}</p>
+                    )}
+                    {ss.widthM != null && (
+                      <p className="summary-card__street-width" style={{ marginBottom: '0.5rem' }}>
+                        <strong>Width:</strong>{' '}
+                        {ss.widthM} m
+                        {ss.lanesOsm != null
+                          ? <span className="summary-card__street-width-source" style={{ fontSize:'0.75rem', color:'#666', marginLeft:'0.4rem' }}>({ss.lanesOsm} lanes · OSM)</span>
+                          : ss.widthOsmM != null
+                            ? <span className="summary-card__street-width-source" style={{ fontSize:'0.75rem', color:'#666', marginLeft:'0.4rem' }}>(OSM width tag)</span>
+                            : null
+                        }
+                      </p>
                     )}
                     {ss.centroid && (
                       <p style={{ marginBottom: '0.5rem' }}><strong>Centroid:</strong> {ss.centroid[0].toFixed(6)}, {ss.centroid[1].toFixed(6)}</p>

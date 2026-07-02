@@ -317,7 +317,7 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | Re-fetch on pan / zoom (debounced 900 ms) | ✅ | `moveend` handler, active only when layer is enabled |
 | Toggle to show / hide the OSM sidewalk layer | ✅ | `osmSidewalksEnabled` state; `Sidewalks` button in view-controls; shows `Loading…` during fetch |
 | Graceful fallback if Overpass returns no data (OSM coverage is incomplete) | ✅ | Empty FeatureCollection leaves map unchanged; no crash |
-| Surface OSM `lanes` + `width` tags to calibrate buffer width for segments that lack area polygons | ❌ | `lanes × 3.5 m` + parking lane allowance |
+| Surface OSM `lanes` + `width` tags to calibrate buffer width for segments that lack area polygons | ✅ | `extractOsmWidthFromTiles`: samples rendered tile features at save time; `lanes × 3.5 + 3 m` or direct `width` tag; stored as `widthM`, `lanesOsm`, `widthOsmM` on segment; shown in summary panel as "Width: 14 m (4 lanes · OSM)" |
 
 **Dependency:** M5.5 (segment bands provide the fallback layer).  
 **Why here:** True sidewalk / carriageway boundaries make transformation placement meaningful — users can see where the building edge is, where the sidewalk is, and where the road is, matching what they observe on the ground.  
