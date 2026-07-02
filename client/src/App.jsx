@@ -4247,11 +4247,17 @@ export default function App() {
     setEndPoint(null);
     setStreetPathLengthM(null);
     setPendingStreetName("");
-    // remove ephemeral map layers if present
+    // Clear ephemeral path so the master renderer removes the in-progress route line
+    setEphemeralStreetPath(null);
+    // Remove ephemeral map layers and sources
     if (map.current) {
       const m = map.current;
-      ['selected-road-segment-layer','start-end-points-layer'].forEach(l=>{ if (m.getLayer(l)) try{ m.removeLayer(l);}catch{} });
-      ['selected-road-segment','start-end-points'].forEach(s=>{ if (m.getSource(s)) try{ m.removeSource(s);}catch{} });
+      ['selected-road-segment-layer', 'street-endpoints-layer', 'edit-delta-layer'].forEach(l => {
+        if (m.getLayer(l)) try { m.removeLayer(l); } catch {}
+      });
+      ['selected-road-segment', 'street-endpoints', 'edit-delta'].forEach(s => {
+        if (m.getSource(s)) try { m.removeSource(s); } catch {}
+      });
     }
   }
   
