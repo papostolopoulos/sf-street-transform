@@ -3093,6 +3093,15 @@ export default function App() {
     }
   }, [drawMode]);
 
+  // Reset drawing tool to Off when a feature is selected so the tool panel
+  // always reflects the idle state while a segment or zone summary is shown.
+  // The activeTool effect below will also clear any in-progress polygon draw.
+  useEffect(() => {
+    if (selectedStreetSegmentIndex !== null || selectedSavedIndex !== null) {
+      setActiveTool('none');
+    }
+  }, [selectedStreetSegmentIndex, selectedSavedIndex]);
+
   // Keep drawMode in sync with active tool & clear when switching away
   useEffect(() => {
     const polygonSelected = activeTool === 'polygon';
