@@ -331,8 +331,8 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | Sub-task | Status |
 |----------|--------|
 | Estimated tree count derived from zone area | ✅ | `computeImpactMetrics`: Polygon → area/15 m², LineString → length/8 × 2 sides; shown when any green tag active; `renderImpactPanel` updates live on tag toggle |
-| Area % calculation (of block / neighbourhood) | ❌ |
-| Speed calming indicator (heuristic) | ❌ |
+| Area % calculation (of block / neighbourhood) | ✅ | Always shown; Polygon → `turf.area / 8500 m²`; LineString → `lengthM / 120 m`; displays m² for zones |
+| Speed calming indicator (heuristic) | ✅ | Additive score table (22 tags); levels: Low/Moderate/High/Very High/Car-Free; 5-segment bar; shown when any scored tag is active |
 | Render impact metrics in sidebar Info Panel | ✅ | `impact-panel` section below transformation menu; appears for zones and street segments |
 | Works for both polygon zones and street segments without crashes | ✅ |
 
