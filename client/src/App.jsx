@@ -2758,8 +2758,8 @@ export default function App() {
     const m = map.current;
 
     const onClickSaved = (e) => {
-      // Prevent selecting a different zone while editing geometry of another
-      if (editingSavedIndex != null) return;
+      // Block selection while any drawing tool is active or a zone is being edited
+      if (activeTool !== 'none' || editingSavedIndex != null) return;
       const f = e.features?.[0];
       if (!f) return;
       const idx = f.properties?.__sid;
@@ -2778,16 +2778,15 @@ export default function App() {
     return () => {
       m.off("click", "saved-zones-fill", onClickSaved);
     };
-  }, [savedZones, editingSavedIndex, basemapStyle]);
+  }, [savedZones, editingSavedIndex, activeTool, basemapStyle]);
 
   // Click on saved street segments to select & fly
   useEffect(() => {
     if (!map.current) return;
     const m = map.current;
     const handler = (e) => {
-      // Ignore while editing a different street geometry (editingStreetSegmentId) or in polygon draw mode
-      if (editingStreetSegmentId) return;
-      if (drawMode) return;
+      // Block selection while any drawing tool is active or a segment geometry is being edited
+      if (editingStreetSegmentId || activeTool !== 'none') return;
       const f = e.features?.[0];
       if (!f) return;
       const sid = f.properties?.__sid;
@@ -2820,7 +2819,7 @@ export default function App() {
       m.off('click', 'saved-street-segments-line', handler);
       m.off('click', 'saved-street-segments-casing', handler);
     };
-  }, [savedStreetSegments, editingStreetSegmentId, drawMode, basemapStyle]);
+  }, [savedStreetSegments, editingStreetSegmentId, activeTool, basemapStyle]);
 
   // Sync saved street segment layer visibility when the toggle changes or after a style switch
   useEffect(() => {
@@ -5868,9 +5867,9 @@ export default function App() {
                             }}
                           >
                             <button
-                              disabled={isEditingSaved || creationLock}
+                              disabled={isEditingSaved || creationLock || activeTool !== 'none'}
                               onClick={() => {
-                                if (isEditingSaved || creationLock) return;
+                                if (isEditingSaved || creationLock || activeTool !== 'none') return;
                                 if (selectedSavedIndex === idx) {
                                   setSelectedSavedIndex(null);
                                   applySelectedFilter(map.current, null);
@@ -5882,8 +5881,8 @@ export default function App() {
                                 }
                               }}
                               className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
-                              title={isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
-                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: (isEditingSaved || creationLock) ? 0.6 : 1, cursor: (isEditingSaved || creationLock) ? 'not-allowed':'pointer' }}
+                              title={activeTool !== 'none' ? 'Switch drawing tool to Off first' : isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
+                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: (isEditingSaved || creationLock || activeTool !== 'none') ? 0.6 : 1, cursor: (isEditingSaved || creationLock || activeTool !== 'none') ? 'not-allowed':'pointer' }}
                             >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
 
                             <button
@@ -5973,8 +5972,8 @@ export default function App() {
                       const segId = f.properties?.id;
                       const editingThis = editingStreetSegmentId && editingStreetSegmentId === segId;
                       const editingActive = !!editingStreetSegmentId || editingSavedIndex != null; // any geometry edit in progress
-                      // Disable interactions with saved segments while a new unsaved geometry (street or polygon) is being created
-                      const savedActionsLocked = creationLock || (editingActive && !editingThis);
+                      // Disable Select while drawing tool is active or a geometry edit is in progress
+                      const savedActionsLocked = creationLock || (editingActive && !editingThis) || activeTool !== 'none';
                       const anyEditLock = editingActive || creationLock; // unified lock for edit buttons
                       return (
                         <li key={idx} className={`list-item street-item ${sel ? 'is-selected' : ''}`} style={{
@@ -6027,6 +6026,7 @@ export default function App() {
                                   }
                                 }}
                                 className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
+                                title={activeTool !== 'none' ? 'Switch drawing tool to Off first' : undefined}
                                   style={{...(sel ? buttonVariants.success : buttonVariants.info), opacity: savedActionsLocked ? 0.5 : 1, cursor: savedActionsLocked ? 'not-allowed':'pointer'}}
                               >{sel ? 'Deselect' : 'Select'}</button>
                               <button
