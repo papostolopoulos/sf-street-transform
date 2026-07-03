@@ -5383,16 +5383,16 @@ export default function App() {
                     <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
                   </div>
                 )}
+                {/* Impact panel above transformation menu so it stays visible regardless of menu length */}
+                {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
+                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]))
+                }
                 {/* Transformation menu — shown on saved zone selection, hidden during draw/edit flows */}
                 {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
                   renderTransformationMenu(
                     savedZones[selectedSavedIndex]?.properties?.tags || [],
                     toggleZoneTag
                   )
-                }
-                {/* Impact panel — updates live as tags are toggled */}
-                {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
-                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]))
                 }
                 {(editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary; const startCoords = Array.isArray(ss.start) ? ss.start : [0,0]; const endCoords = Array.isArray(ss.end) ? ss.end : [0,0]; return (
                   <div className="summary-card__street">
@@ -5434,16 +5434,16 @@ export default function App() {
                     {editingStreetSegmentSummary && (
                       <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
                     )}
+                    {/* Impact panel above transformation menu so it stays in view */}
+                    {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
+                      renderImpactPanel(computeImpactMetrics(selectedStreetSegment))
+                    }
                     {/* Transformation menu — shown on saved segment selection, hidden during geometry edit */}
                     {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
                       renderTransformationMenu(
                         selectedStreetSegment?.properties?.tags || [],
                         toggleSegmentTag
                       )
-                    }
-                    {/* Impact panel — updates live as tags are toggled */}
-                    {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
-                      renderImpactPanel(computeImpactMetrics(selectedStreetSegment))
                     }
                     {editingStreetSegmentId && (
                       <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>
