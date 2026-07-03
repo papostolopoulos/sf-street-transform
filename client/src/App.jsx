@@ -437,7 +437,10 @@ export default function App() {
   const [buildings3DEnabled, setBuildings3DEnabled] = useState(false); // 3D building extrusion toggle
   const [terrainEnabled, setTerrainEnabled] = useState(false);         // terrain DEM extrusion (satellite)
   const [streets3DHintDismissed, setStreets3DHintDismissed] = useState(false); // one-per-session dismiss
-  const [viewMode, setViewMode] = useState('after'); // M7: 'before' | 'after' — controls band layer visibility
+  const [viewMode, setViewMode] = useState('after'); // M7: 'before' | 'after' | 'split'
+  const mapBefore = useRef(null);           // M7: second MapLibre instance for split before-view
+  const mapBeforeContainerRef = useRef(null); // container div for the before map
+  const [splitPos, setSplitPos] = useState(0.5); // M7: 0–1 left-to-right divider position
   const [osmSidewalksEnabled, setOsmSidewalksEnabled] = useState(false);
   const [osmSidewalksFetching, setOsmSidewalksFetching] = useState(false);
   const [osmSidewalksCount, setOsmSidewalksCount] = useState(null); // feature count from last successful fetch
@@ -743,6 +746,23 @@ export default function App() {
   };
 
   // --- helpers ----------------------------------------------------
+
+  // M7: Initiate pointer drag on the split-view divider handle
+  function startSplitDrag(e) {
+    e.preventDefault();
+    const container = mapContainer.current;
+    if (!container) return;
+    function onMove(ev) {
+      const rect = container.getBoundingClientRect();
+      setSplitPos(Math.max(0.05, Math.min(0.95, (ev.clientX - rect.left) / rect.width)));
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
 
   function convertToSquareFeet(squareMeters) {
     return squareMeters * 10.7639;
@@ -2928,6 +2948,86 @@ export default function App() {
     });
   }, [viewMode, basemapStyle]);
 
+  // M7: Create / destroy the split-view "before" MapLibre instance.
+  // Only active when viewMode === 'split'; re-creates on basemap style change.
+  useEffect(() => {
+    const mainMap = map.current;
+    if (viewMode !== 'split' || !mainMap || !mapBeforeContainerRef.current) return;
+    if (mapBefore.current) return; // already running
+
+    const before = new maplibregl.Map({
+      container: mapBeforeContainerRef.current,
+      style: maptilerStyles[basemapStyle],
+      center: mainMap.getCenter(),
+      zoom: mainMap.getZoom(),
+      bearing: mainMap.getBearing(),
+      pitch: mainMap.getPitch(),
+      interactive: false,
+      attributionControl: false,
+    });
+    mapBefore.current = before;
+
+    before.on('load', () => {
+      // Neutral band source + layers — same palette as BAND_COLORS.travel / parking
+      before.addSource('split-bands', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      before.addLayer({
+        id: 'split-bands-fill', type: 'fill', source: 'split-bands', minzoom: 13,
+        paint: {
+          'fill-color': ['match', ['get', 'bandType'], 'travel', BAND_COLORS.travel, BAND_COLORS.parking],
+          'fill-opacity': 0.88,
+        }
+      });
+      before.addLayer({
+        id: 'split-bands-outline', type: 'line', source: 'split-bands', minzoom: 13,
+        paint: { 'line-color': '#6b5e54', 'line-width': 0.5, 'line-opacity': 0.45 }
+      });
+      // Populate with neutral band polygons for all visible saved segments
+      const segs = (savedStreetSegments || []).filter(f => {
+        const fid = f?.properties?.id || f?.id;
+        return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+      });
+      before.getSource('split-bands')?.setData({
+        type: 'FeatureCollection',
+        features: segs.flatMap(f => computeSegmentBandsNeutral(f)),
+      });
+    });
+
+    // Keep before map in sync with main map pan / zoom / rotate
+    function onMainMove() {
+      if (!mapBefore.current || !map.current) return;
+      mapBefore.current.jumpTo({
+        center: map.current.getCenter(),
+        zoom: map.current.getZoom(),
+        bearing: map.current.getBearing(),
+        pitch: map.current.getPitch(),
+      });
+    }
+    mainMap.on('move', onMainMove);
+
+    return () => {
+      mainMap.off('move', onMainMove);
+      if (mapBefore.current) {
+        mapBefore.current.remove();
+        mapBefore.current = null;
+      }
+    };
+  }, [viewMode, basemapStyle]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // M7: Re-push neutral band data to the before map whenever segments change during split mode
+  useEffect(() => {
+    if (!mapBefore.current || viewMode !== 'split') return;
+    const before = mapBefore.current;
+    if (!before.isStyleLoaded()) return;
+    const segs = (savedStreetSegments || []).filter(f => {
+      const fid = f?.properties?.id || f?.id;
+      return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+    });
+    before.getSource('split-bands')?.setData({
+      type: 'FeatureCollection',
+      features: segs.flatMap(f => computeSegmentBandsNeutral(f)),
+    });
+  }, [savedStreetSegments, editingStreetSegmentId, viewMode]);
+
   // Show / hide OSM sidewalk layer and trigger initial fetch when toggle changes
   useEffect(() => {
     if (!map.current) return;
@@ -4305,7 +4405,8 @@ export default function App() {
     return (
       <div className="transformation-menu" style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #eee' }}>
         <h3 className="transformation-menu__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: '0 0 0.6rem' }}>Transformations</h3>
-        <div className="transformation-menu__groups" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+        {/* max-height keeps this list from pushing impact panel off-screen; user scrolls within this box */}
+        <div className="transformation-menu__groups" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', maxHeight: '220px', overflowY: 'auto', paddingRight: '0.3rem' }}>
           {TRANSFORMATION_TAG_GROUPS.map(grp => (
             <div key={grp.group} className="transformation-menu__group">
               <div className="transformation-menu__group-label" style={{ fontSize: '0.65rem', fontWeight: 700, color: '#999', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>{grp.group}</div>
@@ -4337,19 +4438,46 @@ export default function App() {
     );
   }
 
-  // Render the impact metrics panel below the transformation menu.
+  // Render the impact metrics panel.
   // blockCoverPct always shows; treeCount and speedCalming appear only when relevant tags are on.
-  function renderImpactPanel(metrics) {
+  // showToggle: embed the Before/After view toggle in the panel title row (street segments with tags).
+  function renderImpactPanel(metrics, showToggle = false) {
     if (!metrics) return null;
     const hasAny = metrics.blockCoverPct != null || metrics.treeCount != null || metrics.speedCalming != null;
-    if (!hasAny) return null;
+    if (!hasAny && !showToggle) return null;
 
     const CALMING_COLOR = { 'Car-Free': '#00897b', 'Very High': '#2e7d32', High: '#558b2f', Moderate: '#f57f17', Low: '#e65100' };
     const CALMING_STEPS = ['Low', 'Moderate', 'High', 'Very High', 'Car-Free'];
 
     return (
       <div className="impact-panel" style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #eee' }}>
-        <h3 className="impact-panel__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: '0 0 0.6rem' }}>Estimated Impact</h3>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.6rem' }}>
+          <h3 className="impact-panel__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: 0 }}>Estimated Impact</h3>
+          {/* Before / Split / After view toggle — sits here so it's never scrolled off-screen */}
+          {showToggle && (
+            <div className="before-after-toggle" style={{ display: 'flex', borderRadius: 6, overflow: 'hidden', border: '1px solid #ccc', fontSize: '0.72rem' }}>
+              {[
+                { key: 'before', label: 'Before' },
+                { key: 'split',  label: '⇔' },
+                { key: 'after',  label: 'After' },
+              ].map(({ key, label }) => (
+                <button
+                  key={key}
+                  className={`before-after-toggle__btn${viewMode === key ? ' is-active' : ''}`}
+                  title={key === 'split' ? 'Split view — drag divider on map' : key.charAt(0).toUpperCase() + key.slice(1)}
+                  onClick={() => setViewMode(key)}
+                  style={{
+                    padding: '0.2rem 0.55rem', border: 'none', cursor: 'pointer',
+                    background: viewMode === key ? '#1976d2' : '#fff',
+                    color:      viewMode === key ? '#fff'    : '#444',
+                    fontWeight: viewMode === key ? 600 : 400,
+                    textTransform: 'capitalize', transition: 'all 0.15s',
+                  }}
+                >{label}</button>
+              ))}
+            </div>
+          )}
+        </div>
         <div className="impact-panel__metrics" style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
 
           {/* Block coverage % */}
@@ -5152,6 +5280,57 @@ export default function App() {
         style={{ position: "absolute", inset: 0, zIndex: 0 }}
       />
 
+      {/* M7: Before-view container for split mode — clipped to the left of the divider */}
+      <div
+        ref={mapBeforeContainerRef}
+        className="split-view__before-map"
+        style={{
+          position: 'absolute', inset: 0, zIndex: 1,
+          pointerEvents: 'none',
+          visibility: viewMode === 'split' ? 'visible' : 'hidden',
+          clipPath: viewMode === 'split' ? `inset(0 calc(${(1 - splitPos) * 100}%) 0 0)` : 'none',
+        }}
+      />
+
+      {/* M7: Draggable divider handle for split mode */}
+      {viewMode === 'split' && (
+        <div className="split-view__handle" style={{
+          position: 'absolute', top: 0, bottom: 0, zIndex: 5,
+          left: `calc(${splitPos * 100}% - 20px)`,
+          width: 40, display: 'flex', flexDirection: 'column', alignItems: 'center',
+          cursor: 'col-resize',
+          pointerEvents: 'auto',
+        }} onPointerDown={startSplitDrag}>
+          {/* vertical rule */}
+          <div className="split-view__rule" style={{
+            position: 'absolute', top: 0, bottom: 0, left: '50%',
+            width: 2, background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.5)',
+          }} />
+          {/* grip knob */}
+          <div className="split-view__knob" style={{
+            position: 'absolute', top: '50%', left: '50%',
+            transform: 'translate(-50%, -50%)',
+            width: 36, height: 36, borderRadius: '50%',
+            background: '#fff', boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: '0.85rem', color: '#444', userSelect: 'none',
+          }}>⇔</div>
+          {/* BEFORE / AFTER labels */}
+          <div className="split-view__label split-view__label--before" style={{
+            position: 'absolute', top: 12, right: 'calc(50% + 8px)',
+            background: 'rgba(0,0,0,0.55)', color: '#fff',
+            fontSize: '0.7rem', fontWeight: 700, letterSpacing: '0.05em',
+            padding: '0.15rem 0.4rem', borderRadius: 4, whiteSpace: 'nowrap',
+          }}>BEFORE</div>
+          <div className="split-view__label split-view__label--after" style={{
+            position: 'absolute', top: 12, left: 'calc(50% + 8px)',
+            background: 'rgba(0,0,0,0.55)', color: '#fff',
+            fontSize: '0.7rem', fontWeight: 700, letterSpacing: '0.05em',
+            padding: '0.15rem 0.4rem', borderRadius: 4, whiteSpace: 'nowrap',
+          }}>AFTER</div>
+        </div>
+      )}
+
       <div id="tool-panel" className="tool-panel" style={controlPanelStyle}>
         {/* Tool mode selector — Off / Polygon / Street */}
         <div className="tool-panel__label" style={labelStyle}>Drawing tool</div>
@@ -5440,26 +5619,6 @@ export default function App() {
                     {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
                   </h2>
                   <div style={{ display:'flex', gap:'0.4rem', alignItems:'center' }}>
-                    {/* Before/After toggle — only shown when a segment with tags is selected */}
-                    {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
-                      (selectedStreetSegment?.properties?.tags?.length > 0) && (
-                      <div className="before-after-toggle" style={{ display:'flex', borderRadius:6, overflow:'hidden', border:'1px solid #ccc', fontSize:'0.72rem' }}>
-                        {['before','after'].map(mode => (
-                          <button
-                            key={mode}
-                            className={`before-after-toggle__btn${viewMode === mode ? ' is-active' : ''}`}
-                            onClick={() => setViewMode(mode)}
-                            style={{
-                              padding:'0.2rem 0.55rem', border:'none', cursor:'pointer',
-                              background: viewMode === mode ? '#1976d2' : '#fff',
-                              color:      viewMode === mode ? '#fff'     : '#444',
-                              fontWeight: viewMode === mode ? 600 : 400,
-                              textTransform:'capitalize', transition:'all 0.15s',
-                            }}
-                          >{mode}</button>
-                        ))}
-                      </div>
-                    )}
                     {(zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && !polygonCreationLock && !(showSavePanel && polygonActive && editingSavedIndex == null) && !(showSavePanel && polygonActive && editingSavedIndex != null) && !editingStreetSegmentId && (
                       <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
                     )}
@@ -5525,9 +5684,12 @@ export default function App() {
                     {editingStreetSegmentSummary && (
                       <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
                     )}
-                    {/* Impact panel above transformation menu so it stays in view */}
+                    {/* Impact panel contains Before/After toggle so both stay above the scrollable tag list */}
                     {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
-                      renderImpactPanel(computeImpactMetrics(selectedStreetSegment))
+                      renderImpactPanel(
+                        computeImpactMetrics(selectedStreetSegment),
+                        (selectedStreetSegment?.properties?.tags?.length ?? 0) > 0
+                      )
                     }
                     {/* Transformation menu — shown on saved segment selection, hidden during geometry edit */}
                     {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
