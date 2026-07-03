@@ -5980,20 +5980,50 @@ export default function App() {
                       const sel = selectedStreetSegmentIndex === idx;
                       const segId = f.properties?.id;
                       const editingThis = editingStreetSegmentId && editingStreetSegmentId === segId;
-                      const editingActive = !!editingStreetSegmentId || editingSavedIndex != null; // any geometry edit in progress
-                      // Disable Select while drawing tool is active or a geometry edit is in progress
-                      const savedActionsLocked = creationLock || (editingActive && !editingThis) || activeTool !== 'none';
-                      const anyEditLock = editingActive || creationLock; // unified lock for edit buttons
+                      const editingActive = !!editingStreetSegmentId || editingSavedIndex != null;
+                      // Item click is blocked while drawing, creating, or editing a different segment
+                      const itemLocked = creationLock || (editingActive && !editingThis) || activeTool !== 'none';
+                      const anyEditLock = editingActive || creationLock;
+
+                      function handleItemClick() {
+                        if (itemLocked) return;
+                        if (sel) {
+                          // Click selected item again to deselect
+                          setSelectedStreetSegmentIndex(null);
+                          try { map.current?.setFilter('saved-street-segments-selected', null); } catch {}
+                        } else {
+                          setSelectedStreetSegmentIndex(idx);
+                          setSelectedSavedIndex(null);
+                          if (map.current) {
+                            const m = map.current;
+                            try { m.setFilter('saved-street-segments-selected', ['==', ['get', '__sid'], idx]); } catch {}
+                            try {
+                              const bb = turf.bbox(f);
+                              m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                            } catch {}
+                          }
+                          setSidebarVisible(true);
+                        }
+                      }
+
                       return (
-                        <li key={idx} className={`list-item street-item ${sel ? 'is-selected' : ''}`} style={{
-                          background: '#fff',
-                          border: '1px solid #e2e2e2',
-                          borderRadius: 8,
-                          padding: '0.55rem',
-                          display: 'grid',
-                          gap: '0.35rem',
-                          ...(sel ? selectedCardStyle : {})
-                        }}>
+                        <li
+                          key={idx}
+                          className={`list-item street-item ${sel ? 'is-selected' : ''}`}
+                          onClick={handleItemClick}
+                          title={itemLocked && !sel ? 'Switch drawing tool to Off first' : undefined}
+                          style={{
+                            background: '#fff',
+                            border: '1px solid #e2e2e2',
+                            borderRadius: 8,
+                            padding: '0.55rem',
+                            display: 'grid',
+                            gap: '0.35rem',
+                            cursor: itemLocked ? 'default' : 'pointer',
+                            opacity: itemLocked && !sel ? 0.65 : 1,
+                            ...(sel ? selectedCardStyle : {}),
+                          }}
+                        >
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                             <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
                               <span>{f.properties?.name || `Segment ${idx + 1}`}</span>
@@ -6003,76 +6033,39 @@ export default function App() {
                           </div>
                           <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
 
-                          {/* Removed per-street inline type select (editing block now owns type changes) */}
-                          {/* Hide all action buttons while any street segment is in edit mode; prevent duplicate save/cancel */}
-                          {(editingStreetSegmentId || uiLock) ? (
-                            editingThis ? (
-                              <div style={{ fontSize:'0.65rem', color:'#555' }}>Editing form shown above.</div>
-                            ) : null
-                          ) : (
-                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                          {/* Edit geometry + Delete — only visible when this item is selected */}
+                          {sel && !editingStreetSegmentId && !uiLock && (
+                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', marginTop: '0.1rem' }}
+                              onClick={e => e.stopPropagation()}>
                               <button
-                                disabled={savedActionsLocked}
+                                className='btn btn--edit'
                                 onClick={() => {
-                                  if (savedActionsLocked) return;
-                                  if (sel) {
-                                    setSelectedStreetSegmentIndex(null);
-                                    if (map.current) {
-                                      try { map.current.setFilter('saved-street-segments-selected', null); } catch {}
-                                    }
-                                  } else {
-                                    setSelectedStreetSegmentIndex(idx);
-                                    setSelectedSavedIndex(null);
-                                    if (map.current) {
-                                      const m = map.current;
-                                      const filt = ['==',['get','__sid'], idx];
-                                      try { m.setFilter('saved-street-segments-selected', filt); } catch {}
-                                      try {
-                                        const bb = turf.bbox(f);
-                                        m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
-                                      } catch {}
-                                    }
+                                  // Enter street geometry edit mode; useEffect seeds start/end from saved feature
+                                  setActiveTool('street');
+                                  setEditingStreetSegmentId(segId);
+                                  if (map.current) {
+                                    try {
+                                      const bb = turf.bbox(f);
+                                      map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                    } catch {}
                                   }
                                 }}
-                                className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
-                                title={activeTool !== 'none' ? 'Switch drawing tool to Off first' : undefined}
-                                  style={{...(sel ? buttonVariants.success : buttonVariants.info), opacity: savedActionsLocked ? 0.5 : 1, cursor: savedActionsLocked ? 'not-allowed':'pointer'}}
-                              >{sel ? 'Deselect' : 'Select'}</button>
-                              <button
-                                title='Edit geometry'
-                                disabled={anyEditLock}
-                                onClick={() => {
-                                  if (anyEditLock) return;
-                                  try {
-                                    // Enter street geometry edit mode using the freshest saved geometry.
-                                    // Do NOT seed endpoints from this captured list item; let the
-                                    // useEffect([editingStreetSegmentId]) locate the feature by id
-                                    // in the latest savedStreetSegments and seed start/end + refs there.
-                                    setActiveTool('street');
-                                    setEditingStreetSegmentId(segId);
-                                    if (map.current) {
-                                      try {
-                                        const bb = turf.bbox(f);
-                                        map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
-                                      } catch {}
-                                    }
-                                  } catch {}
-                                }}
-                                className='btn btn--edit'
-                                style={{...buttonVariants.muted, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
+                                style={buttonVariants.muted}
                               >Edit geometry</button>
                               <button
-                                disabled={anyEditLock}
+                                className="btn btn--delete"
                                 onClick={() => {
-                                  if (anyEditLock) return;
                                   setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
-                                  if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
+                                  setSelectedStreetSegmentIndex(null);
                                   if (editingStreetSegmentId === segId) clearEditingStreetSegment('deleteSavedSegment');
                                 }}
-                                className="btn btn--delete"
-                                style={{...buttonVariants.danger, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
+                                style={buttonVariants.danger}
                               >Delete</button>
                             </div>
+                          )}
+                          {/* Inline note when this segment's geometry edit form is active above */}
+                          {editingThis && (
+                            <div style={{ fontSize:'0.65rem', color:'#555' }}>Editing form shown above.</div>
                           )}
                         </li>
                       );
