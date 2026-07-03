@@ -341,12 +341,12 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 ---
 
 ### M7 — Before / After View (2D)
-**Status: NOT STARTED | Est: 28 hrs | 0%**
+**Status: IN PROGRESS | Est: 28 hrs | 20%**
 
 | Sub-task | Status |
 |----------|--------|
-| "Before" state 2D street rendering | ❌ |
-| "After" (transformed) state 2D street rendering | ❌ |
+| "Before" state 2D street rendering | ✅ | `computeSegmentBandsNeutral` (tags=[]) → `segment-bands-before` source + fill/outline layers; `viewMode` state ('before'\|'after'); Before/After pill toggle in summary header; useEffect swaps layer visibility; resets on deselect |
+| "After" (transformed) state 2D street rendering | ✅ | Existing `segment-bands` source (M5.5); After is the default view |
 | Drag slider to compare Before vs After | ❌ |
 | Stylistic overlay for transformed state | ❌ |
 | Acceptable render performance | ❌ |

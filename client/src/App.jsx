@@ -315,6 +315,15 @@ function computeSegmentBands(feature) {
   }
 }
 
+// Compute bands with no transformation tags applied — the "Before" state.
+// Identical geometry to computeSegmentBands but always returns neutral parking/travel colors.
+function computeSegmentBandsNeutral(feature) {
+  return computeSegmentBands({
+    ...feature,
+    properties: { ...feature.properties, tags: [] },
+  });
+}
+
 function explodeToLineStrings(feature) {
 
   if (!feature) return [];
@@ -428,6 +437,7 @@ export default function App() {
   const [buildings3DEnabled, setBuildings3DEnabled] = useState(false); // 3D building extrusion toggle
   const [terrainEnabled, setTerrainEnabled] = useState(false);         // terrain DEM extrusion (satellite)
   const [streets3DHintDismissed, setStreets3DHintDismissed] = useState(false); // one-per-session dismiss
+  const [viewMode, setViewMode] = useState('after'); // M7: 'before' | 'after' — controls band layer visibility
   const [osmSidewalksEnabled, setOsmSidewalksEnabled] = useState(false);
   const [osmSidewalksFetching, setOsmSidewalksFetching] = useState(false);
   const [osmSidewalksCount, setOsmSidewalksCount] = useState(null); // feature count from last successful fetch
@@ -1228,6 +1238,46 @@ export default function App() {
       });
     }
 
+    // M7: "Before" state bands — same geometry as segment-bands but locked to neutral colors.
+    // Hidden when viewMode === 'after'; visible when viewMode === 'before'.
+    if (!mapInstance.getSource('segment-bands-before')) {
+      mapInstance.addSource('segment-bands-before', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('segment-bands-before-fill')) {
+      mapInstance.addLayer({
+        id: 'segment-bands-before-fill',
+        type: 'fill',
+        source: 'segment-bands-before',
+        minzoom: 13,
+        layout: { visibility: 'none' },
+        paint: {
+          'fill-color': [
+            'match', ['get', 'bandType'],
+            'travel',  BAND_COLORS.travel,
+            BAND_COLORS.parking   // outer ring always neutral
+          ],
+          'fill-opacity': 0.88
+        }
+      });
+    }
+    if (!mapInstance.getLayer('segment-bands-before-outline')) {
+      mapInstance.addLayer({
+        id: 'segment-bands-before-outline',
+        type: 'line',
+        source: 'segment-bands-before',
+        minzoom: 13,
+        layout: { visibility: 'none' },
+        paint: {
+          'line-color': '#6b5e54',
+          'line-width': 0.5,
+          'line-opacity': 0.45
+        }
+      });
+    }
+
     // Saved street segments
     if (!mapInstance.getSource('saved-street-segments')) {
       mapInstance.addSource('saved-street-segments', {
@@ -1482,19 +1532,22 @@ export default function App() {
       try { mapInstance.setFilter('saved-street-segments-selected', filt); } catch {}
     }
 
-    // Recompute band polygons for all visible saved segments (M5.5)
+    // Recompute "after" band polygons (tag-colored) and "before" bands (neutral) for all segments
+    const visibleSegments = (savedStreetSegments || []).filter(f => {
+      const fid = f?.properties?.id || f?.id;
+      return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+    });
     const bandsFC = {
       type: 'FeatureCollection',
-      features: (savedStreetSegments || [])
-        .filter(f => {
-          const fid = f?.properties?.id || f?.id;
-          return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
-        })
-        .flatMap(f => computeSegmentBands(f))
+      features: visibleSegments.flatMap(f => computeSegmentBands(f))
     };
-    // Source may not exist yet if the map hasn't loaded; ensureSourcesAndLayers + refreshMapData
-    // are called together in the load/styledata handlers, so the next call will populate it.
+    const bandsBeforeFC = {
+      type: 'FeatureCollection',
+      features: visibleSegments.flatMap(f => computeSegmentBandsNeutral(f))
+    };
+    // Sources may not exist yet on first load; ensureSourcesAndLayers runs first in the chain.
     mapInstance.getSource('segment-bands')?.setData(bandsFC);
+    mapInstance.getSource('segment-bands-before')?.setData(bandsBeforeFC);
   }
 
   // Build a zone summary from any Feature<Polygon>
@@ -2859,6 +2912,21 @@ export default function App() {
       setOsmSidewalksFetching(false);
     }
   }
+
+  // M7: Swap segment-bands visibility between "before" (neutral) and "after" (tag-colored)
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const isBefore = viewMode === 'before';
+    [
+      ['segment-bands-fill',         !isBefore],
+      ['segment-bands-outline',      !isBefore],
+      ['segment-bands-before-fill',   isBefore],
+      ['segment-bands-before-outline',isBefore],
+    ].forEach(([id, visible]) => {
+      try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none'); } catch {}
+    });
+  }, [viewMode, basemapStyle]);
 
   // Show / hide OSM sidewalk layer and trigger initial fetch when toggle changes
   useEffect(() => {
@@ -4409,6 +4477,7 @@ export default function App() {
     setEditingSavedIndex(null);
     setEditingStreetSegmentId(null);
     setZoneSummary(null);
+    setViewMode('after'); // reset to After view so the next selection starts fresh
     // streetSegmentSummary & ephemeralStreetPathSummary are derived via useMemo, so clearing source state is enough
     setDrawMode(null);
     setStartPoint(null);
@@ -5370,9 +5439,31 @@ export default function App() {
                   <h2 style={{ fontSize: '1.2rem', margin:0 }}>
                     {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
                   </h2>
-                  {(zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && !polygonCreationLock && !(showSavePanel && polygonActive && editingSavedIndex == null) && !(showSavePanel && polygonActive && editingSavedIndex != null) && !editingStreetSegmentId && (
-                    <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
-                  )}
+                  <div style={{ display:'flex', gap:'0.4rem', alignItems:'center' }}>
+                    {/* Before/After toggle — only shown when a segment with tags is selected */}
+                    {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
+                      (selectedStreetSegment?.properties?.tags?.length > 0) && (
+                      <div className="before-after-toggle" style={{ display:'flex', borderRadius:6, overflow:'hidden', border:'1px solid #ccc', fontSize:'0.72rem' }}>
+                        {['before','after'].map(mode => (
+                          <button
+                            key={mode}
+                            className={`before-after-toggle__btn${viewMode === mode ? ' is-active' : ''}`}
+                            onClick={() => setViewMode(mode)}
+                            style={{
+                              padding:'0.2rem 0.55rem', border:'none', cursor:'pointer',
+                              background: viewMode === mode ? '#1976d2' : '#fff',
+                              color:      viewMode === mode ? '#fff'     : '#444',
+                              fontWeight: viewMode === mode ? 600 : 400,
+                              textTransform:'capitalize', transition:'all 0.15s',
+                            }}
+                          >{mode}</button>
+                        ))}
+                      </div>
+                    )}
+                    {(zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && !polygonCreationLock && !(showSavePanel && polygonActive && editingSavedIndex == null) && !(showSavePanel && polygonActive && editingSavedIndex != null) && !editingStreetSegmentId && (
+                      <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                    )}
+                  </div>
                 </div>
                 {zoneSummary && (
                   <div className="summary-card__zone" style={polygonCreationLock ? { pointerEvents:'auto' } : {}}>
