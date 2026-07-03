@@ -5239,6 +5239,9 @@ export default function App() {
   const creationLock = streetCreationLock || polygonCreationLock;
   // Additional lock when editing an existing street segment
   const editingStreetLock = !!editingStreetSegmentId;
+  // True when a saved feature is selected but not being actively drawn/edited.
+  // Disables the drawing tool so users must Cancel before starting a new feature.
+  const featureSelected = selectedStreetSegmentIndex !== null || selectedSavedIndex !== null;
   // Overarching UI lock used to disable other lists and controls while creating or editing
   const uiLock = creationLock || editingStreetLock || (showSavePanel && polygonActive);
   // Card style reused for summary panel (was referenced but not declared)
@@ -5341,6 +5344,7 @@ export default function App() {
             { key: 'street', label: 'Street' }
           ].map(btn => {
             const active = activeTool === btn.key;
+            const toolLocked = creationLock || editingAny || featureSelected;
             return (
               <button
                 key={btn.key}
@@ -5348,8 +5352,9 @@ export default function App() {
                 className={`tool-panel__btn btn ${active ? 'is-active' : ''}`}
                 role="radio"
                 aria-checked={active}
-                disabled={creationLock || editingAny}
-                onClick={() => { if (creationLock || editingAny) return; setActiveTool(btn.key); }}
+                disabled={toolLocked}
+                title={featureSelected ? 'Click Cancel to deselect before drawing' : undefined}
+                onClick={() => { if (toolLocked) return; setActiveTool(btn.key); }}
                 style={{
                   ...buttonStyle,
                   backgroundColor: active ? '#007bff' : '#e2e6ea',
@@ -5357,8 +5362,8 @@ export default function App() {
                   fontWeight: active ? 600 : 500,
                   padding: '0.4rem 0.65rem',
                   minWidth: 62,
-                  opacity: (creationLock || editingAny) ? 0.5 : 1,
-                  cursor: (creationLock || editingAny) ? 'not-allowed' : 'pointer'
+                  opacity: toolLocked ? 0.5 : 1,
+                  cursor: toolLocked ? 'not-allowed' : 'pointer'
                 }}
               >{btn.label}</button>
             );
