@@ -150,6 +150,94 @@ const TRANSFORMATION_TAG_GROUPS = [
 // Flat list derived from groups — used for any key-based lookups
 const TRANSFORMATION_TAGS = TRANSFORMATION_TAG_GROUPS.flatMap(g => g.tags);
 
+// --- M6: Impact metric computation -----------------------------------------
+
+// Tags that imply tree / planting presence in the transformed zone
+const TREE_TAGS = new Set(['trees', 'urban-orchard', 'community-garden', 'stormwater-planters', 'flower-meadow']);
+
+// Typical SF block dimensions used as the area-% denominator
+const SF_BLOCK_AREA_SQM  = 8500;  // ~120 m × 71 m average SF block
+const SF_BLOCK_LENGTH_M  = 120;   // average SF block street length
+
+// Per-tag speed-calming impact scores (additive, capped at 100).
+// Values reflect the degree to which each intervention reduces vehicle speed.
+const SPEED_CALMING_SCORES = {
+  'car-free-zone':       100,
+  'mini-roundabout':      40,
+  'raised-crosswalk':     25,
+  'bike-lane':            18,
+  'parklet':              15,
+  'outdoor-seating':      12,
+  'stormwater-planters':  10,
+  'trees':                 8,
+  'benches':               6,
+  'led-crosswalk':         6,
+  'community-garden':      5,
+  'cargo-bike-parking':    5,
+  'flower-meadow':         4,
+  'ev-charging':           3,
+  'delivery-parking':      2,
+};
+
+// Derive heuristic impact metrics from a saved Feature (Polygon or LineString).
+// blockCoverPct is always computed; treeCount and speedCalming only appear when
+// the relevant transformation tags are active.
+function computeImpactMetrics(feature) {
+  if (!feature?.geometry) return {};
+  const tags = feature.properties?.tags || [];
+  const geomType = feature.geometry.type;
+  const metrics = {};
+
+  // --- Block coverage % (always computed) ---
+  try {
+    if (geomType === 'Polygon' || geomType === 'MultiPolygon') {
+      const areaSqm = turf.area(feature);
+      metrics.blockCoverPct  = Math.round((areaSqm / SF_BLOCK_AREA_SQM) * 1000) / 10; // 1 dp
+      metrics.blockCoverBasis = 'area';
+      metrics.areaSqm = Math.round(areaSqm);
+    } else if (geomType === 'LineString') {
+      const lengthM = feature.properties?.lengthM
+        ?? turf.length(feature, { units: 'meters' });
+      metrics.blockCoverPct  = Math.round((lengthM / SF_BLOCK_LENGTH_M) * 1000) / 10;
+      metrics.blockCoverBasis = 'length';
+    }
+  } catch {}
+
+  // --- Tree count (green tags) ---
+  if (tags.some(t => TREE_TAGS.has(t))) {
+    try {
+      if (geomType === 'Polygon' || geomType === 'MultiPolygon') {
+        const areaSqm = metrics.areaSqm ?? turf.area(feature);
+        // 1 tree per 15 m² of reclaimed street-level green space
+        metrics.treeCount = Math.max(1, Math.round(areaSqm / 15));
+        metrics.treeCountBasis = 'area';
+      } else if (geomType === 'LineString') {
+        const lengthM = feature.properties?.lengthM
+          ?? turf.length(feature, { units: 'meters' });
+        // SF standard tree spacing ~8 m, planted on both sides
+        metrics.treeCount = Math.max(1, Math.round(lengthM / 8) * 2);
+        metrics.treeCountBasis = 'length';
+      }
+    } catch {}
+  }
+
+  // --- Speed calming (any tag with a score) ---
+  try {
+    const raw = tags.reduce((s, t) => s + (SPEED_CALMING_SCORES[t] || 0), 0);
+    if (raw > 0) {
+      const score = Math.min(raw, 100);
+      const level = score >= 100 ? 'Car-Free'
+                  : score >= 55  ? 'Very High'
+                  : score >= 30  ? 'High'
+                  : score >= 14  ? 'Moderate'
+                  : 'Low';
+      metrics.speedCalming = { score, level };
+    }
+  } catch {}
+
+  return metrics;
+}
+
 // --- M5.5: Road-width polygon rendering helpers ----------------------------
 
 // Fill colors keyed by band type — referenced in both the paint expression and band computation
@@ -4181,6 +4269,86 @@ export default function App() {
     );
   }
 
+  // Render the impact metrics panel below the transformation menu.
+  // blockCoverPct always shows; treeCount and speedCalming appear only when relevant tags are on.
+  function renderImpactPanel(metrics) {
+    if (!metrics) return null;
+    const hasAny = metrics.blockCoverPct != null || metrics.treeCount != null || metrics.speedCalming != null;
+    if (!hasAny) return null;
+
+    const CALMING_COLOR = { 'Car-Free': '#00897b', 'Very High': '#2e7d32', High: '#558b2f', Moderate: '#f57f17', Low: '#e65100' };
+    const CALMING_STEPS = ['Low', 'Moderate', 'High', 'Very High', 'Car-Free'];
+
+    return (
+      <div className="impact-panel" style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #eee' }}>
+        <h3 className="impact-panel__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: '0 0 0.6rem' }}>Estimated Impact</h3>
+        <div className="impact-panel__metrics" style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+
+          {/* Block coverage % */}
+          {metrics.blockCoverPct != null && (
+            <div className="impact-panel__metric impact-panel__metric--coverage" style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem' }}>
+              <span style={{ fontSize: '1rem', lineHeight: 1 }}>📐</span>
+              <div>
+                <span style={{ fontWeight: 700, fontSize: '1rem' }}>{metrics.blockCoverPct}%</span>
+                <span style={{ fontSize: '0.73rem', color: '#555', marginLeft: '0.3rem' }}>
+                  {metrics.blockCoverBasis === 'area'
+                    ? `of a typical SF block (${metrics.areaSqm?.toLocaleString()} m²)`
+                    : 'of a typical SF block length'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Tree count */}
+          {metrics.treeCount != null && (
+            <div className="impact-panel__metric impact-panel__metric--trees" style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem' }}>
+              <span style={{ fontSize: '1rem', lineHeight: 1 }}>🌳</span>
+              <div>
+                <span style={{ fontWeight: 700, color: '#2d9e4f', fontSize: '1rem' }}>{metrics.treeCount}</span>
+                <span style={{ fontSize: '0.73rem', color: '#555', marginLeft: '0.3rem' }}>
+                  est. trees
+                  {metrics.treeCountBasis === 'length' ? ' · 8 m spacing, both sides' : ' · 1 per 15 m²'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Speed calming */}
+          {metrics.speedCalming != null && (() => {
+            const { level, score } = metrics.speedCalming;
+            const color = CALMING_COLOR[level] || '#555';
+            const activeStep = CALMING_STEPS.indexOf(level);
+            return (
+              <div className="impact-panel__metric impact-panel__metric--speed" style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem' }}>
+                  <span style={{ fontSize: '1rem', lineHeight: 1 }}>🚦</span>
+                  <div>
+                    <span style={{ fontWeight: 700, color, fontSize: '1rem' }}>{level}</span>
+                    <span style={{ fontSize: '0.73rem', color: '#555', marginLeft: '0.3rem' }}>speed calming</span>
+                  </div>
+                </div>
+                {/* 5-segment indicator bar */}
+                <div className="impact-panel__speed-bar" style={{ display: 'flex', gap: 3, paddingLeft: '1.6rem' }}>
+                  {CALMING_STEPS.map((s, i) => (
+                    <div key={s} style={{
+                      flex: 1, height: 6, borderRadius: 3,
+                      background: i <= activeStep ? color : '#ddd',
+                      transition: 'background 0.2s',
+                    }} />
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+
+        </div>
+        <p className="impact-panel__disclaimer" style={{ fontSize: '0.65rem', color: '#aaa', margin: '0.6rem 0 0', lineHeight: 1.4 }}>
+          Heuristic estimates · not engineering calculations
+        </p>
+      </div>
+    );
+  }
+
   // Add or remove a tag on the currently selected saved zone
   function toggleZoneTag(tagKey) {
     if (selectedSavedIndex == null) return;
@@ -5215,6 +5383,10 @@ export default function App() {
                     <p style={{ marginBottom: "1rem" }}><strong>Centroid:</strong> {zoneSummary.centroid[0].toFixed(6)}, {zoneSummary.centroid[1].toFixed(6)}</p>
                   </div>
                 )}
+                {/* Impact panel above transformation menu so it stays visible regardless of menu length */}
+                {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
+                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]))
+                }
                 {/* Transformation menu — shown on saved zone selection, hidden during draw/edit flows */}
                 {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
                   renderTransformationMenu(
@@ -5262,6 +5434,10 @@ export default function App() {
                     {editingStreetSegmentSummary && (
                       <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
                     )}
+                    {/* Impact panel above transformation menu so it stays in view */}
+                    {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
+                      renderImpactPanel(computeImpactMetrics(selectedStreetSegment))
+                    }
                     {/* Transformation menu — shown on saved segment selection, hidden during geometry edit */}
                     {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
                       renderTransformationMenu(
