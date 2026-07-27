@@ -238,6 +238,89 @@ function computeImpactMetrics(feature) {
   return metrics;
 }
 
+// --- M7: Render-result memo caches -----------------------------------------
+// All five expensive geometry computations (buffer, pointGrid, along×N, lineOffset) are
+// keyed by featureId + sorted-tags + coord-fingerprint so refreshMapData never recomputes
+// an unchanged feature. Coord fingerprint uses first/last point + count — cheap but reliably
+// changes when geometry is re-edited or a new segment is drawn.
+
+const _bandsCache      = new Map(); // segment → [band Polygon features]
+const _overlaySymCache = new Map(); // segment → [symbol Point features]
+const _overlayLineCache = new Map(); // segment → [offset LineString features]
+const _zoneSymCache    = new Map(); // zone    → [symbol Point features]
+
+function _featureCacheKey(feature) {
+  const id   = feature.properties?.id || '';
+  const tags = (feature.properties?.tags || []).slice().sort().join(',');
+  const c    = feature.geometry?.coordinates;
+  if (!c || !c.length) return `${id}:${tags}:empty`;
+  if (feature.geometry.type === 'LineString') {
+    return `${id}:${tags}:${c[0]},${c[c.length - 1]},${c.length}`;
+  }
+  if (feature.geometry.type === 'Polygon') {
+    const ring = c[0] || [];
+    return `${id}:${tags}:${ring[0]},${ring[ring.length - 1]},${ring.length}`;
+  }
+  return `${id}:${tags}:${c.length}`;
+}
+
+// --- M7.5 Phase 1: Real SVG icons for transformation overlay ---------------
+
+// Top-down tree canopy: organic multi-circle blob with shadow, realistic for overhead map view
+const _ICON_TREE = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <ellipse cx="35" cy="40" rx="18" ry="15" fill="#000" opacity="0.2"/>
+  <circle cx="32" cy="29" r="22" fill="#2d6a2d"/>
+  <circle cx="22" cy="22" r="12" fill="#3a8a3a"/>
+  <circle cx="39" cy="20" r="9" fill="#4caf50"/>
+  <circle cx="26" cy="15" r="7" fill="#66bb6a"/>
+  <circle cx="41" cy="34" r="9" fill="#1e4d1e"/>
+  <circle cx="27" cy="37" r="7" fill="#256825"/>
+</svg>`;
+
+// Side-view A-frame swing set on blue badge — recognizable playground symbol at small sizes
+const _ICON_PLAY = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#0277bd"/>
+  <line x1="8" y1="54" x2="32" y2="12" stroke="white" stroke-width="4" stroke-linecap="round"/>
+  <line x1="56" y1="54" x2="32" y2="12" stroke="white" stroke-width="4" stroke-linecap="round"/>
+  <line x1="6" y1="54" x2="58" y2="54" stroke="white" stroke-width="3" stroke-linecap="round"/>
+  <line x1="25" y1="13" x2="20" y2="42" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="39" y1="13" x2="44" y2="42" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+  <rect x="13" y="41" width="13" height="5" rx="2.5" fill="white"/>
+  <rect x="38" y="41" width="13" height="5" rx="2.5" fill="white"/>
+</svg>`;
+
+// Side-view park bench on orange badge — backrest + seat + legs silhouette
+const _ICON_SEATING = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#e65100"/>
+  <rect x="10" y="19" width="44" height="7" rx="3.5" fill="white" opacity="0.7"/>
+  <rect x="10" y="30" width="44" height="9" rx="4.5" fill="white"/>
+  <rect x="13" y="39" width="6" height="13" rx="3" fill="white" opacity="0.8"/>
+  <rect x="45" y="39" width="6" height="13" rx="3" fill="white" opacity="0.8"/>
+</svg>`;
+
+// Register custom overlay icons into MapLibre's sprite atlas.
+// Must be awaited before ensureSourcesAndLayers creates the symbol layer, since the layer
+// definition references these image IDs by name ('overlay-tree', etc.).
+// After a basemap style switch the atlas is cleared — this must be called again in attemptRestore.
+async function loadMapIcons(mapInstance) {
+  const defs = [
+    ['overlay-tree',    _ICON_TREE],
+    ['overlay-play',    _ICON_PLAY],
+    ['overlay-seating', _ICON_SEATING],
+  ];
+  await Promise.all(defs.map(([id, svg]) =>
+    new Promise(resolve => {
+      if (mapInstance.hasImage(id)) { resolve(); return; }
+      const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+      mapInstance.loadImage(url, (err, img) => {
+        if (!err && img && !mapInstance.hasImage(id)) mapInstance.addImage(id, img);
+        if (err) console.warn('[loadMapIcons] failed to load', id, err?.message);
+        resolve(); // always resolve — missing icon = invisible symbol, not a crash
+      });
+    })
+  ));
+}
+
 // --- M5.5: Road-width polygon rendering helpers ----------------------------
 
 // Fill colors keyed by band type — referenced in both the paint expression and band computation
@@ -270,6 +353,8 @@ function getBandType(bandRole, tags) {
 // manual bearing-offset approach produced self-intersecting polygons on curved paths.
 // Returns 2 features: an inner travel-lane strip and an outer parking/curb ring.
 function computeSegmentBands(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_bandsCache.has(_ckey)) return _bandsCache.get(_ckey);
   try {
     const coords = feature.geometry?.coordinates;
     if (!coords || coords.length < 2) return [];
@@ -308,6 +393,7 @@ function computeSegmentBands(feature) {
       properties: { segId, bandRole: 'travel', bandType: getBandType('travel-left', tags) }
     });
 
+    _bandsCache.set(_ckey, bands);
     return bands;
   } catch (e) {
     console.warn('[computeSegmentBands] error:', e?.message);
@@ -322,6 +408,138 @@ function computeSegmentBandsNeutral(feature) {
     ...feature,
     properties: { ...feature.properties, tags: [] },
   });
+}
+
+// M7: Generate evenly spaced Point symbols offset into the parking band for green / seating / play
+// transformations. All active overlay categories are rendered simultaneously — each type gets its
+// own side(s) so they don't compete: type[0]→left, type[1]→right, type[2+]→both sides.
+function computeSegmentOverlaySymbols(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_overlaySymCache.has(_ckey)) return _overlaySymCache.get(_ckey);
+  try {
+    const tags = feature.properties?.tags || [];
+    if (!tags.length) return [];
+    const coords = feature.geometry?.coordinates;
+    if (!coords || coords.length < 2) return [];
+
+    // Collect all active overlay types — bike is handled by line overlay, not circles
+    const activeTypes = [];
+    if (tags.some(t => ['trees','community-garden','flower-meadow','urban-orchard'].includes(t))) activeTypes.push('green');
+    if (tags.some(t => ['outdoor-seating','benches','bbq-station','parklet'].includes(t))) activeTypes.push('seating');
+    if (tags.some(t => ['playground','outdoor-gym','splash-pad','dog-park'].includes(t))) activeTypes.push('play');
+    if (!activeTypes.length) return [];
+
+    const offsetKm = 0.0035; // ~3.5 m into the parking band from centerline
+    const segId = feature.properties?.id;
+    const line = turf.lineString(coords);
+    const lengthKm = turf.length(line, { units: 'kilometers' });
+    const points = [];
+
+    activeTypes.forEach((type, typeIdx) => {
+      const spacing = type === 'green' ? 8 : type === 'play' ? 16 : 12;
+      if (lengthKm * 1000 < spacing) return;
+      const count = Math.floor((lengthKm * 1000) / spacing);
+
+      // Single type → both sides. Two types → left vs right. Third type → both sides.
+      const sides = activeTypes.length === 1 ? [-90, 90]
+        : typeIdx === 0 ? [-90]
+        : typeIdx === 1 ? [90]
+        : [-90, 90];
+
+      for (let i = 1; i <= count; i++) {
+        const distKm = (i / (count + 1)) * lengthKm;
+        const pt = turf.along(line, distKm, { units: 'kilometers' });
+        const aheadKm = Math.min(distKm + 0.002, lengthKm - 0.0001);
+        const ptAhead = turf.along(line, aheadKm, { units: 'kilometers' });
+        const bearing = turf.bearing(pt, ptAhead);
+
+        for (const side of sides) {
+          const sym = turf.destination(pt, offsetKm, bearing + side, { units: 'kilometers' });
+          sym.properties = { overlayType: type, segId };
+          points.push(sym);
+        }
+      }
+    });
+
+    _overlaySymCache.set(_ckey, points);
+    return points;
+  } catch { return []; }
+}
+
+// M7: Generate offset lines in the parking band for bike-lane dashed markings.
+// turf.lineOffset extends the offset line beyond the endpoint on curved roads (the "fin" artifact
+// where the line fans out past the intersection). Insetting 5 m from each end before offsetting
+// keeps the dashes within the segment's actual extent.
+function computeSegmentOverlayLines(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_overlayLineCache.has(_ckey)) return _overlayLineCache.get(_ckey);
+  try {
+    const tags = feature.properties?.tags || [];
+    if (!tags.includes('bike-lane')) return [];
+    const coords = feature.geometry?.coordinates;
+    if (!coords || coords.length < 2) return [];
+
+    const line = turf.lineString(coords);
+    const segId = feature.properties?.id;
+    const totalLen = turf.length(line, { units: 'kilometers' });
+
+    // Inset 5 m from each end before offsetting to suppress endpoint fin artifacts
+    const insetKm = 0.005;
+    const innerLine = totalLen > insetKm * 3
+      ? turf.lineSliceAlong(line, insetKm, totalLen - insetKm, { units: 'kilometers' })
+      : line;
+
+    // Offset 3.5 m on each side to sit in the center of the parking band
+    const left  = turf.lineOffset(innerLine,  0.0035, { units: 'kilometers' });
+    const right = turf.lineOffset(innerLine, -0.0035, { units: 'kilometers' });
+    left.properties  = { segId, overlayLineType: 'bike' };
+    right.properties = { segId, overlayLineType: 'bike' };
+    const result = [left, right];
+    _overlayLineCache.set(_ckey, result);
+    return result;
+  } catch { return []; }
+}
+
+// M7: Generate symbol points distributed inside a zone polygon for the After-view overlay.
+// All active overlay categories are shown simultaneously by cycling types across a shared grid —
+// green/play/seating points interleave naturally without needing separate grid passes.
+// Building exclusion is applied later in refreshMapData via queryRenderedFeatures.
+function computeZoneOverlaySymbols(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_zoneSymCache.has(_ckey)) return _zoneSymCache.get(_ckey);
+  try {
+    const tags = feature.properties?.tags || [];
+    if (!tags.length) return [];
+    const geom = feature.geometry;
+    if (!geom || (geom.type !== 'Polygon' && geom.type !== 'MultiPolygon')) return [];
+
+    // Collect all active overlay types — same tag groups as segment overlay
+    const activeTypes = [];
+    if (tags.some(t => ['trees','community-garden','flower-meadow','urban-orchard','stormwater-planters'].includes(t))) activeTypes.push('green');
+    if (tags.some(t => ['playground','outdoor-gym','splash-pad','dog-park'].includes(t))) activeTypes.push('play');
+    if (tags.some(t => ['outdoor-seating','benches','bbq-station','parklet'].includes(t))) activeTypes.push('seating');
+    if (!activeTypes.length) return [];
+
+    // Use the finest spacing so the grid is dense enough to represent every active type
+    const spacings = { green: 15, play: 25, seating: 20 };
+    const minSpacing = Math.min(...activeTypes.map(t => spacings[t]));
+
+    const bbox = turf.bbox(feature);
+    const grid = turf.pointGrid(bbox, minSpacing, { units: 'meters' });
+    const zoneId = feature.properties?.id;
+
+    const filtered = grid.features
+      .filter(pt => { try { return turf.booleanPointInPolygon(pt, feature); } catch { return false; } });
+
+    // Assign types by cycling through activeTypes — produces a natural interleaved mix.
+    // Cap at 300 total to avoid rendering overhead on very large zones.
+    const result = filtered
+      .slice(0, 300)
+      .map((pt, i) => ({ ...pt, properties: { overlayType: activeTypes[i % activeTypes.length], segId: zoneId } }));
+
+    _zoneSymCache.set(_ckey, result);
+    return result;
+  } catch { return []; }
 }
 
 function explodeToLineStrings(feature) {
@@ -988,6 +1206,20 @@ export default function App() {
     return null;
   }
 
+  // Returns all rendered layer IDs that represent building footprints — used to exclude
+  // zone overlay symbols from landing on top of buildings.
+  function getBuildingLayerIds(mapInstance) {
+    try {
+      const layers = mapInstance.getStyle()?.layers || [];
+      const ids = layers
+        .filter(l => l['source-layer'] === 'building' && (l.type === 'fill' || l.type === 'fill-extrusion'))
+        .map(l => l.id);
+      // Include our custom extrusion layer if it exists
+      if (mapInstance.getLayer('buildings-3d')) ids.push('buildings-3d');
+      return ids;
+    } catch { return []; }
+  }
+
   function ensureSourcesAndLayers(mapInstance) {
     // Add source for drawn line if not present
     if (!mapInstance.getSource("drawn-line")) {
@@ -1298,6 +1530,67 @@ export default function App() {
       });
     }
 
+    // M7: After-view symbol overlay — circles for green / seating / play transformations
+    if (!mapInstance.getSource('segment-overlay-circles')) {
+      mapInstance.addSource('segment-overlay-circles', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('segment-overlay-circles-layer')) {
+      mapInstance.addLayer({
+        id: 'segment-overlay-circles-layer',
+        type: 'symbol',
+        source: 'segment-overlay-circles',
+        minzoom: 14,
+        layout: {
+          // Map each overlayType to its registered sprite name (loaded by loadMapIcons)
+          'icon-image': ['match', ['get', 'overlayType'],
+            'green',   'overlay-tree',
+            'play',    'overlay-play',
+            'seating', 'overlay-seating',
+            'overlay-tree'
+          ],
+          // Scale icons so they represent ~10–15 m of real-world space at each zoom level.
+          // The 64 px icon is sized to ~10 m at zoom 17–18 for accurate street-scale planning.
+          'icon-size': ['interpolate', ['exponential', 2], ['zoom'],
+            14, 0.10,
+            16, 0.20,
+            18, 0.50,
+            20, 1.20,
+          ],
+          'icon-allow-overlap': true,
+          'icon-ignore-placement': true,
+          // 'map' alignment: icons lie flat on the ground plane, staying correctly scaled
+          // in 3D tilt mode rather than billboarding toward the camera.
+          'icon-pitch-alignment': 'map',
+          'icon-rotation-alignment': 'map',
+        },
+      });
+    }
+
+    // M7: After-view line overlay — dashed markings for bike-lane transformations
+    if (!mapInstance.getSource('segment-overlay-lines')) {
+      mapInstance.addSource('segment-overlay-lines', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('segment-overlay-lines-layer')) {
+      mapInstance.addLayer({
+        id: 'segment-overlay-lines-layer',
+        type: 'line',
+        source: 'segment-overlay-lines',
+        minzoom: 14,
+        paint: {
+          'line-color': '#1565c0',
+          'line-width': 2,
+          'line-dasharray': [4, 3],
+          'line-opacity': 0.9,
+        }
+      });
+    }
+
     // Saved street segments
     if (!mapInstance.getSource('saved-street-segments')) {
       mapInstance.addSource('saved-street-segments', {
@@ -1568,6 +1861,45 @@ export default function App() {
     // Sources may not exist yet on first load; ensureSourcesAndLayers runs first in the chain.
     mapInstance.getSource('segment-bands')?.setData(bandsFC);
     mapInstance.getSource('segment-bands-before')?.setData(bandsBeforeFC);
+
+    // M7: Overlay symbols (circles) for the After-view stylistic overlay.
+    // Zone symbols are filtered to exclude building footprints via queryRenderedFeatures —
+    // the raw grid from computeZoneOverlaySymbols is cached; building exclusion runs here
+    // so it reflects the current viewport without busting the geometry cache.
+    const buildingLayerIds = getBuildingLayerIds(mapInstance);
+    const zoneOverlaySymbols = (savedList || []).flatMap(f => {
+      const pts = computeZoneOverlaySymbols(f);
+      if (!buildingLayerIds.length || !pts.length) return pts;
+      try {
+        const [minLng, minLat, maxLng, maxLat] = turf.bbox(f);
+        const sw = mapInstance.project([minLng, minLat]);
+        const ne = mapInstance.project([maxLng, maxLat]);
+        // queryRenderedFeatures uses screen coords: topLeft=[minX,minY], bottomRight=[maxX,maxY]
+        const buildingFeatures = mapInstance.queryRenderedFeatures(
+          [[sw.x, ne.y], [ne.x, sw.y]],
+          { layers: buildingLayerIds }
+        );
+        const buildingPolys = buildingFeatures.filter(
+          b => b.geometry?.type === 'Polygon' || b.geometry?.type === 'MultiPolygon'
+        );
+        if (!buildingPolys.length) return pts;
+        return pts.filter(pt =>
+          !buildingPolys.some(b => { try { return turf.booleanPointInPolygon(pt, b); } catch { return false; } })
+        );
+      } catch { return pts; }
+    });
+
+    mapInstance.getSource('segment-overlay-circles')?.setData({
+      type: 'FeatureCollection',
+      features: [
+        ...visibleSegments.flatMap(f => computeSegmentOverlaySymbols(f)),
+        ...zoneOverlaySymbols,
+      ],
+    });
+    mapInstance.getSource('segment-overlay-lines')?.setData({
+      type: 'FeatureCollection',
+      features: visibleSegments.flatMap(f => computeSegmentOverlayLines(f)),
+    });
   }
 
   // Build a zone summary from any Feature<Polygon>
@@ -2180,7 +2512,8 @@ export default function App() {
 
     map.current.addControl(new maplibregl.NavigationControl(), "top-right");
 
-    map.current.on("load", () => {
+    map.current.on("load", async () => {
+      await loadMapIcons(map.current);
       ensureSourcesAndLayers(map.current);
       refreshMapData(map.current, drawnCoords, useType, savedZones);
       applySelectedFilter(map.current, selectedSavedIndex);
@@ -2199,9 +2532,10 @@ export default function App() {
     // Orphan old listeners just in case
     const restoreKey = `__restore_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
-    function attemptRestore(stage) {
+    async function attemptRestore(stage) {
       // eslint-disable-next-line no-console
       console.log('[style-switch] attemptRestore', stage);
+      await loadMapIcons(m); // style switch clears the sprite atlas — re-register icons first
       ensureSourcesAndLayers(m);
       refreshMapData(m, drawnCoords, useType, savedZones);
       applySelectedFilter(m, selectedSavedIndex);
@@ -2827,7 +3161,8 @@ export default function App() {
     const m = map.current;
     const vis = segmentsVisible ? 'visible' : 'none';
     ['saved-street-segments-line', 'saved-street-segments-casing', 'saved-street-segments-selected',
-     'segment-bands-fill', 'segment-bands-outline'].forEach(id => {
+     'segment-bands-fill', 'segment-bands-outline',
+     'segment-overlay-circles-layer', 'segment-overlay-lines-layer'].forEach(id => {
       try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', vis); } catch {}
     });
   }, [segmentsVisible, basemapStyle]);
@@ -2932,16 +3267,19 @@ export default function App() {
     }
   }
 
-  // M7: Swap segment-bands visibility between "before" (neutral) and "after" (tag-colored)
+  // M7: Swap segment-bands visibility between "before" (neutral) and "after" (tag-colored);
+  // also hide the stylistic overlay layers in Before view.
   useEffect(() => {
     if (!map.current) return;
     const m = map.current;
     const isBefore = viewMode === 'before';
     [
-      ['segment-bands-fill',         !isBefore],
-      ['segment-bands-outline',      !isBefore],
-      ['segment-bands-before-fill',   isBefore],
-      ['segment-bands-before-outline',isBefore],
+      ['segment-bands-fill',            !isBefore],
+      ['segment-bands-outline',         !isBefore],
+      ['segment-bands-before-fill',      isBefore],
+      ['segment-bands-before-outline',   isBefore],
+      ['segment-overlay-circles-layer', !isBefore],
+      ['segment-overlay-lines-layer',   !isBefore],
     ].forEach(([id, visible]) => {
       try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none'); } catch {}
     });
@@ -5269,7 +5607,7 @@ export default function App() {
       : pendingName || "Custom Zone";
 
   return (
-    <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
+    <div style={{ height: "100vh", width: "100vw", position: "relative", overflow: "hidden" }}>
       {/* Global overlay to block all interactions outside active edit context */}
       {(showSavePanel && polygonActive && editingSavedIndex == null) && (
         <div
@@ -5648,7 +5986,7 @@ export default function App() {
                 )}
                 {/* Impact panel above transformation menu so it stays visible regardless of menu length */}
                 {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
-                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]))
+                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]), true)
                 }
                 {/* Transformation menu — shown on saved zone selection, hidden during draw/edit flows */}
                 {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
@@ -5701,7 +6039,7 @@ export default function App() {
                     {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
                       renderImpactPanel(
                         computeImpactMetrics(selectedStreetSegment),
-                        (selectedStreetSegment?.properties?.tags?.length ?? 0) > 0
+                        true
                       )
                     }
                     {/* Transformation menu — shown on saved segment selection, hidden during geometry edit */}
@@ -5832,87 +6170,75 @@ export default function App() {
                   >
                     {savedZones.map((f, idx) => {
                       const zoneSelected = selectedSavedIndex === idx;
+                      const editingThis = editingSavedIndex === idx;
+                      const editingActive = editingSavedIndex != null;
+                      const itemLocked = creationLock || (editingActive && !editingThis) || activeTool !== 'none';
+
+                      function handleZoneClick() {
+                        if (itemLocked) return;
+                        if (zoneSelected) {
+                          setSelectedSavedIndex(null);
+                          applySelectedFilter(map.current, null);
+                        } else {
+                          setSelectedSavedIndex(idx);
+                          setSelectedStreetSegmentIndex(null);
+                          applySelectedFilter(map.current, idx);
+                          flyToSaved(f);
+                          setSidebarVisible(true);
+                        }
+                      }
+
                       return (
                       <li
                         key={idx}
                         className={`list-item zone-item ${zoneSelected ? 'is-selected' : ''}`}
+                        onClick={handleZoneClick}
+                        title={itemLocked && !zoneSelected ? 'Switch drawing tool to Off first' : undefined}
                         style={{
                           background: '#fff',
                           border: '1px solid #e5e5e5',
                           borderRadius: 8,
                           padding: '0.5rem',
-                          ...(zoneSelected ? selectedCardStyle : {})
+                          cursor: itemLocked ? 'default' : 'pointer',
+                          opacity: itemLocked && !zoneSelected ? 0.65 : 1,
+                          ...(zoneSelected ? selectedCardStyle : {}),
                         }}
                       >
-                        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8 }}>
-                          <div style={{ fontWeight: 600, fontSize:'0.9rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                          <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
                             {f.properties?.name || `Zone ${idx + 1}`}
-                            {selectedSavedIndex === idx ? " • selected" : ""}
+                            {zoneSelected ? ' • selected' : ''}
                           </div>
-                          <span style={{ width:12, height:12, borderRadius:3, background: colorByUse[f.properties?.useType || 'mixed-use'], border:'1px solid #ccc' }} />
+                          <span style={{ width: 12, height: 12, borderRadius: 3, background: colorByUse[f.properties?.useType || 'mixed-use'], border: '1px solid #ccc' }} />
                         </div>
 
                         {f.properties?.description && (
-                          <div style={{ fontSize: "0.85rem", marginTop: 4 }}>
+                          <div style={{ fontSize: '0.85rem', marginTop: 4 }}>
                             {f.properties.description}
                           </div>
                         )}
 
-                        <div style={{ fontSize: "0.8rem", marginTop: 4 }}>
-                          {f.properties?.address?.street ||
-                            f.properties?.address?.city ||
-                            ""}
+                        <div style={{ fontSize: '0.8rem', marginTop: 4 }}>
+                          {f.properties?.address?.street || f.properties?.address?.city || ''}
                         </div>
 
-                        {/* Removed per-zone inline type select to simplify UI */}
-
-                        {!isEditingSaved && !uiLock && (
-                          <div
-                            style={{
-                              display: "flex",
-                              gap: "0.5rem",
-                              marginTop: 6,
-                              flexWrap: "wrap",
-                            }}
-                          >
+                        {zoneSelected && !editingThis && !uiLock && (
+                          <div style={{ display: 'flex', gap: '0.5rem', marginTop: 6, flexWrap: 'wrap' }}
+                            onClick={e => e.stopPropagation()}>
                             <button
-                              disabled={isEditingSaved || creationLock || activeTool !== 'none'}
-                              onClick={() => {
-                                if (isEditingSaved || creationLock || activeTool !== 'none') return;
-                                if (selectedSavedIndex === idx) {
-                                  setSelectedSavedIndex(null);
-                                  applySelectedFilter(map.current, null);
-                                } else {
-                                  setSelectedSavedIndex(idx);
-                                  setSelectedStreetSegmentIndex(null);
-                                  applySelectedFilter(map.current, idx);
-                                  flyToSaved(f);
-                                }
-                              }}
-                              className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
-                              title={activeTool !== 'none' ? 'Switch drawing tool to Off first' : isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
-                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: (isEditingSaved || creationLock || activeTool !== 'none') ? 0.6 : 1, cursor: (isEditingSaved || creationLock || activeTool !== 'none') ? 'not-allowed':'pointer' }}
-                            >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
-
+                              className="btn btn--edit"
+                              onClick={() => loadSavedIntoDraw(idx, true)}
+                              style={buttonVariants.muted}
+                            >Edit geometry</button>
                             <button
-                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
-                              onClick={() => {
-                                if ((isEditingSaved && editingSavedIndex !== idx) || creationLock) return;
-                                loadSavedIntoDraw(idx, true);
-                              }}
-                              className={`btn btn--edit ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
-                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Edit geometry'}
-                              style={{ ...(isEditingSaved && editingSavedIndex === idx ? buttonVariants.warning : buttonVariants.muted), opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
-                            >{isEditingSaved && editingSavedIndex === idx ? 'Editing…' : 'Edit geometry'}</button>
-
-                            <button
-                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
+                              className="btn btn--delete"
                               onClick={() => deleteSaved(idx)}
-                              className={`btn btn--delete ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
-                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Delete'}
-                              style={{ ...buttonVariants.danger, opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
+                              style={buttonVariants.danger}
                             >Delete</button>
                           </div>
+                        )}
+                        {editingThis && (
+                          <div style={{ fontSize: '0.65rem', color: '#555' }}>Editing form shown above.</div>
                         )}
                       </li>
                     );})}

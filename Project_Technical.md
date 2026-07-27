@@ -341,17 +341,37 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 ---
 
 ### M7 — Before / After View (2D)
-**Status: IN PROGRESS | Est: 28 hrs | 20%**
+**Status: DONE | Est: 28 hrs | 100%**
 
-| Sub-task | Status |
-|----------|--------|
-| "Before" state 2D street rendering | ✅ | `computeSegmentBandsNeutral` (tags=[]) → `segment-bands-before` source + fill/outline layers; `viewMode` state ('before'\|'after'); Before/After pill toggle in summary header; useEffect swaps layer visibility; resets on deselect |
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| "Before" state 2D street rendering | ✅ | `computeSegmentBandsNeutral` (tags=[]) → `segment-bands-before` source + fill/outline layers; `viewMode` state ('before'\|'after'\|'split'); Before/After/Split toggle in impact panel title row |
 | "After" (transformed) state 2D street rendering | ✅ | Existing `segment-bands` source (M5.5); After is the default view |
-| Drag slider to compare Before vs After | ❌ |
-| Stylistic overlay for transformed state | ❌ |
-| Acceptable render performance | ❌ |
+| Drag slider to compare Before vs After | ✅ | Second MapLibre instance (`mapBefore`); lazy creation on split mode; `clip-path: inset()` shows Before half; `splitPos` state drives divider; `startSplitDrag` pointer handler; BEFORE/AFTER labels on handle; `interactive: false` + `jumpTo` sync via `move` event |
+| Toggle visible for all selected features | ✅ | Before/After/Split toggle always shown in impact panel when zone or segment selected |
+| Mutual exclusion: drawing tool ↔ feature selection | ✅ | `featureSelected` disables drawing tool; `activeTool !== 'none'` blocks map click handlers |
+| Stylistic overlay for transformed state | ✅ | `computeZoneOverlaySymbols` (pointGrid + booleanPointInPolygon, 15/20/25 m spacing, capped 300); `computeSegmentOverlaySymbols` (along+bearing+destination, offset 3.5 m into parking band); `computeSegmentOverlayLines` (lineOffset ±3.5 m, bike-lane dashes); `segment-overlay-circles-layer` + `segment-overlay-lines-layer`; hidden in Before mode; respects segmentsVisible toggle |
+| Acceptable render performance | ✅ | Module-level memo caches (`_bandsCache`, `_overlaySymCache`, `_overlayLineCache`, `_zoneSymCache`) keyed by `featureId:sortedTags:coordFingerprint`; `computeSegmentBands`, `computeSegmentOverlaySymbols`, `computeSegmentOverlayLines`, `computeZoneOverlaySymbols` all skip recomputation on cache hit; cache miss only on geometry re-edit or tag change |
 
 **Dependency:** M5 (need transformation tags to know what "After" looks like).
+
+---
+
+### M7.6 — Realistic Transformation Overlay (Icon Editor)
+**Status: IN PROGRESS | Est: 20 hrs | 20%**
+
+Goal: Replace abstract colored dots with recognizable SVG icons that accurately communicate each transformation type at map scale, then make those icons individually editable (position, size).
+
+| Sub-task | Status | Notes |
+|----------|--------|-------|
+| Phase 1 — Real SVG icons in MapLibre symbol layer | ✅ | Tree top-down canopy blob; playground A-frame badge; seating bench badge; registered via `loadMapIcons()` async loader; `icon-pitch-alignment: 'map'` for correct 3D behaviour; zoom-interpolated size ~10 m real-world at z17 |
+| Phase 2 — Per-icon draggable placement | ❌ | Switch from GeoJSON layer to `maplibregl.Marker` instances; store per-symbol `{ overlayType, lngLat, size }` in feature `properties.symbols[]`; persist to localStorage |
+| Phase 3 — Density & size controls | ❌ | Sidebar: spacing slider (fewer ↔ more), size presets (sapling / medium / mature for trees); applied globally per feature |
+| Phase 4 — Click-to-add in zone/segment | ❌ | While a feature is selected, clicking the map places a new icon of the active tag type |
+
+**Approach:** Phase 1 uses MapLibre symbol layers + SVG data-URI sprites (zero cost, no external assets). Phases 2–4 replace auto-placed symbols with individually addressable `maplibregl.Marker` HTML overlays that have native drag support and CSS-controllable size handles.
+
+**Why:** Colored circles don't communicate the actual character of a transformation. A correctly-scaled tree canopy icon next to a 14 m road gives users a realistic sense of proportion without requiring photorealistic rendering.
 
 ---
 
@@ -446,8 +466,9 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | M5 | Transformation Menu Phase 1 | 20 | DONE | 100% |
 | M5.5 | Road-Width Polygon Rendering | 16 | DONE | 100% |
 | M5.6 | OSM Sidewalk & Carriageway Overlay | 10 | IN PROGRESS | 30% |
-| M6 | Impact Panel Phase 1 | 14 | NOT STARTED | 0% |
-| M7 | Before / After View 2D | 28 | NOT STARTED | 0% |
+| M6 | Impact Panel Phase 1 | 14 | DONE | 100% |
+| M7 | Before / After View 2D | 28 | DONE | 100% |
+| M7.6 | Realistic Transformation Overlay | 20 | IN PROGRESS | 20% |
 | M7.5 | Street Cross-Section Panel | 20 | NOT STARTED | 0% |
 | M8 | Auth & Cloud Persistence | 34 | NOT STARTED | 0% |
 | M9 | Counterpoint Mode Phase 1 | 12 | NOT STARTED | 0% |
@@ -488,6 +509,10 @@ _Zone comparison / multi-zone analysis deferred to M6 (Impact Panel) and M7 (Bef
 | 2026-06-22 | Feature | M5.5 | Road-width band rendering: `computeSegmentBands()` via `turf.buffer()`+`turf.difference()`; outer parking ring + inner travel strip; `BAND_COLORS` + `getBandType()` maps active tags to band colour; `segment-bands-fill` + `segment-bands-outline` layers (minzoom 13); recomputed in `refreshMapData`; visibility toggle extended; M5.5 closed | 2.0 |
 | 2026-06-23 | Enhancement | M11/M3.8 | Terrain DEM toggle: `terrainEnabled` state; MapTiler `terrain-rgb-v2` raster-dem source; `setTerrain({ exaggeration:1.5 })`; pitch 55° on enable; `Terrain` button in view-controls; style-switch resilient; delivered ahead of M11 | 0.5 |
 | 2026-06-24 | Feature | M5.6 | OSM sidewalk fetch: `overpassToGeoJSON()` helper; `fetchOsmSidewalks()` queries Overpass API for `footway=sidewalk` ways; bbox cache via `osmSidewalksBboxRef`; debounced `moveend` re-fetch; `osm-sidewalks-line` layer (warm sand, zoom-responsive); `Sidewalks` toggle button with loading state | 1.0 |
+| 2026-07-03 | Feature | M6+M7 | M6 closed: block-cover %, tree count, speed-calming impact metrics; shared `renderImpactPanel()` for zones + segments. M7 drag slider: second MapLibre instance (`mapBefore`), lazy creation/destroy on split mode, `clip-path: inset()` clip, `startSplitDrag` pointer handler, BEFORE/AFTER labels, `jumpTo` sync. Before/After/Split toggle always visible on feature selection. Mutual exclusion: drawing tool ↔ feature selection (4 directions). Click-to-select refactor for segment + zone lists (Edit/Delete appear only when item selected). | 4.0 |
+| 2026-07-04 | Feature | M7 | M7 closed: stylistic overlay for transformed state (`computeZoneOverlaySymbols` pointGrid+booleanPointInPolygon; `computeSegmentOverlaySymbols` along+bearing+destination offset; `computeSegmentOverlayLines` lineOffset bike dashes); memo caches (`_bandsCache`, `_overlaySymCache`, `_overlayLineCache`, `_zoneSymCache`) keyed by featureId+tags+coordFingerprint eliminate redundant turf.buffer/pointGrid recomputation across refreshMapData calls. | 2.0 |
+| 2026-07-25 | Bug fix | M7 | Multi-type overlay fix for segments: `computeSegmentOverlaySymbols` now collects all active tag groups (green/seating/play) instead of single dominant type; distributes across left/right sides. Bike lane endpoint fin artifact fixed via 5 m inset before `turf.lineOffset`. Zone multi-type: `computeZoneOverlaySymbols` cycles types across shared grid. Building exclusion: zone points filtered via `queryRenderedFeatures` against building fill/extrusion layers in `refreshMapData`. | 1.5 |
+| 2026-07-25 | Feature | M7.6 | Phase 1 — real SVG icons: tree top-down canopy blob (multi-green circles + shadow); playground A-frame swing badge (blue); seating bench badge (orange). `loadMapIcons()` async loader registers SVG data-URI sprites via `map.loadImage`; called before `ensureSourcesAndLayers` on initial load and after each basemap style switch (style switch clears sprite atlas). Circle layer replaced with symbol layer (`icon-pitch-alignment: 'map'`, `icon-rotation-alignment: 'map'`); zoom-interpolated `icon-size` scales icons to ~10–15 m real-world at z17. M7.6 Phase 1 done. | 1.5 |
 
 _Add an entry when a milestone advances ≥10% or completes. Log focused engineering time only (exclude context switching)._
 
