@@ -238,6 +238,89 @@ function computeImpactMetrics(feature) {
   return metrics;
 }
 
+// --- M7: Render-result memo caches -----------------------------------------
+// All five expensive geometry computations (buffer, pointGrid, along×N, lineOffset) are
+// keyed by featureId + sorted-tags + coord-fingerprint so refreshMapData never recomputes
+// an unchanged feature. Coord fingerprint uses first/last point + count — cheap but reliably
+// changes when geometry is re-edited or a new segment is drawn.
+
+const _bandsCache      = new Map(); // segment → [band Polygon features]
+const _overlaySymCache = new Map(); // segment → [symbol Point features]
+const _overlayLineCache = new Map(); // segment → [offset LineString features]
+const _zoneSymCache    = new Map(); // zone    → [symbol Point features]
+
+function _featureCacheKey(feature) {
+  const id   = feature.properties?.id || '';
+  const tags = (feature.properties?.tags || []).slice().sort().join(',');
+  const c    = feature.geometry?.coordinates;
+  if (!c || !c.length) return `${id}:${tags}:empty`;
+  if (feature.geometry.type === 'LineString') {
+    return `${id}:${tags}:${c[0]},${c[c.length - 1]},${c.length}`;
+  }
+  if (feature.geometry.type === 'Polygon') {
+    const ring = c[0] || [];
+    return `${id}:${tags}:${ring[0]},${ring[ring.length - 1]},${ring.length}`;
+  }
+  return `${id}:${tags}:${c.length}`;
+}
+
+// --- M7.5 Phase 1: Real SVG icons for transformation overlay ---------------
+
+// Top-down tree canopy: organic multi-circle blob with shadow, realistic for overhead map view
+const _ICON_TREE = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <ellipse cx="35" cy="40" rx="18" ry="15" fill="#000" opacity="0.2"/>
+  <circle cx="32" cy="29" r="22" fill="#2d6a2d"/>
+  <circle cx="22" cy="22" r="12" fill="#3a8a3a"/>
+  <circle cx="39" cy="20" r="9" fill="#4caf50"/>
+  <circle cx="26" cy="15" r="7" fill="#66bb6a"/>
+  <circle cx="41" cy="34" r="9" fill="#1e4d1e"/>
+  <circle cx="27" cy="37" r="7" fill="#256825"/>
+</svg>`;
+
+// Side-view A-frame swing set on blue badge — recognizable playground symbol at small sizes
+const _ICON_PLAY = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#0277bd"/>
+  <line x1="8" y1="54" x2="32" y2="12" stroke="white" stroke-width="4" stroke-linecap="round"/>
+  <line x1="56" y1="54" x2="32" y2="12" stroke="white" stroke-width="4" stroke-linecap="round"/>
+  <line x1="6" y1="54" x2="58" y2="54" stroke="white" stroke-width="3" stroke-linecap="round"/>
+  <line x1="25" y1="13" x2="20" y2="42" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="39" y1="13" x2="44" y2="42" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+  <rect x="13" y="41" width="13" height="5" rx="2.5" fill="white"/>
+  <rect x="38" y="41" width="13" height="5" rx="2.5" fill="white"/>
+</svg>`;
+
+// Side-view park bench on orange badge — backrest + seat + legs silhouette
+const _ICON_SEATING = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#e65100"/>
+  <rect x="10" y="19" width="44" height="7" rx="3.5" fill="white" opacity="0.7"/>
+  <rect x="10" y="30" width="44" height="9" rx="4.5" fill="white"/>
+  <rect x="13" y="39" width="6" height="13" rx="3" fill="white" opacity="0.8"/>
+  <rect x="45" y="39" width="6" height="13" rx="3" fill="white" opacity="0.8"/>
+</svg>`;
+
+// Register custom overlay icons into MapLibre's sprite atlas.
+// Must be awaited before ensureSourcesAndLayers creates the symbol layer, since the layer
+// definition references these image IDs by name ('overlay-tree', etc.).
+// After a basemap style switch the atlas is cleared — this must be called again in attemptRestore.
+async function loadMapIcons(mapInstance) {
+  const defs = [
+    ['overlay-tree',    _ICON_TREE],
+    ['overlay-play',    _ICON_PLAY],
+    ['overlay-seating', _ICON_SEATING],
+  ];
+  await Promise.all(defs.map(([id, svg]) =>
+    new Promise(resolve => {
+      if (mapInstance.hasImage(id)) { resolve(); return; }
+      const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+      mapInstance.loadImage(url, (err, img) => {
+        if (!err && img && !mapInstance.hasImage(id)) mapInstance.addImage(id, img);
+        if (err) console.warn('[loadMapIcons] failed to load', id, err?.message);
+        resolve(); // always resolve — missing icon = invisible symbol, not a crash
+      });
+    })
+  ));
+}
+
 // --- M5.5: Road-width polygon rendering helpers ----------------------------
 
 // Fill colors keyed by band type — referenced in both the paint expression and band computation
@@ -270,6 +353,8 @@ function getBandType(bandRole, tags) {
 // manual bearing-offset approach produced self-intersecting polygons on curved paths.
 // Returns 2 features: an inner travel-lane strip and an outer parking/curb ring.
 function computeSegmentBands(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_bandsCache.has(_ckey)) return _bandsCache.get(_ckey);
   try {
     const coords = feature.geometry?.coordinates;
     if (!coords || coords.length < 2) return [];
@@ -308,11 +393,153 @@ function computeSegmentBands(feature) {
       properties: { segId, bandRole: 'travel', bandType: getBandType('travel-left', tags) }
     });
 
+    _bandsCache.set(_ckey, bands);
     return bands;
   } catch (e) {
     console.warn('[computeSegmentBands] error:', e?.message);
     return [];
   }
+}
+
+// Compute bands with no transformation tags applied — the "Before" state.
+// Identical geometry to computeSegmentBands but always returns neutral parking/travel colors.
+function computeSegmentBandsNeutral(feature) {
+  return computeSegmentBands({
+    ...feature,
+    properties: { ...feature.properties, tags: [] },
+  });
+}
+
+// M7: Generate evenly spaced Point symbols offset into the parking band for green / seating / play
+// transformations. All active overlay categories are rendered simultaneously — each type gets its
+// own side(s) so they don't compete: type[0]→left, type[1]→right, type[2+]→both sides.
+function computeSegmentOverlaySymbols(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_overlaySymCache.has(_ckey)) return _overlaySymCache.get(_ckey);
+  try {
+    const tags = feature.properties?.tags || [];
+    if (!tags.length) return [];
+    const coords = feature.geometry?.coordinates;
+    if (!coords || coords.length < 2) return [];
+
+    // Collect all active overlay types — bike is handled by line overlay, not circles
+    const activeTypes = [];
+    if (tags.some(t => ['trees','community-garden','flower-meadow','urban-orchard'].includes(t))) activeTypes.push('green');
+    if (tags.some(t => ['outdoor-seating','benches','bbq-station','parklet'].includes(t))) activeTypes.push('seating');
+    if (tags.some(t => ['playground','outdoor-gym','splash-pad','dog-park'].includes(t))) activeTypes.push('play');
+    if (!activeTypes.length) return [];
+
+    const offsetKm = 0.0035; // ~3.5 m into the parking band from centerline
+    const segId = feature.properties?.id;
+    const line = turf.lineString(coords);
+    const lengthKm = turf.length(line, { units: 'kilometers' });
+    const points = [];
+
+    activeTypes.forEach((type, typeIdx) => {
+      const spacing = type === 'green' ? 8 : type === 'play' ? 16 : 12;
+      if (lengthKm * 1000 < spacing) return;
+      const count = Math.floor((lengthKm * 1000) / spacing);
+
+      // Single type → both sides. Two types → left vs right. Third type → both sides.
+      const sides = activeTypes.length === 1 ? [-90, 90]
+        : typeIdx === 0 ? [-90]
+        : typeIdx === 1 ? [90]
+        : [-90, 90];
+
+      for (let i = 1; i <= count; i++) {
+        const distKm = (i / (count + 1)) * lengthKm;
+        const pt = turf.along(line, distKm, { units: 'kilometers' });
+        const aheadKm = Math.min(distKm + 0.002, lengthKm - 0.0001);
+        const ptAhead = turf.along(line, aheadKm, { units: 'kilometers' });
+        const bearing = turf.bearing(pt, ptAhead);
+
+        for (const side of sides) {
+          const sym = turf.destination(pt, offsetKm, bearing + side, { units: 'kilometers' });
+          sym.properties = { overlayType: type, segId };
+          points.push(sym);
+        }
+      }
+    });
+
+    _overlaySymCache.set(_ckey, points);
+    return points;
+  } catch { return []; }
+}
+
+// M7: Generate offset lines in the parking band for bike-lane dashed markings.
+// turf.lineOffset extends the offset line beyond the endpoint on curved roads (the "fin" artifact
+// where the line fans out past the intersection). Insetting 5 m from each end before offsetting
+// keeps the dashes within the segment's actual extent.
+function computeSegmentOverlayLines(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_overlayLineCache.has(_ckey)) return _overlayLineCache.get(_ckey);
+  try {
+    const tags = feature.properties?.tags || [];
+    if (!tags.includes('bike-lane')) return [];
+    const coords = feature.geometry?.coordinates;
+    if (!coords || coords.length < 2) return [];
+
+    const line = turf.lineString(coords);
+    const segId = feature.properties?.id;
+    const totalLen = turf.length(line, { units: 'kilometers' });
+
+    // Inset 5 m from each end before offsetting to suppress endpoint fin artifacts
+    const insetKm = 0.005;
+    const innerLine = totalLen > insetKm * 3
+      ? turf.lineSliceAlong(line, insetKm, totalLen - insetKm, { units: 'kilometers' })
+      : line;
+
+    // Offset 3.5 m on each side to sit in the center of the parking band
+    const left  = turf.lineOffset(innerLine,  0.0035, { units: 'kilometers' });
+    const right = turf.lineOffset(innerLine, -0.0035, { units: 'kilometers' });
+    left.properties  = { segId, overlayLineType: 'bike' };
+    right.properties = { segId, overlayLineType: 'bike' };
+    const result = [left, right];
+    _overlayLineCache.set(_ckey, result);
+    return result;
+  } catch { return []; }
+}
+
+// M7: Generate symbol points distributed inside a zone polygon for the After-view overlay.
+// All active overlay categories are shown simultaneously by cycling types across a shared grid —
+// green/play/seating points interleave naturally without needing separate grid passes.
+// Building exclusion is applied later in refreshMapData via queryRenderedFeatures.
+function computeZoneOverlaySymbols(feature) {
+  const _ckey = _featureCacheKey(feature);
+  if (_zoneSymCache.has(_ckey)) return _zoneSymCache.get(_ckey);
+  try {
+    const tags = feature.properties?.tags || [];
+    if (!tags.length) return [];
+    const geom = feature.geometry;
+    if (!geom || (geom.type !== 'Polygon' && geom.type !== 'MultiPolygon')) return [];
+
+    // Collect all active overlay types — same tag groups as segment overlay
+    const activeTypes = [];
+    if (tags.some(t => ['trees','community-garden','flower-meadow','urban-orchard','stormwater-planters'].includes(t))) activeTypes.push('green');
+    if (tags.some(t => ['playground','outdoor-gym','splash-pad','dog-park'].includes(t))) activeTypes.push('play');
+    if (tags.some(t => ['outdoor-seating','benches','bbq-station','parklet'].includes(t))) activeTypes.push('seating');
+    if (!activeTypes.length) return [];
+
+    // Use the finest spacing so the grid is dense enough to represent every active type
+    const spacings = { green: 15, play: 25, seating: 20 };
+    const minSpacing = Math.min(...activeTypes.map(t => spacings[t]));
+
+    const bbox = turf.bbox(feature);
+    const grid = turf.pointGrid(bbox, minSpacing, { units: 'meters' });
+    const zoneId = feature.properties?.id;
+
+    const filtered = grid.features
+      .filter(pt => { try { return turf.booleanPointInPolygon(pt, feature); } catch { return false; } });
+
+    // Assign types by cycling through activeTypes — produces a natural interleaved mix.
+    // Cap at 300 total to avoid rendering overhead on very large zones.
+    const result = filtered
+      .slice(0, 300)
+      .map((pt, i) => ({ ...pt, properties: { overlayType: activeTypes[i % activeTypes.length], segId: zoneId } }));
+
+    _zoneSymCache.set(_ckey, result);
+    return result;
+  } catch { return []; }
 }
 
 function explodeToLineStrings(feature) {
@@ -428,6 +655,10 @@ export default function App() {
   const [buildings3DEnabled, setBuildings3DEnabled] = useState(false); // 3D building extrusion toggle
   const [terrainEnabled, setTerrainEnabled] = useState(false);         // terrain DEM extrusion (satellite)
   const [streets3DHintDismissed, setStreets3DHintDismissed] = useState(false); // one-per-session dismiss
+  const [viewMode, setViewMode] = useState('after'); // M7: 'before' | 'after' | 'split'
+  const mapBefore = useRef(null);           // M7: second MapLibre instance for split before-view
+  const mapBeforeContainerRef = useRef(null); // container div for the before map
+  const [splitPos, setSplitPos] = useState(0.5); // M7: 0–1 left-to-right divider position
   const [osmSidewalksEnabled, setOsmSidewalksEnabled] = useState(false);
   const [osmSidewalksFetching, setOsmSidewalksFetching] = useState(false);
   const [osmSidewalksCount, setOsmSidewalksCount] = useState(null); // feature count from last successful fetch
@@ -734,6 +965,23 @@ export default function App() {
 
   // --- helpers ----------------------------------------------------
 
+  // M7: Initiate pointer drag on the split-view divider handle
+  function startSplitDrag(e) {
+    e.preventDefault();
+    const container = mapContainer.current;
+    if (!container) return;
+    function onMove(ev) {
+      const rect = container.getBoundingClientRect();
+      setSplitPos(Math.max(0.05, Math.min(0.95, (ev.clientX - rect.left) / rect.width)));
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
   function convertToSquareFeet(squareMeters) {
     return squareMeters * 10.7639;
   }
@@ -956,6 +1204,20 @@ export default function App() {
       if (hit) return { source: hit.source, sourceLayer: 'building' };
     } catch {}
     return null;
+  }
+
+  // Returns all rendered layer IDs that represent building footprints — used to exclude
+  // zone overlay symbols from landing on top of buildings.
+  function getBuildingLayerIds(mapInstance) {
+    try {
+      const layers = mapInstance.getStyle()?.layers || [];
+      const ids = layers
+        .filter(l => l['source-layer'] === 'building' && (l.type === 'fill' || l.type === 'fill-extrusion'))
+        .map(l => l.id);
+      // Include our custom extrusion layer if it exists
+      if (mapInstance.getLayer('buildings-3d')) ids.push('buildings-3d');
+      return ids;
+    } catch { return []; }
   }
 
   function ensureSourcesAndLayers(mapInstance) {
@@ -1228,6 +1490,107 @@ export default function App() {
       });
     }
 
+    // M7: "Before" state bands — same geometry as segment-bands but locked to neutral colors.
+    // Hidden when viewMode === 'after'; visible when viewMode === 'before'.
+    if (!mapInstance.getSource('segment-bands-before')) {
+      mapInstance.addSource('segment-bands-before', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('segment-bands-before-fill')) {
+      mapInstance.addLayer({
+        id: 'segment-bands-before-fill',
+        type: 'fill',
+        source: 'segment-bands-before',
+        minzoom: 13,
+        layout: { visibility: 'none' },
+        paint: {
+          'fill-color': [
+            'match', ['get', 'bandType'],
+            'travel',  BAND_COLORS.travel,
+            BAND_COLORS.parking   // outer ring always neutral
+          ],
+          'fill-opacity': 0.88
+        }
+      });
+    }
+    if (!mapInstance.getLayer('segment-bands-before-outline')) {
+      mapInstance.addLayer({
+        id: 'segment-bands-before-outline',
+        type: 'line',
+        source: 'segment-bands-before',
+        minzoom: 13,
+        layout: { visibility: 'none' },
+        paint: {
+          'line-color': '#6b5e54',
+          'line-width': 0.5,
+          'line-opacity': 0.45
+        }
+      });
+    }
+
+    // M7: After-view symbol overlay — circles for green / seating / play transformations
+    if (!mapInstance.getSource('segment-overlay-circles')) {
+      mapInstance.addSource('segment-overlay-circles', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('segment-overlay-circles-layer')) {
+      mapInstance.addLayer({
+        id: 'segment-overlay-circles-layer',
+        type: 'symbol',
+        source: 'segment-overlay-circles',
+        minzoom: 14,
+        layout: {
+          // Map each overlayType to its registered sprite name (loaded by loadMapIcons)
+          'icon-image': ['match', ['get', 'overlayType'],
+            'green',   'overlay-tree',
+            'play',    'overlay-play',
+            'seating', 'overlay-seating',
+            'overlay-tree'
+          ],
+          // Scale icons so they represent ~10–15 m of real-world space at each zoom level.
+          // The 64 px icon is sized to ~10 m at zoom 17–18 for accurate street-scale planning.
+          'icon-size': ['interpolate', ['exponential', 2], ['zoom'],
+            14, 0.10,
+            16, 0.20,
+            18, 0.50,
+            20, 1.20,
+          ],
+          'icon-allow-overlap': true,
+          'icon-ignore-placement': true,
+          // 'map' alignment: icons lie flat on the ground plane, staying correctly scaled
+          // in 3D tilt mode rather than billboarding toward the camera.
+          'icon-pitch-alignment': 'map',
+          'icon-rotation-alignment': 'map',
+        },
+      });
+    }
+
+    // M7: After-view line overlay — dashed markings for bike-lane transformations
+    if (!mapInstance.getSource('segment-overlay-lines')) {
+      mapInstance.addSource('segment-overlay-lines', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+    }
+    if (!mapInstance.getLayer('segment-overlay-lines-layer')) {
+      mapInstance.addLayer({
+        id: 'segment-overlay-lines-layer',
+        type: 'line',
+        source: 'segment-overlay-lines',
+        minzoom: 14,
+        paint: {
+          'line-color': '#1565c0',
+          'line-width': 2,
+          'line-dasharray': [4, 3],
+          'line-opacity': 0.9,
+        }
+      });
+    }
+
     // Saved street segments
     if (!mapInstance.getSource('saved-street-segments')) {
       mapInstance.addSource('saved-street-segments', {
@@ -1482,19 +1845,61 @@ export default function App() {
       try { mapInstance.setFilter('saved-street-segments-selected', filt); } catch {}
     }
 
-    // Recompute band polygons for all visible saved segments (M5.5)
+    // Recompute "after" band polygons (tag-colored) and "before" bands (neutral) for all segments
+    const visibleSegments = (savedStreetSegments || []).filter(f => {
+      const fid = f?.properties?.id || f?.id;
+      return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+    });
     const bandsFC = {
       type: 'FeatureCollection',
-      features: (savedStreetSegments || [])
-        .filter(f => {
-          const fid = f?.properties?.id || f?.id;
-          return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
-        })
-        .flatMap(f => computeSegmentBands(f))
+      features: visibleSegments.flatMap(f => computeSegmentBands(f))
     };
-    // Source may not exist yet if the map hasn't loaded; ensureSourcesAndLayers + refreshMapData
-    // are called together in the load/styledata handlers, so the next call will populate it.
+    const bandsBeforeFC = {
+      type: 'FeatureCollection',
+      features: visibleSegments.flatMap(f => computeSegmentBandsNeutral(f))
+    };
+    // Sources may not exist yet on first load; ensureSourcesAndLayers runs first in the chain.
     mapInstance.getSource('segment-bands')?.setData(bandsFC);
+    mapInstance.getSource('segment-bands-before')?.setData(bandsBeforeFC);
+
+    // M7: Overlay symbols (circles) for the After-view stylistic overlay.
+    // Zone symbols are filtered to exclude building footprints via queryRenderedFeatures —
+    // the raw grid from computeZoneOverlaySymbols is cached; building exclusion runs here
+    // so it reflects the current viewport without busting the geometry cache.
+    const buildingLayerIds = getBuildingLayerIds(mapInstance);
+    const zoneOverlaySymbols = (savedList || []).flatMap(f => {
+      const pts = computeZoneOverlaySymbols(f);
+      if (!buildingLayerIds.length || !pts.length) return pts;
+      try {
+        const [minLng, minLat, maxLng, maxLat] = turf.bbox(f);
+        const sw = mapInstance.project([minLng, minLat]);
+        const ne = mapInstance.project([maxLng, maxLat]);
+        // queryRenderedFeatures uses screen coords: topLeft=[minX,minY], bottomRight=[maxX,maxY]
+        const buildingFeatures = mapInstance.queryRenderedFeatures(
+          [[sw.x, ne.y], [ne.x, sw.y]],
+          { layers: buildingLayerIds }
+        );
+        const buildingPolys = buildingFeatures.filter(
+          b => b.geometry?.type === 'Polygon' || b.geometry?.type === 'MultiPolygon'
+        );
+        if (!buildingPolys.length) return pts;
+        return pts.filter(pt =>
+          !buildingPolys.some(b => { try { return turf.booleanPointInPolygon(pt, b); } catch { return false; } })
+        );
+      } catch { return pts; }
+    });
+
+    mapInstance.getSource('segment-overlay-circles')?.setData({
+      type: 'FeatureCollection',
+      features: [
+        ...visibleSegments.flatMap(f => computeSegmentOverlaySymbols(f)),
+        ...zoneOverlaySymbols,
+      ],
+    });
+    mapInstance.getSource('segment-overlay-lines')?.setData({
+      type: 'FeatureCollection',
+      features: visibleSegments.flatMap(f => computeSegmentOverlayLines(f)),
+    });
   }
 
   // Build a zone summary from any Feature<Polygon>
@@ -2107,7 +2512,8 @@ export default function App() {
 
     map.current.addControl(new maplibregl.NavigationControl(), "top-right");
 
-    map.current.on("load", () => {
+    map.current.on("load", async () => {
+      await loadMapIcons(map.current);
       ensureSourcesAndLayers(map.current);
       refreshMapData(map.current, drawnCoords, useType, savedZones);
       applySelectedFilter(map.current, selectedSavedIndex);
@@ -2126,9 +2532,10 @@ export default function App() {
     // Orphan old listeners just in case
     const restoreKey = `__restore_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
-    function attemptRestore(stage) {
+    async function attemptRestore(stage) {
       // eslint-disable-next-line no-console
       console.log('[style-switch] attemptRestore', stage);
+      await loadMapIcons(m); // style switch clears the sprite atlas — re-register icons first
       ensureSourcesAndLayers(m);
       refreshMapData(m, drawnCoords, useType, savedZones);
       applySelectedFilter(m, selectedSavedIndex);
@@ -2685,8 +3092,8 @@ export default function App() {
     const m = map.current;
 
     const onClickSaved = (e) => {
-      // Prevent selecting a different zone while editing geometry of another
-      if (editingSavedIndex != null) return;
+      // Block selection while any drawing tool is active or a zone is being edited
+      if (activeTool !== 'none' || editingSavedIndex != null) return;
       const f = e.features?.[0];
       if (!f) return;
       const idx = f.properties?.__sid;
@@ -2705,16 +3112,15 @@ export default function App() {
     return () => {
       m.off("click", "saved-zones-fill", onClickSaved);
     };
-  }, [savedZones, editingSavedIndex, basemapStyle]);
+  }, [savedZones, editingSavedIndex, activeTool, basemapStyle]);
 
   // Click on saved street segments to select & fly
   useEffect(() => {
     if (!map.current) return;
     const m = map.current;
     const handler = (e) => {
-      // Ignore while editing a different street geometry (editingStreetSegmentId) or in polygon draw mode
-      if (editingStreetSegmentId) return;
-      if (drawMode) return;
+      // Block selection while any drawing tool is active or a segment geometry is being edited
+      if (editingStreetSegmentId || activeTool !== 'none') return;
       const f = e.features?.[0];
       if (!f) return;
       const sid = f.properties?.__sid;
@@ -2747,7 +3153,7 @@ export default function App() {
       m.off('click', 'saved-street-segments-line', handler);
       m.off('click', 'saved-street-segments-casing', handler);
     };
-  }, [savedStreetSegments, editingStreetSegmentId, drawMode, basemapStyle]);
+  }, [savedStreetSegments, editingStreetSegmentId, activeTool, basemapStyle]);
 
   // Sync saved street segment layer visibility when the toggle changes or after a style switch
   useEffect(() => {
@@ -2755,7 +3161,8 @@ export default function App() {
     const m = map.current;
     const vis = segmentsVisible ? 'visible' : 'none';
     ['saved-street-segments-line', 'saved-street-segments-casing', 'saved-street-segments-selected',
-     'segment-bands-fill', 'segment-bands-outline'].forEach(id => {
+     'segment-bands-fill', 'segment-bands-outline',
+     'segment-overlay-circles-layer', 'segment-overlay-lines-layer'].forEach(id => {
       try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', vis); } catch {}
     });
   }, [segmentsVisible, basemapStyle]);
@@ -2860,6 +3267,104 @@ export default function App() {
     }
   }
 
+  // M7: Swap segment-bands visibility between "before" (neutral) and "after" (tag-colored);
+  // also hide the stylistic overlay layers in Before view.
+  useEffect(() => {
+    if (!map.current) return;
+    const m = map.current;
+    const isBefore = viewMode === 'before';
+    [
+      ['segment-bands-fill',            !isBefore],
+      ['segment-bands-outline',         !isBefore],
+      ['segment-bands-before-fill',      isBefore],
+      ['segment-bands-before-outline',   isBefore],
+      ['segment-overlay-circles-layer', !isBefore],
+      ['segment-overlay-lines-layer',   !isBefore],
+    ].forEach(([id, visible]) => {
+      try { if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none'); } catch {}
+    });
+  }, [viewMode, basemapStyle]);
+
+  // M7: Create / destroy the split-view "before" MapLibre instance.
+  // Only active when viewMode === 'split'; re-creates on basemap style change.
+  useEffect(() => {
+    const mainMap = map.current;
+    if (viewMode !== 'split' || !mainMap || !mapBeforeContainerRef.current) return;
+    if (mapBefore.current) return; // already running
+
+    const before = new maplibregl.Map({
+      container: mapBeforeContainerRef.current,
+      style: maptilerStyles[basemapStyle],
+      center: mainMap.getCenter(),
+      zoom: mainMap.getZoom(),
+      bearing: mainMap.getBearing(),
+      pitch: mainMap.getPitch(),
+      interactive: false,
+      attributionControl: false,
+    });
+    mapBefore.current = before;
+
+    before.on('load', () => {
+      // Neutral band source + layers — same palette as BAND_COLORS.travel / parking
+      before.addSource('split-bands', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      before.addLayer({
+        id: 'split-bands-fill', type: 'fill', source: 'split-bands', minzoom: 13,
+        paint: {
+          'fill-color': ['match', ['get', 'bandType'], 'travel', BAND_COLORS.travel, BAND_COLORS.parking],
+          'fill-opacity': 0.88,
+        }
+      });
+      before.addLayer({
+        id: 'split-bands-outline', type: 'line', source: 'split-bands', minzoom: 13,
+        paint: { 'line-color': '#6b5e54', 'line-width': 0.5, 'line-opacity': 0.45 }
+      });
+      // Populate with neutral band polygons for all visible saved segments
+      const segs = (savedStreetSegments || []).filter(f => {
+        const fid = f?.properties?.id || f?.id;
+        return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+      });
+      before.getSource('split-bands')?.setData({
+        type: 'FeatureCollection',
+        features: segs.flatMap(f => computeSegmentBandsNeutral(f)),
+      });
+    });
+
+    // Keep before map in sync with main map pan / zoom / rotate
+    function onMainMove() {
+      if (!mapBefore.current || !map.current) return;
+      mapBefore.current.jumpTo({
+        center: map.current.getCenter(),
+        zoom: map.current.getZoom(),
+        bearing: map.current.getBearing(),
+        pitch: map.current.getPitch(),
+      });
+    }
+    mainMap.on('move', onMainMove);
+
+    return () => {
+      mainMap.off('move', onMainMove);
+      if (mapBefore.current) {
+        mapBefore.current.remove();
+        mapBefore.current = null;
+      }
+    };
+  }, [viewMode, basemapStyle]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // M7: Re-push neutral band data to the before map whenever segments change during split mode
+  useEffect(() => {
+    if (!mapBefore.current || viewMode !== 'split') return;
+    const before = mapBefore.current;
+    if (!before.isStyleLoaded()) return;
+    const segs = (savedStreetSegments || []).filter(f => {
+      const fid = f?.properties?.id || f?.id;
+      return editingStreetSegmentId ? fid !== editingStreetSegmentId : true;
+    });
+    before.getSource('split-bands')?.setData({
+      type: 'FeatureCollection',
+      features: segs.flatMap(f => computeSegmentBandsNeutral(f)),
+    });
+  }, [savedStreetSegments, editingStreetSegmentId, viewMode]);
+
   // Show / hide OSM sidewalk layer and trigger initial fetch when toggle changes
   useEffect(() => {
     if (!map.current) return;
@@ -2925,6 +3430,15 @@ export default function App() {
       setShowHelpBox(true);
     }
   }, [drawMode]);
+
+  // Reset drawing tool to Off when a feature is selected so the tool panel
+  // always reflects the idle state while a segment or zone summary is shown.
+  // The activeTool effect below will also clear any in-progress polygon draw.
+  useEffect(() => {
+    if (selectedStreetSegmentIndex !== null || selectedSavedIndex !== null) {
+      setActiveTool('none');
+    }
+  }, [selectedStreetSegmentIndex, selectedSavedIndex]);
 
   // Keep drawMode in sync with active tool & clear when switching away
   useEffect(() => {
@@ -4237,7 +4751,8 @@ export default function App() {
     return (
       <div className="transformation-menu" style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #eee' }}>
         <h3 className="transformation-menu__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: '0 0 0.6rem' }}>Transformations</h3>
-        <div className="transformation-menu__groups" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+        {/* max-height keeps this list from pushing impact panel off-screen; user scrolls within this box */}
+        <div className="transformation-menu__groups" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', maxHeight: '220px', overflowY: 'auto', paddingRight: '0.3rem' }}>
           {TRANSFORMATION_TAG_GROUPS.map(grp => (
             <div key={grp.group} className="transformation-menu__group">
               <div className="transformation-menu__group-label" style={{ fontSize: '0.65rem', fontWeight: 700, color: '#999', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.3rem' }}>{grp.group}</div>
@@ -4269,19 +4784,46 @@ export default function App() {
     );
   }
 
-  // Render the impact metrics panel below the transformation menu.
+  // Render the impact metrics panel.
   // blockCoverPct always shows; treeCount and speedCalming appear only when relevant tags are on.
-  function renderImpactPanel(metrics) {
+  // showToggle: embed the Before/After view toggle in the panel title row (street segments with tags).
+  function renderImpactPanel(metrics, showToggle = false) {
     if (!metrics) return null;
     const hasAny = metrics.blockCoverPct != null || metrics.treeCount != null || metrics.speedCalming != null;
-    if (!hasAny) return null;
+    if (!hasAny && !showToggle) return null;
 
     const CALMING_COLOR = { 'Car-Free': '#00897b', 'Very High': '#2e7d32', High: '#558b2f', Moderate: '#f57f17', Low: '#e65100' };
     const CALMING_STEPS = ['Low', 'Moderate', 'High', 'Very High', 'Car-Free'];
 
     return (
       <div className="impact-panel" style={{ marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid #eee' }}>
-        <h3 className="impact-panel__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: '0 0 0.6rem' }}>Estimated Impact</h3>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.6rem' }}>
+          <h3 className="impact-panel__title" style={{ fontSize: '0.9rem', fontWeight: 600, margin: 0 }}>Estimated Impact</h3>
+          {/* Before / Split / After view toggle — sits here so it's never scrolled off-screen */}
+          {showToggle && (
+            <div className="before-after-toggle" style={{ display: 'flex', borderRadius: 6, overflow: 'hidden', border: '1px solid #ccc', fontSize: '0.72rem' }}>
+              {[
+                { key: 'before', label: 'Before' },
+                { key: 'split',  label: '⇔' },
+                { key: 'after',  label: 'After' },
+              ].map(({ key, label }) => (
+                <button
+                  key={key}
+                  className={`before-after-toggle__btn${viewMode === key ? ' is-active' : ''}`}
+                  title={key === 'split' ? 'Split view — drag divider on map' : key.charAt(0).toUpperCase() + key.slice(1)}
+                  onClick={() => setViewMode(key)}
+                  style={{
+                    padding: '0.2rem 0.55rem', border: 'none', cursor: 'pointer',
+                    background: viewMode === key ? '#1976d2' : '#fff',
+                    color:      viewMode === key ? '#fff'    : '#444',
+                    fontWeight: viewMode === key ? 600 : 400,
+                    textTransform: 'capitalize', transition: 'all 0.15s',
+                  }}
+                >{label}</button>
+              ))}
+            </div>
+          )}
+        </div>
         <div className="impact-panel__metrics" style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
 
           {/* Block coverage % */}
@@ -4409,6 +4951,7 @@ export default function App() {
     setEditingSavedIndex(null);
     setEditingStreetSegmentId(null);
     setZoneSummary(null);
+    setViewMode('after'); // reset to After view so the next selection starts fresh
     // streetSegmentSummary & ephemeralStreetPathSummary are derived via useMemo, so clearing source state is enough
     setDrawMode(null);
     setStartPoint(null);
@@ -5042,6 +5585,9 @@ export default function App() {
   const creationLock = streetCreationLock || polygonCreationLock;
   // Additional lock when editing an existing street segment
   const editingStreetLock = !!editingStreetSegmentId;
+  // True when a saved feature is selected but not being actively drawn/edited.
+  // Disables the drawing tool so users must Cancel before starting a new feature.
+  const featureSelected = selectedStreetSegmentIndex !== null || selectedSavedIndex !== null;
   // Overarching UI lock used to disable other lists and controls while creating or editing
   const uiLock = creationLock || editingStreetLock || (showSavePanel && polygonActive);
   // Card style reused for summary panel (was referenced but not declared)
@@ -5061,7 +5607,7 @@ export default function App() {
       : pendingName || "Custom Zone";
 
   return (
-    <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
+    <div style={{ height: "100vh", width: "100vw", position: "relative", overflow: "hidden" }}>
       {/* Global overlay to block all interactions outside active edit context */}
       {(showSavePanel && polygonActive && editingSavedIndex == null) && (
         <div
@@ -5083,6 +5629,57 @@ export default function App() {
         style={{ position: "absolute", inset: 0, zIndex: 0 }}
       />
 
+      {/* M7: Before-view container for split mode — clipped to the left of the divider */}
+      <div
+        ref={mapBeforeContainerRef}
+        className="split-view__before-map"
+        style={{
+          position: 'absolute', inset: 0, zIndex: 1,
+          pointerEvents: 'none',
+          visibility: viewMode === 'split' ? 'visible' : 'hidden',
+          clipPath: viewMode === 'split' ? `inset(0 calc(${(1 - splitPos) * 100}%) 0 0)` : 'none',
+        }}
+      />
+
+      {/* M7: Draggable divider handle for split mode */}
+      {viewMode === 'split' && (
+        <div className="split-view__handle" style={{
+          position: 'absolute', top: 0, bottom: 0, zIndex: 5,
+          left: `calc(${splitPos * 100}% - 20px)`,
+          width: 40, display: 'flex', flexDirection: 'column', alignItems: 'center',
+          cursor: 'col-resize',
+          pointerEvents: 'auto',
+        }} onPointerDown={startSplitDrag}>
+          {/* vertical rule */}
+          <div className="split-view__rule" style={{
+            position: 'absolute', top: 0, bottom: 0, left: '50%',
+            width: 2, background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.5)',
+          }} />
+          {/* grip knob */}
+          <div className="split-view__knob" style={{
+            position: 'absolute', top: '50%', left: '50%',
+            transform: 'translate(-50%, -50%)',
+            width: 36, height: 36, borderRadius: '50%',
+            background: '#fff', boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: '0.85rem', color: '#444', userSelect: 'none',
+          }}>⇔</div>
+          {/* BEFORE / AFTER labels */}
+          <div className="split-view__label split-view__label--before" style={{
+            position: 'absolute', top: 12, right: 'calc(50% + 8px)',
+            background: 'rgba(0,0,0,0.55)', color: '#fff',
+            fontSize: '0.7rem', fontWeight: 700, letterSpacing: '0.05em',
+            padding: '0.15rem 0.4rem', borderRadius: 4, whiteSpace: 'nowrap',
+          }}>BEFORE</div>
+          <div className="split-view__label split-view__label--after" style={{
+            position: 'absolute', top: 12, left: 'calc(50% + 8px)',
+            background: 'rgba(0,0,0,0.55)', color: '#fff',
+            fontSize: '0.7rem', fontWeight: 700, letterSpacing: '0.05em',
+            padding: '0.15rem 0.4rem', borderRadius: 4, whiteSpace: 'nowrap',
+          }}>AFTER</div>
+        </div>
+      )}
+
       <div id="tool-panel" className="tool-panel" style={controlPanelStyle}>
         {/* Tool mode selector — Off / Polygon / Street */}
         <div className="tool-panel__label" style={labelStyle}>Drawing tool</div>
@@ -5093,6 +5690,7 @@ export default function App() {
             { key: 'street', label: 'Street' }
           ].map(btn => {
             const active = activeTool === btn.key;
+            const toolLocked = creationLock || editingAny || featureSelected;
             return (
               <button
                 key={btn.key}
@@ -5100,8 +5698,9 @@ export default function App() {
                 className={`tool-panel__btn btn ${active ? 'is-active' : ''}`}
                 role="radio"
                 aria-checked={active}
-                disabled={creationLock || editingAny}
-                onClick={() => { if (creationLock || editingAny) return; setActiveTool(btn.key); }}
+                disabled={toolLocked}
+                title={featureSelected ? 'Click Cancel to deselect before drawing' : undefined}
+                onClick={() => { if (toolLocked) return; setActiveTool(btn.key); }}
                 style={{
                   ...buttonStyle,
                   backgroundColor: active ? '#007bff' : '#e2e6ea',
@@ -5109,8 +5708,8 @@ export default function App() {
                   fontWeight: active ? 600 : 500,
                   padding: '0.4rem 0.65rem',
                   minWidth: 62,
-                  opacity: (creationLock || editingAny) ? 0.5 : 1,
-                  cursor: (creationLock || editingAny) ? 'not-allowed' : 'pointer'
+                  opacity: toolLocked ? 0.5 : 1,
+                  cursor: toolLocked ? 'not-allowed' : 'pointer'
                 }}
               >{btn.label}</button>
             );
@@ -5370,9 +5969,11 @@ export default function App() {
                   <h2 style={{ fontSize: '1.2rem', margin:0 }}>
                     {zoneSummary ? 'Zone Summary' : 'Street Segment Summary'}
                   </h2>
-                  {(zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && !polygonCreationLock && !(showSavePanel && polygonActive && editingSavedIndex == null) && !(showSavePanel && polygonActive && editingSavedIndex != null) && !editingStreetSegmentId && (
-                    <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
-                  )}
+                  <div style={{ display:'flex', gap:'0.4rem', alignItems:'center' }}>
+                    {(zoneSummary || (streetSegmentSummary && !ephemeralStreetPathSummary)) && !polygonCreationLock && !(showSavePanel && polygonActive && editingSavedIndex == null) && !(showSavePanel && polygonActive && editingSavedIndex != null) && !editingStreetSegmentId && (
+                      <button onClick={cancelAllSelections} className="btn btn--cancel" style={buttonVariants.outline}>Cancel</button>
+                    )}
+                  </div>
                 </div>
                 {zoneSummary && (
                   <div className="summary-card__zone" style={polygonCreationLock ? { pointerEvents:'auto' } : {}}>
@@ -5385,7 +5986,7 @@ export default function App() {
                 )}
                 {/* Impact panel above transformation menu so it stays visible regardless of menu length */}
                 {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
-                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]))
+                  renderImpactPanel(computeImpactMetrics(savedZones[selectedSavedIndex]), true)
                 }
                 {/* Transformation menu — shown on saved zone selection, hidden during draw/edit flows */}
                 {zoneSummary && summaryContext === 'saved' && editingSavedIndex == null && !editingStreetSegmentId &&
@@ -5434,9 +6035,12 @@ export default function App() {
                     {editingStreetSegmentSummary && (
                       <div style={{ fontSize:'0.75rem', color:'#555', marginTop:'0.25rem' }}>Editing saved street segment</div>
                     )}
-                    {/* Impact panel above transformation menu so it stays in view */}
+                    {/* Impact panel contains Before/After toggle so both stay above the scrollable tag list */}
                     {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
-                      renderImpactPanel(computeImpactMetrics(selectedStreetSegment))
+                      renderImpactPanel(
+                        computeImpactMetrics(selectedStreetSegment),
+                        true
+                      )
                     }
                     {/* Transformation menu — shown on saved segment selection, hidden during geometry edit */}
                     {streetSegmentSummary && !editingStreetSegmentId && !ephemeralStreetPathSummary &&
@@ -5566,87 +6170,75 @@ export default function App() {
                   >
                     {savedZones.map((f, idx) => {
                       const zoneSelected = selectedSavedIndex === idx;
+                      const editingThis = editingSavedIndex === idx;
+                      const editingActive = editingSavedIndex != null;
+                      const itemLocked = creationLock || (editingActive && !editingThis) || activeTool !== 'none';
+
+                      function handleZoneClick() {
+                        if (itemLocked) return;
+                        if (zoneSelected) {
+                          setSelectedSavedIndex(null);
+                          applySelectedFilter(map.current, null);
+                        } else {
+                          setSelectedSavedIndex(idx);
+                          setSelectedStreetSegmentIndex(null);
+                          applySelectedFilter(map.current, idx);
+                          flyToSaved(f);
+                          setSidebarVisible(true);
+                        }
+                      }
+
                       return (
                       <li
                         key={idx}
                         className={`list-item zone-item ${zoneSelected ? 'is-selected' : ''}`}
+                        onClick={handleZoneClick}
+                        title={itemLocked && !zoneSelected ? 'Switch drawing tool to Off first' : undefined}
                         style={{
                           background: '#fff',
                           border: '1px solid #e5e5e5',
                           borderRadius: 8,
                           padding: '0.5rem',
-                          ...(zoneSelected ? selectedCardStyle : {})
+                          cursor: itemLocked ? 'default' : 'pointer',
+                          opacity: itemLocked && !zoneSelected ? 0.65 : 1,
+                          ...(zoneSelected ? selectedCardStyle : {}),
                         }}
                       >
-                        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8 }}>
-                          <div style={{ fontWeight: 600, fontSize:'0.9rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                          <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
                             {f.properties?.name || `Zone ${idx + 1}`}
-                            {selectedSavedIndex === idx ? " • selected" : ""}
+                            {zoneSelected ? ' • selected' : ''}
                           </div>
-                          <span style={{ width:12, height:12, borderRadius:3, background: colorByUse[f.properties?.useType || 'mixed-use'], border:'1px solid #ccc' }} />
+                          <span style={{ width: 12, height: 12, borderRadius: 3, background: colorByUse[f.properties?.useType || 'mixed-use'], border: '1px solid #ccc' }} />
                         </div>
 
                         {f.properties?.description && (
-                          <div style={{ fontSize: "0.85rem", marginTop: 4 }}>
+                          <div style={{ fontSize: '0.85rem', marginTop: 4 }}>
                             {f.properties.description}
                           </div>
                         )}
 
-                        <div style={{ fontSize: "0.8rem", marginTop: 4 }}>
-                          {f.properties?.address?.street ||
-                            f.properties?.address?.city ||
-                            ""}
+                        <div style={{ fontSize: '0.8rem', marginTop: 4 }}>
+                          {f.properties?.address?.street || f.properties?.address?.city || ''}
                         </div>
 
-                        {/* Removed per-zone inline type select to simplify UI */}
-
-                        {!isEditingSaved && !uiLock && (
-                          <div
-                            style={{
-                              display: "flex",
-                              gap: "0.5rem",
-                              marginTop: 6,
-                              flexWrap: "wrap",
-                            }}
-                          >
+                        {zoneSelected && !editingThis && !uiLock && (
+                          <div style={{ display: 'flex', gap: '0.5rem', marginTop: 6, flexWrap: 'wrap' }}
+                            onClick={e => e.stopPropagation()}>
                             <button
-                              disabled={isEditingSaved || creationLock}
-                              onClick={() => {
-                                if (isEditingSaved || creationLock) return;
-                                if (selectedSavedIndex === idx) {
-                                  setSelectedSavedIndex(null);
-                                  applySelectedFilter(map.current, null);
-                                } else {
-                                  setSelectedSavedIndex(idx);
-                                  setSelectedStreetSegmentIndex(null);
-                                  applySelectedFilter(map.current, idx);
-                                  flyToSaved(f);
-                                }
-                              }}
-                              className={`btn btn--select ${isEditingSaved ? 'is-disabled' : ''}`}
-                              title={isEditingSaved ? 'Finish or cancel current edit first' : 'Select'}
-                              style={{ ...(selectedSavedIndex===idx ? buttonVariants.success : buttonVariants.info), opacity: (isEditingSaved || creationLock) ? 0.6 : 1, cursor: (isEditingSaved || creationLock) ? 'not-allowed':'pointer' }}
-                            >{selectedSavedIndex===idx ? 'Deselect' : 'Select'}</button>
-
+                              className="btn btn--edit"
+                              onClick={() => loadSavedIntoDraw(idx, true)}
+                              style={buttonVariants.muted}
+                            >Edit geometry</button>
                             <button
-                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
-                              onClick={() => {
-                                if ((isEditingSaved && editingSavedIndex !== idx) || creationLock) return;
-                                loadSavedIntoDraw(idx, true);
-                              }}
-                              className={`btn btn--edit ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
-                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Edit geometry'}
-                              style={{ ...(isEditingSaved && editingSavedIndex === idx ? buttonVariants.warning : buttonVariants.muted), opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
-                            >{isEditingSaved && editingSavedIndex === idx ? 'Editing…' : 'Edit geometry'}</button>
-
-                            <button
-                              disabled={(isEditingSaved && editingSavedIndex !== idx) || creationLock}
+                              className="btn btn--delete"
                               onClick={() => deleteSaved(idx)}
-                              className={`btn btn--delete ${isEditingSaved && editingSavedIndex !== idx ? 'is-disabled' : ''}`}
-                              title={isEditingSaved && editingSavedIndex !== idx ? 'Finish or cancel current edit first' : 'Delete'}
-                              style={{ ...buttonVariants.danger, opacity: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 0.6 : 1, cursor: ((isEditingSaved && editingSavedIndex !== idx) || creationLock) ? 'not-allowed':'pointer' }}
+                              style={buttonVariants.danger}
                             >Delete</button>
                           </div>
+                        )}
+                        {editingThis && (
+                          <div style={{ fontSize: '0.65rem', color: '#555' }}>Editing form shown above.</div>
                         )}
                       </li>
                     );})}
@@ -5714,20 +6306,50 @@ export default function App() {
                       const sel = selectedStreetSegmentIndex === idx;
                       const segId = f.properties?.id;
                       const editingThis = editingStreetSegmentId && editingStreetSegmentId === segId;
-                      const editingActive = !!editingStreetSegmentId || editingSavedIndex != null; // any geometry edit in progress
-                      // Disable interactions with saved segments while a new unsaved geometry (street or polygon) is being created
-                      const savedActionsLocked = creationLock || (editingActive && !editingThis);
-                      const anyEditLock = editingActive || creationLock; // unified lock for edit buttons
+                      const editingActive = !!editingStreetSegmentId || editingSavedIndex != null;
+                      // Item click is blocked while drawing, creating, or editing a different segment
+                      const itemLocked = creationLock || (editingActive && !editingThis) || activeTool !== 'none';
+                      const anyEditLock = editingActive || creationLock;
+
+                      function handleItemClick() {
+                        if (itemLocked) return;
+                        if (sel) {
+                          // Click selected item again to deselect
+                          setSelectedStreetSegmentIndex(null);
+                          try { map.current?.setFilter('saved-street-segments-selected', null); } catch {}
+                        } else {
+                          setSelectedStreetSegmentIndex(idx);
+                          setSelectedSavedIndex(null);
+                          if (map.current) {
+                            const m = map.current;
+                            try { m.setFilter('saved-street-segments-selected', ['==', ['get', '__sid'], idx]); } catch {}
+                            try {
+                              const bb = turf.bbox(f);
+                              m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                            } catch {}
+                          }
+                          setSidebarVisible(true);
+                        }
+                      }
+
                       return (
-                        <li key={idx} className={`list-item street-item ${sel ? 'is-selected' : ''}`} style={{
-                          background: '#fff',
-                          border: '1px solid #e2e2e2',
-                          borderRadius: 8,
-                          padding: '0.55rem',
-                          display: 'grid',
-                          gap: '0.35rem',
-                          ...(sel ? selectedCardStyle : {})
-                        }}>
+                        <li
+                          key={idx}
+                          className={`list-item street-item ${sel ? 'is-selected' : ''}`}
+                          onClick={handleItemClick}
+                          title={itemLocked && !sel ? 'Switch drawing tool to Off first' : undefined}
+                          style={{
+                            background: '#fff',
+                            border: '1px solid #e2e2e2',
+                            borderRadius: 8,
+                            padding: '0.55rem',
+                            display: 'grid',
+                            gap: '0.35rem',
+                            cursor: itemLocked ? 'default' : 'pointer',
+                            opacity: itemLocked && !sel ? 0.65 : 1,
+                            ...(sel ? selectedCardStyle : {}),
+                          }}
+                        >
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                             <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
                               <span>{f.properties?.name || `Segment ${idx + 1}`}</span>
@@ -5737,75 +6359,39 @@ export default function App() {
                           </div>
                           <div style={{ fontSize: '0.7rem', color: '#555' }}>Length: {f.properties?.lengthM ? f.properties.lengthM.toFixed(1) : '?'} m</div>
 
-                          {/* Removed per-street inline type select (editing block now owns type changes) */}
-                          {/* Hide all action buttons while any street segment is in edit mode; prevent duplicate save/cancel */}
-                          {(editingStreetSegmentId || uiLock) ? (
-                            editingThis ? (
-                              <div style={{ fontSize:'0.65rem', color:'#555' }}>Editing form shown above.</div>
-                            ) : null
-                          ) : (
-                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                          {/* Edit geometry + Delete — only visible when this item is selected */}
+                          {sel && !editingStreetSegmentId && !uiLock && (
+                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', marginTop: '0.1rem' }}
+                              onClick={e => e.stopPropagation()}>
                               <button
-                                disabled={savedActionsLocked}
+                                className='btn btn--edit'
                                 onClick={() => {
-                                  if (savedActionsLocked) return;
-                                  if (sel) {
-                                    setSelectedStreetSegmentIndex(null);
-                                    if (map.current) {
-                                      try { map.current.setFilter('saved-street-segments-selected', null); } catch {}
-                                    }
-                                  } else {
-                                    setSelectedStreetSegmentIndex(idx);
-                                    setSelectedSavedIndex(null);
-                                    if (map.current) {
-                                      const m = map.current;
-                                      const filt = ['==',['get','__sid'], idx];
-                                      try { m.setFilter('saved-street-segments-selected', filt); } catch {}
-                                      try {
-                                        const bb = turf.bbox(f);
-                                        m.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
-                                      } catch {}
-                                    }
+                                  // Enter street geometry edit mode; useEffect seeds start/end from saved feature
+                                  setActiveTool('street');
+                                  setEditingStreetSegmentId(segId);
+                                  if (map.current) {
+                                    try {
+                                      const bb = turf.bbox(f);
+                                      map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
+                                    } catch {}
                                   }
                                 }}
-                                className={`btn ${sel ? 'btn--selected' : 'btn--select'}`}
-                                  style={{...(sel ? buttonVariants.success : buttonVariants.info), opacity: savedActionsLocked ? 0.5 : 1, cursor: savedActionsLocked ? 'not-allowed':'pointer'}}
-                              >{sel ? 'Deselect' : 'Select'}</button>
-                              <button
-                                title='Edit geometry'
-                                disabled={anyEditLock}
-                                onClick={() => {
-                                  if (anyEditLock) return;
-                                  try {
-                                    // Enter street geometry edit mode using the freshest saved geometry.
-                                    // Do NOT seed endpoints from this captured list item; let the
-                                    // useEffect([editingStreetSegmentId]) locate the feature by id
-                                    // in the latest savedStreetSegments and seed start/end + refs there.
-                                    setActiveTool('street');
-                                    setEditingStreetSegmentId(segId);
-                                    if (map.current) {
-                                      try {
-                                        const bb = turf.bbox(f);
-                                        map.current.fitBounds([[bb[0],bb[1]],[bb[2],bb[3]]], { padding: getMapPadding(), duration: 600 });
-                                      } catch {}
-                                    }
-                                  } catch {}
-                                }}
-                                className='btn btn--edit'
-                                style={{...buttonVariants.muted, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
+                                style={buttonVariants.muted}
                               >Edit geometry</button>
                               <button
-                                disabled={anyEditLock}
+                                className="btn btn--delete"
                                 onClick={() => {
-                                  if (anyEditLock) return;
                                   setSavedStreetSegments(prev => prev.filter((_,i) => i !== idx));
-                                  if (selectedStreetSegmentIndex === idx) setSelectedStreetSegmentIndex(null);
+                                  setSelectedStreetSegmentIndex(null);
                                   if (editingStreetSegmentId === segId) clearEditingStreetSegment('deleteSavedSegment');
                                 }}
-                                className="btn btn--delete"
-                                style={{...buttonVariants.danger, opacity: anyEditLock ? 0.5 : 1, cursor: anyEditLock ? 'not-allowed':'pointer'}}
+                                style={buttonVariants.danger}
                               >Delete</button>
                             </div>
+                          )}
+                          {/* Inline note when this segment's geometry edit form is active above */}
+                          {editingThis && (
+                            <div style={{ fontSize:'0.65rem', color:'#555' }}>Editing form shown above.</div>
                           )}
                         </li>
                       );
