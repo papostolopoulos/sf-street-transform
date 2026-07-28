@@ -365,7 +365,7 @@ Goal: Replace abstract colored dots with recognizable SVG icons that accurately 
 | Sub-task | Status | Notes |
 |----------|--------|-------|
 | Phase 1 — Real SVG icons in MapLibre symbol layer | ✅ | Tree top-down canopy blob; playground A-frame badge; seating bench badge; registered via `loadMapIcons()` async loader; `icon-pitch-alignment: 'map'` for correct 3D behaviour; zoom-interpolated size ~10 m real-world at z17 |
-| Phase 2 — Per-icon draggable placement | ❌ | Switch from GeoJSON layer to `maplibregl.Marker` instances; store per-symbol `{ overlayType, lngLat, size }` in feature `properties.symbols[]`; persist to localStorage |
+| Phase 2 — Per-icon draggable placement | ✅ | `getOverlaySymbols()` routes to explicit `feature.properties.symbols[]` or auto-gen; `symIdx` added to all GeoJSON symbol properties for hit-testing; `overlayFeaturesRef` mirrors source data for zero-React-render live drag; `mutateFeatureSymbols()` initialises from auto on first edit; delete, drag-to-reposition, and "Reset all to auto" per feature; white ring highlight layer under selected icon; persisted via existing savedZones/savedStreetSegments localStorage hooks |
 | Phase 3 — Density & size controls | ❌ | Sidebar: spacing slider (fewer ↔ more), size presets (sapling / medium / mature for trees); applied globally per feature |
 | Phase 4 — Click-to-add in zone/segment | ❌ | While a feature is selected, clicking the map places a new icon of the active tag type |
 
@@ -468,7 +468,7 @@ Goal: Replace abstract colored dots with recognizable SVG icons that accurately 
 | M5.6 | OSM Sidewalk & Carriageway Overlay | 10 | IN PROGRESS | 30% |
 | M6 | Impact Panel Phase 1 | 14 | DONE | 100% |
 | M7 | Before / After View 2D | 28 | DONE | 100% |
-| M7.6 | Realistic Transformation Overlay | 20 | IN PROGRESS | 20% |
+| M7.6 | Realistic Transformation Overlay | 20 | IN PROGRESS | 50% |
 | M7.5 | Street Cross-Section Panel | 20 | NOT STARTED | 0% |
 | M8 | Auth & Cloud Persistence | 34 | NOT STARTED | 0% |
 | M9 | Counterpoint Mode Phase 1 | 12 | NOT STARTED | 0% |
@@ -512,6 +512,7 @@ Goal: Replace abstract colored dots with recognizable SVG icons that accurately 
 | 2026-07-03 | Feature | M6+M7 | M6 closed: block-cover %, tree count, speed-calming impact metrics; shared `renderImpactPanel()` for zones + segments. M7 drag slider: second MapLibre instance (`mapBefore`), lazy creation/destroy on split mode, `clip-path: inset()` clip, `startSplitDrag` pointer handler, BEFORE/AFTER labels, `jumpTo` sync. Before/After/Split toggle always visible on feature selection. Mutual exclusion: drawing tool ↔ feature selection (4 directions). Click-to-select refactor for segment + zone lists (Edit/Delete appear only when item selected). | 4.0 |
 | 2026-07-04 | Feature | M7 | M7 closed: stylistic overlay for transformed state (`computeZoneOverlaySymbols` pointGrid+booleanPointInPolygon; `computeSegmentOverlaySymbols` along+bearing+destination offset; `computeSegmentOverlayLines` lineOffset bike dashes); memo caches (`_bandsCache`, `_overlaySymCache`, `_overlayLineCache`, `_zoneSymCache`) keyed by featureId+tags+coordFingerprint eliminate redundant turf.buffer/pointGrid recomputation across refreshMapData calls. | 2.0 |
 | 2026-07-25 | Bug fix | M7 | Multi-type overlay fix for segments: `computeSegmentOverlaySymbols` now collects all active tag groups (green/seating/play) instead of single dominant type; distributes across left/right sides. Bike lane endpoint fin artifact fixed via 5 m inset before `turf.lineOffset`. Zone multi-type: `computeZoneOverlaySymbols` cycles types across shared grid. Building exclusion: zone points filtered via `queryRenderedFeatures` against building fill/extrusion layers in `refreshMapData`. | 1.5 |
+| 2026-07-27 | Feature | M7.6 | Phase 2 — per-icon drag/delete: `getOverlaySymbols()` routes between explicit `properties.symbols[]` and auto-gen; `symIdx` on every GeoJSON symbol for hit-testing; mousedown+mousemove+mouseup drag on `segment-overlay-circles-layer` with live `setData` updates via `overlayFeaturesRef` (no React re-renders during drag); `mutateFeatureSymbols()` initialises explicit list from auto on first edit; `deleteOverlaySymbol()`, `resetOverlaySymbols()`; white ring highlight layer (`overlay-symbol-highlight-layer`) under selected icon; "Icon selected" panel with Delete/Reset controls in sidebar for zones and segments; clears on empty-map click and view mode change. | 2.5 |
 | 2026-07-25 | Feature | M7.6 | Phase 1 — real SVG icons: tree top-down canopy blob (multi-green circles + shadow); playground A-frame swing badge (blue); seating bench badge (orange). `loadMapIcons()` async loader registers SVG data-URI sprites via `map.loadImage`; called before `ensureSourcesAndLayers` on initial load and after each basemap style switch (style switch clears sprite atlas). Circle layer replaced with symbol layer (`icon-pitch-alignment: 'map'`, `icon-rotation-alignment: 'map'`); zoom-interpolated `icon-size` scales icons to ~10–15 m real-world at z17. M7.6 Phase 1 done. | 1.5 |
 
 _Add an entry when a milestone advances ≥10% or completes. Log focused engineering time only (exclude context switching)._

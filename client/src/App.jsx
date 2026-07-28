@@ -455,7 +455,7 @@ function computeSegmentOverlaySymbols(feature) {
 
         for (const side of sides) {
           const sym = turf.destination(pt, offsetKm, bearing + side, { units: 'kilometers' });
-          sym.properties = { overlayType: type, segId };
+          sym.properties = { overlayType: type, segId, symIdx: points.length };
           points.push(sym);
         }
       }
@@ -535,11 +535,29 @@ function computeZoneOverlaySymbols(feature) {
     // Cap at 300 total to avoid rendering overhead on very large zones.
     const result = filtered
       .slice(0, 300)
-      .map((pt, i) => ({ ...pt, properties: { overlayType: activeTypes[i % activeTypes.length], segId: zoneId } }));
+      .map((pt, i) => ({ ...pt, properties: { overlayType: activeTypes[i % activeTypes.length], segId: zoneId, symIdx: i } }));
 
     _zoneSymCache.set(_ckey, result);
     return result;
   } catch { return []; }
+}
+
+// M7.6 Phase 2: Route to explicit user-positioned symbols if the feature has been manually
+// edited, otherwise fall back to the auto-generated positions. Explicit symbols are stored
+// as `feature.properties.symbols: [{ overlayType, lngLat: [lng,lat] }, ...]`.
+function getOverlaySymbols(feature) {
+  const explicit = feature.properties?.symbols;
+  if (Array.isArray(explicit) && explicit.length > 0) {
+    const segId = feature.properties?.id;
+    return explicit.map((s, i) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: s.lngLat },
+      properties: { overlayType: s.overlayType, segId, symIdx: i },
+    }));
+  }
+  return feature.geometry?.type === 'LineString'
+    ? computeSegmentOverlaySymbols(feature)
+    : computeZoneOverlaySymbols(feature);
 }
 
 function explodeToLineStrings(feature) {
@@ -710,6 +728,11 @@ export default function App() {
   const [savedZones, setSavedZones] = useState([]);
   const [selectedSavedIndex, setSelectedSavedIndex] = useState(null);
   const [editingSavedIndex, setEditingSavedIndex] = useState(null);
+  // M7.6 Phase 2: selected overlay symbol for drag/delete interaction
+  // null | { segId: string, symIdx: number, overlayType: string, isZone: boolean }
+  const [selectedOverlaySymbol, setSelectedOverlaySymbol] = useState(null);
+  // Mirrors current overlay feature collection for live drag updates (avoids re-render per frame)
+  const overlayFeaturesRef = useRef([]);
   // Derived flags for specific edit modes
   const editingZone = editingSavedIndex != null;
   const editingStreet = !!editingStreetSegmentId;
@@ -1569,6 +1592,32 @@ export default function App() {
       });
     }
 
+    // M7.6 Phase 2: highlight ring rendered under the selected overlay symbol icon
+    if (!mapInstance.getSource('overlay-symbol-highlight')) {
+      mapInstance.addSource('overlay-symbol-highlight', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+    }
+    if (!mapInstance.getLayer('overlay-symbol-highlight-layer')) {
+      mapInstance.addLayer({
+        id: 'overlay-symbol-highlight-layer',
+        type: 'circle',
+        source: 'overlay-symbol-highlight',
+        minzoom: 14,
+        paint: {
+          // Radius scales to match the icon-size interpolation (~half of icon pixel size)
+          'circle-radius': ['interpolate', ['exponential', 2], ['zoom'],
+            14, 6, 16, 12, 18, 26, 20, 56
+          ],
+          'circle-color': 'rgba(255,255,255,0.25)',
+          'circle-stroke-color': '#ffffff',
+          'circle-stroke-width': 2.5,
+          'circle-opacity': 1,
+        },
+      }, 'segment-overlay-circles-layer'); // render below the icon
+    }
+
     // M7: After-view line overlay — dashed markings for bike-lane transformations
     if (!mapInstance.getSource('segment-overlay-lines')) {
       mapInstance.addSource('segment-overlay-lines', {
@@ -1862,19 +1911,26 @@ export default function App() {
     mapInstance.getSource('segment-bands')?.setData(bandsFC);
     mapInstance.getSource('segment-bands-before')?.setData(bandsBeforeFC);
 
-    // M7: Overlay symbols (circles) for the After-view stylistic overlay.
-    // Zone symbols are filtered to exclude building footprints via queryRenderedFeatures —
-    // the raw grid from computeZoneOverlaySymbols is cached; building exclusion runs here
-    // so it reflects the current viewport without busting the geometry cache.
+    // M7/M7.6: Overlay symbols for the After-view.
+    // Uses explicit user-positioned symbols (feature.properties.symbols) when present,
+    // otherwise auto-generates. Auto-generated zone symbols are building-filtered via
+    // queryRenderedFeatures; explicit placements are kept as-is (user intended them).
     const buildingLayerIds = getBuildingLayerIds(mapInstance);
+
+    const segmentOverlaySymbols = visibleSegments.flatMap(f => getOverlaySymbols(f));
+
     const zoneOverlaySymbols = (savedList || []).flatMap(f => {
+      // Explicit placements: skip building filter — user chose those positions deliberately
+      if (Array.isArray(f.properties?.symbols) && f.properties.symbols.length > 0) {
+        return getOverlaySymbols(f);
+      }
+      // Auto-generated: filter out points that land on building footprints
       const pts = computeZoneOverlaySymbols(f);
       if (!buildingLayerIds.length || !pts.length) return pts;
       try {
         const [minLng, minLat, maxLng, maxLat] = turf.bbox(f);
         const sw = mapInstance.project([minLng, minLat]);
         const ne = mapInstance.project([maxLng, maxLat]);
-        // queryRenderedFeatures uses screen coords: topLeft=[minX,minY], bottomRight=[maxX,maxY]
         const buildingFeatures = mapInstance.queryRenderedFeatures(
           [[sw.x, ne.y], [ne.x, sw.y]],
           { layers: buildingLayerIds }
@@ -1889,18 +1945,189 @@ export default function App() {
       } catch { return pts; }
     });
 
+    const allOverlayFeatures = [...segmentOverlaySymbols, ...zoneOverlaySymbols];
+    overlayFeaturesRef.current = allOverlayFeatures; // keep ref in sync for live drag updates
     mapInstance.getSource('segment-overlay-circles')?.setData({
       type: 'FeatureCollection',
-      features: [
-        ...visibleSegments.flatMap(f => computeSegmentOverlaySymbols(f)),
-        ...zoneOverlaySymbols,
-      ],
+      features: allOverlayFeatures,
     });
     mapInstance.getSource('segment-overlay-lines')?.setData({
       type: 'FeatureCollection',
       features: visibleSegments.flatMap(f => computeSegmentOverlayLines(f)),
     });
   }
+
+  // --- M7.6 Phase 2: Overlay symbol interaction helpers --------------------
+
+  // Push a single-point feature into the highlight source so a white ring appears
+  // beneath the currently selected overlay icon. Pass null to clear.
+  function updateHighlightLayer(lngLat) {
+    map.current?.getSource('overlay-symbol-highlight')?.setData({
+      type: 'FeatureCollection',
+      features: lngLat
+        ? [{ type: 'Feature', geometry: { type: 'Point', coordinates: lngLat }, properties: {} }]
+        : [],
+    });
+  }
+
+  // Materialise auto-generated symbols into the explicit format so the user can edit them.
+  // Called the first time a drag or delete is attempted on a feature with no saved positions.
+  function initializeSymbolsFromAuto(feature) {
+    const auto = feature.geometry?.type === 'LineString'
+      ? computeSegmentOverlaySymbols(feature)
+      : computeZoneOverlaySymbols(feature);
+    return auto.map(f => ({ overlayType: f.properties.overlayType, lngLat: f.geometry.coordinates }));
+  }
+
+  // Apply a mutation (function symbols→symbols) to a specific feature's explicit symbol list,
+  // initialising from auto-generated positions if this is the first edit.
+  function mutateFeatureSymbols(segId, isZone, mutationFn) {
+    const list    = isZone ? savedZones : savedStreetSegments;
+    const setList = isZone ? setSavedZones : setSavedStreetSegments;
+    const idx = list.findIndex(f => f.properties?.id === segId);
+    if (idx === -1) return;
+    const feature  = list[idx];
+    const existing = Array.isArray(feature.properties?.symbols) && feature.properties.symbols.length > 0
+      ? feature.properties.symbols
+      : initializeSymbolsFromAuto(feature);
+    const next = mutationFn([...existing]);
+    const updated = { ...feature, properties: { ...feature.properties, symbols: next } };
+    const newList = [...list];
+    newList[idx] = updated;
+    setList(newList);
+  }
+
+  // Commit a dragged icon's new position to persistent state.
+  function moveOverlaySymbol(segId, isZone, symIdx, newLngLat) {
+    mutateFeatureSymbols(segId, isZone, syms =>
+      syms.map((s, i) => i === symIdx ? { ...s, lngLat: newLngLat } : s)
+    );
+  }
+
+  // Remove a specific icon and re-index the rest.
+  function deleteOverlaySymbol(segId, isZone, symIdx) {
+    mutateFeatureSymbols(segId, isZone, syms => syms.filter((_, i) => i !== symIdx));
+  }
+
+  // Remove all explicit positions so auto-generation takes over again.
+  function resetOverlaySymbols(segId, isZone) {
+    const list    = isZone ? savedZones : savedStreetSegments;
+    const setList = isZone ? setSavedZones : setSavedStreetSegments;
+    const idx = list.findIndex(f => f.properties?.id === segId);
+    if (idx === -1) return;
+    const feature = list[idx];
+    const { symbols: _removed, ...restProps } = feature.properties || {};
+    const updated = { ...feature, properties: restProps };
+    const newList = [...list];
+    newList[idx] = updated;
+    setList(newList);
+  }
+
+  // --- M7.6 Phase 2: useEffect to install/remove symbol drag + click handlers
+
+  // Drag and click handlers for individual overlay icons. Active only in After mode
+  // with no drawing tool running. On drag-start, icons are moved live by mutating the
+  // GeoJSON source directly (no React re-render per frame); on mouseup the new position
+  // is committed to savedZones/savedStreetSegments which triggers a refreshMapData.
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+
+    const LAYER = 'segment-overlay-circles-layer';
+
+    function canInteract() {
+      return viewMode === 'after' && activeTool === 'none' && !editingAny;
+    }
+
+    function onEnter() {
+      if (canInteract()) m.getCanvas().style.cursor = 'pointer';
+    }
+    function onLeave() {
+      if (canInteract()) m.getCanvas().style.cursor = '';
+    }
+
+    function onMouseDown(e) {
+      if (!canInteract() || !e.features?.length) return;
+      e.preventDefault();
+
+      const props = e.features[0].properties;
+      const segId   = props.segId;
+      const symIdx  = Number(props.symIdx);
+      const overlayType = props.overlayType;
+      const isZone  = savedZones.some(f => f.properties?.id === segId);
+      let currentLngLat = e.features[0].geometry.coordinates;
+
+      setSelectedOverlaySymbol({ segId, symIdx, overlayType, isZone });
+      updateHighlightLayer(currentLngLat);
+
+      m.getCanvas().style.cursor = 'grabbing';
+      m.dragPan.disable();
+
+      const onMove = (moveEvent) => {
+        currentLngLat = [moveEvent.lngLat.lng, moveEvent.lngLat.lat];
+        // Live update: mutate source directly without React re-renders
+        const updated = overlayFeaturesRef.current.map(f =>
+          (f.properties?.segId === segId && Number(f.properties?.symIdx) === symIdx)
+            ? { ...f, geometry: { type: 'Point', coordinates: currentLngLat } }
+            : f
+        );
+        overlayFeaturesRef.current = updated;
+        m.getSource('segment-overlay-circles')?.setData({ type: 'FeatureCollection', features: updated });
+        updateHighlightLayer(currentLngLat);
+      };
+
+      const onUp = () => {
+        m.off('mousemove', onMove);
+        m.off('mouseup', onUp);
+        m.getCanvas().style.cursor = canInteract() ? 'pointer' : '';
+        m.dragPan.enable();
+        // Commit final position — triggers refreshMapData via state change
+        moveOverlaySymbol(segId, isZone, symIdx, currentLngLat);
+      };
+
+      m.on('mousemove', onMove);
+      m.on('mouseup', onUp);
+    }
+
+    // Click without drag just selects the symbol (mousedown handles drag + select together;
+    // this handler covers the case where mousedown fires on a feature but the pointer
+    // moves off the feature before mouseup — treated as a tap, not a drag)
+    function onClick(e) {
+      if (!canInteract() || !e.features?.length) return;
+      const props = e.features[0].properties;
+      setSelectedOverlaySymbol({
+        segId: props.segId,
+        symIdx: Number(props.symIdx),
+        overlayType: props.overlayType,
+        isZone: savedZones.some(f => f.properties?.id === props.segId),
+      });
+      updateHighlightLayer(e.features[0].geometry.coordinates);
+    }
+
+    if (m.getLayer(LAYER)) {
+      m.on('mouseenter',  LAYER, onEnter);
+      m.on('mouseleave',  LAYER, onLeave);
+      m.on('mousedown',   LAYER, onMouseDown);
+      m.on('click',       LAYER, onClick);
+    }
+
+    return () => {
+      try {
+        m.off('mouseenter',  LAYER, onEnter);
+        m.off('mouseleave',  LAYER, onLeave);
+        m.off('mousedown',   LAYER, onMouseDown);
+        m.off('click',       LAYER, onClick);
+      } catch {}
+    };
+  }, [viewMode, activeTool, editingAny, savedZones, savedStreetSegments]);
+
+  // Clear selected overlay symbol whenever the user deselects a feature or switches view mode
+  useEffect(() => {
+    if (viewMode !== 'after' || (selectedSavedIndex === null && selectedStreetSegmentIndex === null)) {
+      setSelectedOverlaySymbol(null);
+      updateHighlightLayer(null);
+    }
+  }, [viewMode, selectedSavedIndex, selectedStreetSegmentIndex]);
 
   // Build a zone summary from any Feature<Polygon>
   // typeFallback is used if the feature has no useType prop
@@ -3406,6 +3633,8 @@ export default function App() {
       if (!hits || hits.length === 0) {
         setSelectedSavedIndex(null);
         setSelectedStreetSegmentIndex(null);
+        setSelectedOverlaySymbol(null);
+        updateHighlightLayer(null);
       }
     };
     m.on('click', handleEmptyClick);
@@ -5995,6 +6224,26 @@ export default function App() {
                     toggleZoneTag
                   )
                 }
+                {/* Overlay symbol controls — shown when user has clicked/dragged a specific icon */}
+                {selectedOverlaySymbol && viewMode === 'after' && summaryContext === 'saved' && (
+                  <div className="overlay-symbol-controls" style={{ marginTop: '0.75rem', padding: '0.65rem 0.75rem', background: '#f5f5f5', borderRadius: '6px', border: '1px solid #ddd' }}>
+                    <div style={{ fontSize: '0.78rem', fontWeight: 600, marginBottom: '0.5rem', color: '#333' }}>
+                      Icon selected: {selectedOverlaySymbol.overlayType === 'green' ? 'Tree' : selectedOverlaySymbol.overlayType === 'play' ? 'Playground' : 'Seating'}
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                      <button className="btn btn--delete" style={{ fontSize: '0.75rem', padding: '0.25rem 0.6rem' }} onClick={() => {
+                        deleteOverlaySymbol(selectedOverlaySymbol.segId, selectedOverlaySymbol.isZone, selectedOverlaySymbol.symIdx);
+                        setSelectedOverlaySymbol(null);
+                        updateHighlightLayer(null);
+                      }}>Delete icon</button>
+                      <button className="btn" style={{ fontSize: '0.75rem', padding: '0.25rem 0.6rem' }} onClick={() => {
+                        resetOverlaySymbols(selectedOverlaySymbol.segId, selectedOverlaySymbol.isZone);
+                        setSelectedOverlaySymbol(null);
+                        updateHighlightLayer(null);
+                      }}>Reset all to auto</button>
+                    </div>
+                  </div>
+                )}
                 {(editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary) && (() => { const ss = editingStreetSegmentSummary || streetSegmentSummary || ephemeralStreetPathSummary; const startCoords = Array.isArray(ss.start) ? ss.start : [0,0]; const endCoords = Array.isArray(ss.end) ? ss.end : [0,0]; return (
                   <div className="summary-card__street">
                     <p style={{ marginBottom: '0.5rem' }}><strong>Name:</strong> {ss.name}</p>
@@ -6049,6 +6298,26 @@ export default function App() {
                         toggleSegmentTag
                       )
                     }
+                    {/* Overlay symbol controls — shown when user has clicked/dragged a specific icon */}
+                    {selectedOverlaySymbol && viewMode === 'after' && streetSegmentSummary && !editingStreetSegmentId && (
+                      <div className="overlay-symbol-controls" style={{ marginTop: '0.75rem', padding: '0.65rem 0.75rem', background: '#f5f5f5', borderRadius: '6px', border: '1px solid #ddd' }}>
+                        <div style={{ fontSize: '0.78rem', fontWeight: 600, marginBottom: '0.5rem', color: '#333' }}>
+                          Icon selected: {selectedOverlaySymbol.overlayType === 'green' ? 'Tree' : selectedOverlaySymbol.overlayType === 'play' ? 'Playground' : 'Seating'}
+                        </div>
+                        <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                          <button className="btn btn--delete" style={{ fontSize: '0.75rem', padding: '0.25rem 0.6rem' }} onClick={() => {
+                            deleteOverlaySymbol(selectedOverlaySymbol.segId, selectedOverlaySymbol.isZone, selectedOverlaySymbol.symIdx);
+                            setSelectedOverlaySymbol(null);
+                            updateHighlightLayer(null);
+                          }}>Delete icon</button>
+                          <button className="btn" style={{ fontSize: '0.75rem', padding: '0.25rem 0.6rem' }} onClick={() => {
+                            resetOverlaySymbols(selectedOverlaySymbol.segId, selectedOverlaySymbol.isZone);
+                            setSelectedOverlaySymbol(null);
+                            updateHighlightLayer(null);
+                          }}>Reset all to auto</button>
+                        </div>
+                      </div>
+                    )}
                     {editingStreetSegmentId && (
                       <div style={{ marginTop:'0.75rem', borderTop:'1px solid #eee', paddingTop:'0.75rem' }}>
                         <EditForm
